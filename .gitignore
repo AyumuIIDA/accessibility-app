@@ -1,0 +1,6 @@
+.dotnet/
+.nuget/
+bin/
+obj/
+**/bin/
+**/obj/
