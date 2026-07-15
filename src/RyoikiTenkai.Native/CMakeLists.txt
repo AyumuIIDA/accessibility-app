@@ -61,6 +61,7 @@ add_library(RyoikiTenkai.VisionCore STATIC
     src/HandPerception/ModelRunners/cpu_hand_landmark_runner.cpp
     src/HandPerception/ModelRunners/cpu_palm_detection_runner.cpp
     src/HandPerception/ModelRunners/hand_landmark_runner.h
+    src/HandPerception/ModelRunners/hand_landmark_model_contract.cpp
     src/HandPerception/ModelRunners/palm_detection_runner.cpp
     src/Pipeline/latest_frame_slot.cpp
     src/Pipeline/perception_mailbox.cpp

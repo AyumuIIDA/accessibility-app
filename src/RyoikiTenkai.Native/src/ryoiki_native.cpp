@@ -544,8 +544,9 @@ void runPerceptionLoop(RyoikiHandle& handle)
         if (!graph.process(*frame, perceptionResult, graphMetrics, error))
         {
             handle.setError(error);
-            handle.perceptionMailbox.stop();
-            break;
+            const std::string diagnostic = "Recoverable perception frame failure: "
+                + error + "\n";
+            OutputDebugStringA(diagnostic.c_str());
         }
 
         const auto completed = clock::now();

@@ -28,8 +28,11 @@ CameraCapture
   perception overwrites stale pending work.
 - `Geometry` owns OpenCV resize, letterbox, rotated ROI warp, coordinate transforms,
   and tensor packing. It does not select an execution provider or decode model output.
-- `ModelRunners` owns model loading and raw tensor inference only. It does not decode
-  detections or implement tracking policy.
+- `ModelRunners` owns model loading, model-specific tensor contracts, and raw tensor
+  inference only. It does not decode detections or implement tracking policy. Model
+  input/output names, shapes, and element types are validated when a runner is created;
+  contract incompatibility is a fatal initialization error rather than a per-frame
+  fallback.
 - `MediaPipeGraph` owns anchor decode, confidence handling, NMS, palm-to-ROI,
   landmark projection, ROI loopback, and palm fallback. It depends on runner
   interfaces and does not select hardware providers.
@@ -127,3 +130,16 @@ instead of hiding it in `native_overhead_ms`.
 The current native implementation populates all listed CPU stages. Palm stages are
 zero on frames that successfully use the landmark ROI loopback; they run again after
 tracking confidence falls below the fallback threshold.
+
+## Failure handling
+
+The runtime separates initialization failures from frame-local processing failures:
+
+- Missing models, ONNX Runtime session creation failures, unsupported tensor element
+  types, and incompatible model contracts are fatal. The perception worker does not
+  enter its frame loop and exposes the diagnostic through `ryoiki_get_last_error`.
+- A preprocessing, inference, or coordinate-processing failure for one frame is
+  recoverable. The worker records the diagnostic, publishes an empty hand result for
+  that processed frame, and continues with the next capacity-one mailbox item.
+- Low confidence and an invalid tracking ROI are normal graph outcomes. They clear
+  tracking and return to palm detection instead of stopping the worker.

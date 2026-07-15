@@ -20,7 +20,9 @@ constexpr std::array<std::int64_t, 2> kScalarShape{1, 1};
 
 struct CpuHandLandmarkRunner::Impl
 {
-    explicit Impl(const std::filesystem::path& modelPath)
+    Impl(
+        const std::filesystem::path& modelPath,
+        const HandLandmarkModelContract& contract)
         : environment{ORT_LOGGING_LEVEL_WARNING, "RyoikiTenkai"}
     {
         if (!std::filesystem::is_regular_file(modelPath))
@@ -32,35 +34,66 @@ struct CpuHandLandmarkRunner::Impl
         sessionOptions.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
         session = std::make_unique<Ort::Session>(environment, modelPath.c_str(), sessionOptions);
 
-        Ort::AllocatorWithDefaultOptions allocator;
-        if (session->GetInputCount() != 1)
+        const auto requiredInputShape = std::vector<std::int64_t>{
+            kInputShape.begin(), kInputShape.end()};
+        const auto requiredLandmarkShape = std::vector<std::int64_t>{
+            kLandmarkShape.begin(), kLandmarkShape.end()};
+        const auto requiredScalarShape = std::vector<std::int64_t>{
+            kScalarShape.begin(), kScalarShape.end()};
+        if (contract.input.shape != requiredInputShape
+            || contract.imageLandmarks.shape != requiredLandmarkShape
+            || contract.presence.shape != requiredScalarShape
+            || contract.handedness.shape != requiredScalarShape
+            || contract.worldLandmarks.shape != requiredLandmarkShape)
         {
-            throw std::runtime_error{"Hand landmark model must expose exactly one input."};
-        }
-        auto inputName = session->GetInputNameAllocated(0, allocator);
-        inputNameStorage = inputName.get();
-        const auto inputShape = session->GetInputTypeInfo(0)
-            .GetTensorTypeAndShapeInfo().GetShape();
-        if (inputShape != std::vector<std::int64_t>{kInputShape.begin(), kInputShape.end()})
-        {
-            throw std::runtime_error{"Hand landmark model input shape must be [1,224,224,3]."};
+            throw std::runtime_error{"Selected hand landmark contract uses unsupported tensor shapes."};
         }
 
-        constexpr std::array<const char*, 4> kExpectedOutputs{
-            "Identity", "Identity_1", "Identity_2", "Identity_3"};
-        if (session->GetOutputCount() != kExpectedOutputs.size())
+        Ort::AllocatorWithDefaultOptions allocator;
+        std::vector<ModelTensorDescriptor> inputDescriptors;
+        std::vector<ModelTensorDescriptor> outputDescriptors;
+        inputDescriptors.reserve(session->GetInputCount());
+        outputDescriptors.reserve(session->GetOutputCount());
+        for (std::size_t index = 0; index < session->GetInputCount(); ++index)
         {
-            throw std::runtime_error{"Hand landmark model must expose four outputs."};
-        }
-        for (std::size_t index = 0; index < kExpectedOutputs.size(); ++index)
-        {
-            auto outputName = session->GetOutputNameAllocated(index, allocator);
-            outputNames[index] = outputName.get();
-            if (outputNames[index] != kExpectedOutputs[index])
+            const auto typeInfo = session->GetInputTypeInfo(index);
+            const auto tensorInfo = typeInfo.GetTensorTypeAndShapeInfo();
+            if (tensorInfo.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
             {
-                throw std::runtime_error{"Hand landmark model output names do not match the expected contract."};
+                throw std::runtime_error{"Hand landmark model inputs must use float32."};
             }
+            auto name = session->GetInputNameAllocated(index, allocator);
+            inputDescriptors.push_back({name.get(), tensorInfo.GetShape()});
         }
+        for (std::size_t index = 0; index < session->GetOutputCount(); ++index)
+        {
+            const auto typeInfo = session->GetOutputTypeInfo(index);
+            const auto tensorInfo = typeInfo.GetTensorTypeAndShapeInfo();
+            if (tensorInfo.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+            {
+                throw std::runtime_error{"Hand landmark model outputs must use float32."};
+            }
+            auto name = session->GetOutputNameAllocated(index, allocator);
+            outputDescriptors.push_back({name.get(), tensorInfo.GetShape()});
+        }
+
+        std::string contractError;
+        if (!validateHandLandmarkModelContract(
+                inputDescriptors,
+                outputDescriptors,
+                contract,
+                contractError))
+        {
+            throw std::runtime_error{contractError};
+        }
+
+        inputNameStorage = contract.input.name;
+        outputNames = {
+            contract.imageLandmarks.name,
+            contract.presence.name,
+            contract.handedness.name,
+            contract.worldLandmarks.name
+        };
     }
 
     Ort::Env environment;
@@ -74,11 +107,19 @@ std::unique_ptr<CpuHandLandmarkRunner> CpuHandLandmarkRunner::create(
     const std::filesystem::path& modelPath,
     std::string& error)
 {
+    return create(modelPath, HandLandmarkModelContract::openCvZoo2023(), error);
+}
+
+std::unique_ptr<CpuHandLandmarkRunner> CpuHandLandmarkRunner::create(
+    const std::filesystem::path& modelPath,
+    const HandLandmarkModelContract& contract,
+    std::string& error)
+{
     try
     {
         error.clear();
         return std::unique_ptr<CpuHandLandmarkRunner>{
-            new CpuHandLandmarkRunner{std::make_unique<Impl>(modelPath)}};
+            new CpuHandLandmarkRunner{std::make_unique<Impl>(modelPath, contract)}};
     }
     catch (const Ort::Exception& exception)
     {

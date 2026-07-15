@@ -1,6 +1,7 @@
 #pragma once
 
 #include "HandPerception/ModelRunners/hand_landmark_runner.h"
+#include "HandPerception/ModelRunners/hand_landmark_model_contract.h"
 
 #include <filesystem>
 #include <memory>
@@ -13,6 +14,10 @@ class CpuHandLandmarkRunner final : public IHandLandmarkRunner
 public:
     static std::unique_ptr<CpuHandLandmarkRunner> create(
         const std::filesystem::path& modelPath,
+        std::string& error);
+    static std::unique_ptr<CpuHandLandmarkRunner> create(
+        const std::filesystem::path& modelPath,
+        const HandLandmarkModelContract& contract,
         std::string& error);
 
     ~CpuHandLandmarkRunner() override;

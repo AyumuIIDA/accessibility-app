@@ -9,6 +9,7 @@
 #include "HandPerception/MediaPipeGraph/palm_detection_to_roi.h"
 #include "HandPerception/ModelRunners/cpu_hand_landmark_runner.h"
 #include "HandPerception/ModelRunners/cpu_palm_detection_runner.h"
+#include "HandPerception/ModelRunners/hand_landmark_model_contract.h"
 
 #include <algorithm>
 #include <cmath>
@@ -285,7 +286,7 @@ public:
         wasCalled = true;
         ++runCallCount;
         receivedExpectedShape = input.shape() == std::array<std::int64_t, 4>{1, 224, 224, 3};
-        if (!succeeds)
+        if (!succeeds || std::ranges::find(failOnCalls, runCallCount) != failOnCalls.end())
         {
             error = "fake hand runner failure";
             return false;
@@ -300,6 +301,7 @@ public:
 
     ryoiki::hand_perception::HandLandmarkRawOutput rawOutput{};
     std::vector<ryoiki::hand_perception::HandLandmarkRawOutput> outputs;
+    std::vector<std::size_t> failOnCalls;
     bool succeeds{true};
     bool wasCalled{false};
     bool receivedExpectedShape{false};
@@ -399,7 +401,7 @@ public:
         wasCalled = true;
         ++runCallCount;
         receivedExpectedShape = input.shape() == std::array<std::int64_t, 4>{1, 192, 192, 3};
-        if (!succeeds_)
+        if (!succeeds_ || std::ranges::find(failOnCalls, runCallCount) != failOnCalls.end())
         {
             error = "fake runner failure";
             return false;
@@ -415,6 +417,7 @@ public:
     bool wasCalled{false};
     bool receivedExpectedShape{false};
     std::size_t runCallCount{0};
+    std::vector<std::size_t> failOnCalls;
 
 private:
     bool succeeds_{false};
@@ -533,6 +536,102 @@ void testHandPerceptionTrackingAndPalmFallback()
         "Palm fallback invoked an incorrect model runner sequence.");
 }
 
+void testHandPerceptionContinuesAfterSingleFrameRunnerFailures()
+{
+    const auto frame = createFrame();
+
+    {
+        auto palmRunner = std::make_unique<FakePalmDetectionRunner>(true);
+        auto* palmObserver = palmRunner.get();
+        palmObserver->failOnCalls = {1};
+        auto handRunner = std::make_unique<FakeHandLandmarkRunner>();
+        auto* handObserver = handRunner.get();
+        handObserver->rawOutput = createTrackedHandOutput(0.8F);
+        ryoiki::hand_perception::HandPerceptionGraph graph{
+            std::move(palmRunner), std::move(handRunner)};
+        ryoiki::hand_perception::HandPerceptionResult result;
+        ryoiki::hand_perception::HandPerceptionGraphMetrics metrics{};
+        std::string error;
+
+        require(!graph.process(frame, result, metrics, error),
+            "One-frame palm runner failure was not surfaced as recoverable work failure.");
+        require(!error.empty(), "One-frame palm runner failure did not retain its diagnostic.");
+        require(graph.process(frame, result, metrics, error),
+            "Perception graph did not continue after a one-frame palm runner failure.");
+        require(result.hand.detected && !result.usedTracking,
+            "Frame after palm runner recovery did not establish a tracked hand.");
+        require(palmObserver->runCallCount == 2 && handObserver->runCallCount == 1,
+            "Palm runner recovery invoked an incorrect model sequence.");
+    }
+
+    {
+        auto palmRunner = std::make_unique<FakePalmDetectionRunner>(true);
+        auto* palmObserver = palmRunner.get();
+        auto handRunner = std::make_unique<FakeHandLandmarkRunner>();
+        auto* handObserver = handRunner.get();
+        handObserver->rawOutput = createTrackedHandOutput(0.8F);
+        handObserver->failOnCalls = {2};
+        ryoiki::hand_perception::HandPerceptionGraph graph{
+            std::move(palmRunner), std::move(handRunner)};
+        ryoiki::hand_perception::HandPerceptionResult result;
+        ryoiki::hand_perception::HandPerceptionGraphMetrics metrics{};
+        std::string error;
+
+        require(graph.process(frame, result, metrics, error) && result.hand.detected,
+            "Hand runner recovery test could not establish initial tracking state.");
+        require(!graph.process(frame, result, metrics, error),
+            "One-frame tracked hand runner failure was not surfaced.");
+        require(!error.empty(), "One-frame hand runner failure did not retain its diagnostic.");
+        require(graph.process(frame, result, metrics, error),
+            "Perception graph did not continue after a one-frame hand runner failure.");
+        require(result.usedTracking && result.hand.detected,
+            "Tracked ROI state was lost after a recoverable hand runner failure.");
+        require(palmObserver->runCallCount == 1 && handObserver->runCallCount == 3,
+            "Hand runner recovery unexpectedly reran palm detection or skipped a hand frame.");
+    }
+}
+
+void testHandLandmarkModelContractUsesSemanticNamesAndShapes()
+{
+    using ryoiki::hand_perception::HandLandmarkModelContract;
+    using ryoiki::hand_perception::ModelTensorDescriptor;
+
+    const auto contract = HandLandmarkModelContract::openCvZoo2023();
+    const std::vector<ModelTensorDescriptor> inputs{contract.input};
+    const std::vector<ModelTensorDescriptor> reorderedOutputs{
+        contract.worldLandmarks,
+        contract.handedness,
+        contract.imageLandmarks,
+        contract.presence};
+    std::string error{"stale error"};
+
+    require(ryoiki::hand_perception::validateHandLandmarkModelContract(
+        inputs, reorderedOutputs, contract, error),
+        "Hand landmark contract depended on model output enumeration order.");
+    require(error.empty(), "Successful hand landmark contract validation retained a stale error.");
+
+    auto wrongNameOutputs = reorderedOutputs;
+    wrongNameOutputs[0].name = "unexpected_world_landmarks";
+    require(!ryoiki::hand_perception::validateHandLandmarkModelContract(
+        inputs, wrongNameOutputs, contract, error),
+        "Hand landmark contract accepted an output with the wrong semantic name.");
+    require(!error.empty(), "Wrong hand output name did not produce a contract error.");
+
+    auto wrongShapeOutputs = reorderedOutputs;
+    wrongShapeOutputs[2].shape = {1, 62};
+    require(!ryoiki::hand_perception::validateHandLandmarkModelContract(
+        inputs, wrongShapeOutputs, contract, error),
+        "Hand landmark contract accepted an output with the wrong shape.");
+    require(!error.empty(), "Wrong hand output shape did not produce a contract error.");
+
+    auto wrongInput = inputs;
+    wrongInput[0].shape = {1, 3, 224, 224};
+    require(!ryoiki::hand_perception::validateHandLandmarkModelContract(
+        wrongInput, reorderedOutputs, contract, error),
+        "Hand landmark contract accepted an input with the wrong layout.");
+    require(!error.empty(), "Wrong hand input shape did not produce a contract error.");
+}
+
 void testCpuRunnerSmoke()
 {
 #ifdef RYOIKI_PALM_MODEL_PATH
@@ -603,6 +702,7 @@ void testCpuHandLandmarkRunnerSmoke()
         "CPU hand runner emitted an invalid presence score.");
     require(std::isfinite(output.handedness) && output.handedness >= 0.0F && output.handedness <= 1.0F,
         "CPU hand runner emitted an invalid handedness score.");
+
 #endif
 }
 }
@@ -624,6 +724,8 @@ int main()
         testPalmDetectionGraphSuccess();
         testPalmDetectionGraphFailure();
         testHandPerceptionTrackingAndPalmFallback();
+        testHandPerceptionContinuesAfterSingleFrameRunnerFailures();
+        testHandLandmarkModelContractUsesSemanticNamesAndShapes();
         testCpuRunnerSmoke();
         testCpuHandLandmarkRunnerSmoke();
         std::cout << "HandPerception tests passed.\n";
