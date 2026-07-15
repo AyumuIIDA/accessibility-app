@@ -216,7 +216,7 @@ The ABI, ownership, coordinate, timestamp, and metrics contracts are documented 
 ABI version before creating a runtime and validates the version and size of every
 polled structure.
 
-The native runtime currently captures the first available camera through Media Foundation,
+The native runtime currently captures a user-facing camera through Media Foundation,
 converts frames to top-down BGRA32, publishes pooled native-owned frames to separate
 latest-display and capacity-one perception paths, and renders into the child HWND. The
 perception worker uses OpenCV to letterbox the palm input and pack an RGB NHWC float

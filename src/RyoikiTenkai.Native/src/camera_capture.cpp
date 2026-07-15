@@ -1,4 +1,5 @@
 #include "camera_capture.h"
+#include "Runtime/camera_device_selection.h"
 
 #include <Windows.h>
 #include <mfapi.h>
@@ -10,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <sstream>
+#include <string>
 
 using Microsoft::WRL::ComPtr;
 
@@ -34,6 +36,23 @@ bool failed(const HRESULT result, const char* operation, std::string& error)
 
     error = formatHresult(operation, result);
     return true;
+}
+
+std::wstring getCameraFriendlyName(IMFActivate& device)
+{
+    wchar_t* allocatedName = nullptr;
+    UINT32 nameLength = 0;
+    if (FAILED(device.GetAllocatedString(
+            MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME,
+            &allocatedName,
+            &nameLength)))
+    {
+        return L"Unnamed camera";
+    }
+
+    std::wstring name{allocatedName, nameLength};
+    CoTaskMemFree(allocatedName);
+    return name;
 }
 }
 
@@ -119,7 +138,21 @@ bool CameraCapture::initialize(std::string& error)
         return false;
     }
 
-    result = devices[0]->ActivateObject(IID_PPV_ARGS(&impl_->mediaSource));
+    std::vector<std::wstring> friendlyNames;
+    friendlyNames.reserve(deviceCount);
+    for (UINT32 index = 0; index < deviceCount; ++index)
+    {
+        friendlyNames.push_back(getCameraFriendlyName(*devices[index]));
+        const std::wstring diagnostic = L"Native camera candidate "
+            + std::to_wstring(index) + L": " + friendlyNames.back() + L"\n";
+        OutputDebugStringW(diagnostic.c_str());
+    }
+
+    const std::size_t selectedIndex = ryoiki::runtime::selectUserFacingCamera(friendlyNames);
+    const std::wstring selectedDiagnostic = L"Native camera selected: "
+        + friendlyNames[selectedIndex] + L"\n";
+    OutputDebugStringW(selectedDiagnostic.c_str());
+    result = devices[selectedIndex]->ActivateObject(IID_PPV_ARGS(&impl_->mediaSource));
     for (UINT32 index = 0; index < deviceCount; ++index)
     {
         devices[index]->Release();

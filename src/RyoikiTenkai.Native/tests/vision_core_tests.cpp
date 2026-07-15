@@ -3,6 +3,7 @@
 #include "Geometry/hand_geometry_processor.h"
 #include "Pipeline/latest_frame_slot.h"
 #include "Pipeline/perception_mailbox.h"
+#include "Runtime/camera_device_selection.h"
 
 #include <chrono>
 #include <cmath>
@@ -259,6 +260,22 @@ void testInvalidGeometryInputs()
     }
     require(zeroShapeRejected, "Tensor buffer accepted a zero dimension.");
 }
+
+void testUserFacingCameraSelection()
+{
+    require(ryoiki::runtime::selectUserFacingCamera(
+        std::vector<std::wstring>{L"Surface Camera Rear", L"Surface Camera Front"}) == 1,
+        "Camera selection did not prefer the user-facing Surface camera.");
+    require(ryoiki::runtime::selectUserFacingCamera(
+        std::vector<std::wstring>{L"Surface IR Camera Front", L"Surface Camera Front"}) == 1,
+        "Camera selection preferred an infrared camera over the front color camera.");
+    require(ryoiki::runtime::selectUserFacingCamera(
+        std::vector<std::wstring>{L"REAR CAMERA", L"FRONT CAMERA"}) == 1,
+        "Camera selection was case-sensitive.");
+    require(ryoiki::runtime::selectUserFacingCamera(
+        std::vector<std::wstring>{L"USB Camera", L"External Capture"}) == 0,
+        "Camera selection did not preserve enumeration-order fallback.");
+}
 }
 
 int main()
@@ -271,6 +288,7 @@ int main()
         testPalmLetterboxAndRgbPacking();
         testRotatedHandRegions();
         testInvalidGeometryInputs();
+        testUserFacingCameraSelection();
         std::cout << "VisionCore tests passed.\n";
         return 0;
     }
