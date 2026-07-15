@@ -316,6 +316,10 @@ dotnet build src/RyoikiTenkai.Wpf/RyoikiTenkai.Wpf.csproj `
   --no-restore -p:BuildNativeRuntime=true
 ```
 
+This target fails before CMake runs when the Visual Studio target architecture is not
+ARM64 or the vcpkg toolchain cannot be found. This prevents a regular PowerShell or a
+stale x86 developer environment from silently producing an incompatible native DLL.
+
 If the build directory was previously configured for x86 or another architecture, delete it before reconfiguring:
 
 ```cmd

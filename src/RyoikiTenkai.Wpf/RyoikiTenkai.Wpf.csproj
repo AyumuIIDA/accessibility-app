@@ -30,6 +30,12 @@
   <Target Name="BuildNativeRuntimeWithCMake"
           BeforeTargets="Build"
           Condition="'$(BuildNativeRuntime)' == 'true'">
+    <Error Condition="'$(VSCMD_ARG_TGT_ARCH)' != 'arm64'"
+           Text="BuildNativeRuntime=true requires an ARM64 Visual Studio developer shell (VSCMD_ARG_TGT_ARCH=arm64)." />
+    <Error Condition="'$(VcpkgRoot)' == ''"
+           Text="BuildNativeRuntime=true requires VCPKG_ROOT or a Visual Studio installation with bundled vcpkg." />
+    <Error Condition="!Exists('$(VcpkgRoot)\scripts\buildsystems\vcpkg.cmake')"
+           Text="The vcpkg CMake toolchain was not found at '$(VcpkgRoot)\scripts\buildsystems\vcpkg.cmake'." />
     <Exec Command="cmake -S &quot;$(NativeRuntimeSourceDir)&quot; -B &quot;$(NativeRuntimeBuildDir)&quot; -G Ninja -DCMAKE_BUILD_TYPE=$(Configuration) $(VcpkgCMakeArgs)" />
     <Exec Command="cmake --build &quot;$(NativeRuntimeBuildDir)&quot;" />
   </Target>
