@@ -3,6 +3,7 @@
 #include "Geometry/hand_geometry_processor.h"
 #include "Pipeline/latest_frame_slot.h"
 #include "Pipeline/perception_mailbox.h"
+#include "Rendering/latest_render_packet_slot.h"
 #include "Runtime/camera_device_selection.h"
 
 #include <chrono>
@@ -276,6 +277,33 @@ void testUserFacingCameraSelection()
         std::vector<std::wstring>{L"USB Camera", L"External Capture"}) == 0,
         "Camera selection did not preserve enumeration-order fallback.");
 }
+
+void testLatestRenderPacketKeepsFrameAndMetadataTogether()
+{
+    ryoiki::rendering::LatestRenderPacketSlot slot;
+    ryoiki::hand_perception::HandPerceptionResult firstResult;
+    firstResult.hand.detected = true;
+    firstResult.hand.confidence = 0.75F;
+    slot.publish({createFrame(11), firstResult});
+
+    const auto first = slot.snapshot();
+    require(first.has_value() && first->frame != nullptr && first->frame->frameId() == 11,
+        "Render packet slot did not retain the source frame.");
+    require(first->perception.hand.detected
+            && first->perception.hand.confidence == 0.75F,
+        "Render packet slot detached metadata from its source frame.");
+
+    ryoiki::hand_perception::HandPerceptionResult secondResult;
+    slot.publish({createFrame(12), secondResult});
+    const auto latest = slot.snapshot();
+    require(latest.has_value() && latest->frame->frameId() == 12,
+        "Render packet slot did not replace a stale packet.");
+    require(!latest->perception.hand.detected,
+        "Render packet slot mixed metadata from different frames.");
+
+    slot.clear();
+    require(!slot.snapshot().has_value(), "Render packet slot clear retained a packet.");
+}
 }
 
 int main()
@@ -289,6 +317,7 @@ int main()
         testRotatedHandRegions();
         testInvalidGeometryInputs();
         testUserFacingCameraSelection();
+        testLatestRenderPacketKeepsFrameAndMetadataTogether();
         std::cout << "VisionCore tests passed.\n";
         return 0;
     }

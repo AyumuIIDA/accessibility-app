@@ -12,7 +12,6 @@ them:
 ```text
 CameraCapture
   -> Buffers/FramePool
-  -> Pipeline/LatestFrameSlot -> HWND display
   -> Pipeline/PerceptionMailbox (capacity 1)
        -> HandPerception/MediaPipeGraph/HandPerceptionGraph
             -> PalmDetectionGraph -> IPalmDetectionRunner
@@ -20,12 +19,14 @@ CameraCapture
             -> HandLandmarkGraph -> IHandLandmarkRunner
             -> HandLandmarksToRoi -> next-frame ROI loopback
             -> CPU ONNX Runtime runners
+       -> Rendering/LatestRenderPacketSlot
+            -> reusable GDI back buffer -> HWND present
 ```
 
 - `Buffers` owns reusable image/tensor storage and memory-location metadata. It does
   not schedule work or interpret hand coordinates.
-- `Pipeline` owns delivery policy only. Display retains the latest frame and
-  perception overwrites stale pending work.
+- `Pipeline` owns perception delivery policy only. Its capacity-one mailbox
+  overwrites stale pending work.
 - `Geometry` owns OpenCV resize, letterbox, rotated ROI warp, coordinate transforms,
   and tensor packing. It does not select an execution provider or decode model output.
 - `ModelRunners` owns model loading, model-specific tensor contracts, and raw tensor
@@ -38,12 +39,16 @@ CameraCapture
   interfaces and does not select hardware providers.
 - `CameraCapture` owns Media Foundation and copies samples into caller-provided native
   storage. It does not publish frames or call perception.
+- `Rendering` joins a source frame with the palm/hand result produced from that exact
+  frame. It retains only the latest completed render packet. The HWND draws the image
+  and overlays into a reusable offscreen buffer, then presents the completed image in
+  one `BitBlt` operation.
 - `ryoiki_native.cpp` is the runtime/C ABI composition root. It owns lifecycle,
   workers, polling snapshots, and the current HWND adapter.
 
 The `RyoikiTenkai.VisionCore` static target contains `Buffers`, `Pipeline`, `Geometry`,
-and `HandPerception`, allowing those layers to be tested without a camera, WPF, or a
-native window.
+`HandPerception`, and the platform-neutral render packet slot, allowing those layers
+to be tested without a camera, WPF, or a native window.
 
 ## ABI compatibility
 
@@ -90,10 +95,13 @@ with a mutex and copies it into caller-owned structures.
 - `capture_timestamp_us` is a monotonic native timestamp in microseconds. Its epoch is
   unspecified, so it is valid for durations and ordering, not wall-clock display.
 - The capture worker acquires top-down BGRA32 frames from a fixed native frame pool.
-- The display path retains one latest frame. The perception path has a capacity-one
-  mailbox and overwrites stale pending work.
-- The display path paints whichever frame is latest when `WM_PAINT` runs. Frames
-  superseded before painting are intentionally dropped.
+- The perception path has a capacity-one mailbox and overwrites stale pending work.
+- Every accepted perception frame produces one terminal render packet, including
+  no-hand and recoverable-error results. A render packet always carries metadata from
+  the same `frame_id` as its retained frame.
+- The display path retains the latest completed render packet. Packets superseded
+  before `WM_PAINT` are intentionally dropped. Camera capture does not independently
+  trigger a normal frame paint.
 
 ## Coordinates
 
@@ -130,6 +138,9 @@ instead of hiding it in `native_overhead_ms`.
 The current native implementation populates all listed CPU stages. Palm stages are
 zero on frames that successfully use the landmark ROI loopback; they run again after
 tracking confidence falls below the fallback threshold.
+
+Display FPS counts newly presented render packet frame IDs. Window exposure or resize
+paints that re-present the same packet do not increment the display cadence metric.
 
 ## Failure handling
 

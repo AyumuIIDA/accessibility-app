@@ -217,8 +217,10 @@ ABI version before creating a runtime and validates the version and size of ever
 polled structure.
 
 The native runtime currently captures a user-facing camera through Media Foundation,
-converts frames to top-down BGRA32, publishes pooled native-owned frames to separate
-latest-display and capacity-one perception paths, and renders into the child HWND. The
+converts frames to top-down BGRA32, and sends pooled native-owned frames through a
+capacity-one perception path. Perception completion publishes one synchronized render
+packet containing the source frame and its palm/hand metadata. The child HWND composes
+that packet in a reusable GDI back buffer and presents it with one blit. The
 perception worker uses OpenCV to letterbox the palm input and pack an RGB NHWC float
 tensor. CPU model runners execute both ONNX models through ONNX Runtime. The
 MediaPipe-like graph decodes palm anchors, creates a rotated hand ROI, projects 21

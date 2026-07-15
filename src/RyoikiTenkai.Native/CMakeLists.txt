@@ -65,6 +65,7 @@ add_library(RyoikiTenkai.VisionCore STATIC
     src/HandPerception/ModelRunners/palm_detection_runner.cpp
     src/Pipeline/latest_frame_slot.cpp
     src/Pipeline/perception_mailbox.cpp
+    src/Rendering/latest_render_packet_slot.cpp
     src/Runtime/camera_device_selection.cpp
 )
 

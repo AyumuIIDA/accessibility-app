@@ -3,8 +3,8 @@
 #include "HandPerception/MediaPipeGraph/hand_perception_graph.h"
 #include "HandPerception/ModelRunners/cpu_hand_landmark_runner.h"
 #include "HandPerception/ModelRunners/cpu_palm_detection_runner.h"
-#include "Pipeline/latest_frame_slot.h"
 #include "Pipeline/perception_mailbox.h"
+#include "Rendering/latest_render_packet_slot.h"
 #include "camera_capture.h"
 
 #include <Windows.h>
@@ -103,6 +103,81 @@ void copyString(const std::string& source, char* buffer, const std::int32_t buff
 }
 }
 
+namespace
+{
+class GdiBackBuffer final
+{
+public:
+    GdiBackBuffer() = default;
+    ~GdiBackBuffer()
+    {
+        if (dc_ != nullptr && defaultBitmap_ != nullptr)
+        {
+            SelectObject(dc_, defaultBitmap_);
+        }
+        if (bitmap_ != nullptr)
+        {
+            DeleteObject(bitmap_);
+        }
+        if (dc_ != nullptr)
+        {
+            DeleteDC(dc_);
+        }
+    }
+
+    GdiBackBuffer(const GdiBackBuffer&) = delete;
+    GdiBackBuffer& operator=(const GdiBackBuffer&) = delete;
+
+    [[nodiscard]] bool ensure(const HDC referenceDc, const int width, const int height)
+    {
+        if (width <= 0 || height <= 0)
+        {
+            return false;
+        }
+        if (dc_ != nullptr && bitmap_ != nullptr && width_ == width && height_ == height)
+        {
+            return true;
+        }
+        if (dc_ == nullptr)
+        {
+            dc_ = CreateCompatibleDC(referenceDc);
+            if (dc_ == nullptr)
+            {
+                return false;
+            }
+        }
+
+        const HBITMAP replacement = CreateCompatibleBitmap(referenceDc, width, height);
+        if (replacement == nullptr)
+        {
+            return false;
+        }
+        const auto previous = SelectObject(dc_, replacement);
+        if (defaultBitmap_ == nullptr)
+        {
+            defaultBitmap_ = previous;
+        }
+        if (bitmap_ != nullptr)
+        {
+            DeleteObject(bitmap_);
+        }
+        bitmap_ = replacement;
+        width_ = width;
+        height_ = height;
+        return true;
+    }
+
+    [[nodiscard]] HDC dc() const noexcept { return dc_; }
+
+private:
+    HDC dc_{nullptr};
+    HBITMAP bitmap_{nullptr};
+    HGDIOBJ defaultBitmap_{nullptr};
+    int width_{0};
+    int height_{0};
+};
+}
+
 struct RyoikiHandle
 {
     explicit RyoikiHandle(HWND parent) : parentHwnd{parent}
@@ -126,12 +201,14 @@ struct RyoikiHandle
     RyoikiPalmResult palm{};
     RyoikiHandResult hand{};
     ryoiki::buffers::FramePool framePool{4};
-    ryoiki::pipeline::LatestFrameSlot displayFrames;
     ryoiki::pipeline::PerceptionMailbox perceptionMailbox;
+    ryoiki::rendering::LatestRenderPacketSlot renderPackets;
+    GdiBackBuffer backBuffer;
     CameraCapture* activeCapture{nullptr};
     std::string lastError;
     std::chrono::steady_clock::time_point startedAt{};
     std::chrono::steady_clock::time_point lastDisplayAt{};
+    std::uint64_t lastPresentedFrameId{0};
 
     void setError(const std::string& message)
     {
@@ -195,28 +272,33 @@ void drawPalmOverlay(
     const int targetY,
     const int targetWidth,
     const int targetHeight,
-    const RyoikiPalmResult& palm)
+    const std::uint32_t sourceWidth,
+    const std::uint32_t sourceHeight,
+    const ryoiki::hand_perception::PalmDetectionResult& palms)
 {
-    if (palm.palm_count <= 0)
+    if (palms.size() == 0 || sourceWidth == 0 || sourceHeight == 0)
     {
         return;
     }
 
-    const auto mapX = [targetX, targetWidth](const float normalizedX)
+    const auto& palm = palms[0];
+    const auto mapX = [targetX, targetWidth, sourceWidth](const float sourceX)
     {
+        const float normalizedX = sourceX / static_cast<float>(sourceWidth);
         return targetX + static_cast<int>(
             (1.0F - std::clamp(normalizedX, 0.0F, 1.0F)) * targetWidth);
     };
-    const auto mapY = [targetY, targetHeight](const float normalizedY)
+    const auto mapY = [targetY, targetHeight, sourceHeight](const float sourceY)
     {
+        const float normalizedY = sourceY / static_cast<float>(sourceHeight);
         return targetY + static_cast<int>(
             std::clamp(normalizedY, 0.0F, 1.0F) * targetHeight);
     };
 
-    const int left = mapX(palm.bbox[2]);
-    const int right = mapX(palm.bbox[0]);
-    const int top = mapY(palm.bbox[1]);
-    const int bottom = mapY(palm.bbox[3]);
+    const int left = mapX(palm.box.right);
+    const int right = mapX(palm.box.left);
+    const int top = mapY(palm.box.top);
+    const int bottom = mapY(palm.box.bottom);
     const auto pen = CreatePen(PS_SOLID, 3, RGB(0, 255, 180));
     const auto oldPen = SelectObject(dc, pen);
     const auto oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
@@ -224,8 +306,8 @@ void drawPalmOverlay(
 
     for (std::size_t index = 0; index < 7; ++index)
     {
-        const int x = mapX(palm.keypoints[index * 2]);
-        const int y = mapY(palm.keypoints[index * 2 + 1]);
+        const int x = mapX(palm.keypoints[index].x);
+        const int y = mapY(palm.keypoints[index].y);
         Ellipse(dc, x - 3, y - 3, x + 4, y + 4);
     }
 
@@ -240,17 +322,28 @@ void drawHandOverlay(
     const int targetY,
     const int targetWidth,
     const int targetHeight,
-    const RyoikiHandResult& hand)
+    const std::uint32_t sourceWidth,
+    const std::uint32_t sourceHeight,
+    const ryoiki::hand_perception::HandLandmarkResult& hand)
 {
-    if (hand.hand_count <= 0)
+    if (!hand.detected || sourceWidth == 0 || sourceHeight == 0)
     {
         return;
     }
 
-    const auto mapPoint = [targetX, targetY, targetWidth, targetHeight, &hand](const int index)
+    const auto mapPoint = [
+        targetX,
+        targetY,
+        targetWidth,
+        targetHeight,
+        sourceWidth,
+        sourceHeight,
+        &hand](const int index)
     {
-        const float x = std::clamp(hand.landmarks[index * 3], 0.0F, 1.0F);
-        const float y = std::clamp(hand.landmarks[index * 3 + 1], 0.0F, 1.0F);
+        const float x = std::clamp(
+            hand.landmarks[index].x / static_cast<float>(sourceWidth), 0.0F, 1.0F);
+        const float y = std::clamp(
+            hand.landmarks[index].y / static_cast<float>(sourceHeight), 0.0F, 1.0F);
         return POINT{
             targetX + static_cast<LONG>((1.0F - x) * targetWidth),
             targetY + static_cast<LONG>(y * targetHeight)};
@@ -288,22 +381,30 @@ void paintNativeWindow(RyoikiHandle& handle, const HDC dc, const RECT& rect)
 {
     using clock = std::chrono::steady_clock;
     const auto renderStarted = clock::now();
-    const auto background = CreateSolidBrush(RGB(5, 6, 8));
-    FillRect(dc, &rect, background);
-    DeleteObject(background);
+    const int viewWidth = rect.right - rect.left;
+    const int viewHeight = rect.bottom - rect.top;
+    if (viewWidth <= 0 || viewHeight <= 0)
+    {
+        return;
+    }
+
+    const bool buffered = handle.backBuffer.ensure(dc, viewWidth, viewHeight);
+    const HDC renderDc = buffered ? handle.backBuffer.dc() : dc;
+    RECT renderRect{0, 0, viewWidth, viewHeight};
+    SetDCBrushColor(renderDc, RGB(5, 6, 8));
+    FillRect(renderDc, &renderRect, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
 
     std::uint64_t frameId = 0;
     std::uint64_t captureTimestampUs = 0;
     bool frameDrawn = false;
 
-    const auto frame = handle.displayFrames.snapshot();
-    if (frame != nullptr)
+    const auto packet = handle.renderPackets.snapshot();
+    if (packet.has_value() && packet->frame != nullptr)
     {
+        const auto& frame = packet->frame;
         const auto& pixels = frame->pixels();
         if (!pixels.empty() && frame->width() > 0 && frame->height() > 0)
         {
-            const int viewWidth = rect.right - rect.left;
-            const int viewHeight = rect.bottom - rect.top;
             const double scale = (std::min)(
                 viewWidth / static_cast<double>(frame->width()),
                 viewHeight / static_cast<double>(frame->height()));
@@ -320,10 +421,10 @@ void paintNativeWindow(RyoikiHandle& handle, const HDC dc, const RECT& rect)
             bitmapInfo.bmiHeader.biBitCount = 32;
             bitmapInfo.bmiHeader.biCompression = BI_RGB;
 
-            SetStretchBltMode(dc, HALFTONE);
-            SetBrushOrgEx(dc, 0, 0, nullptr);
+            SetStretchBltMode(renderDc, HALFTONE);
+            SetBrushOrgEx(renderDc, 0, 0, nullptr);
             StretchDIBits(
-                dc,
+                renderDc,
                 targetX + targetWidth,
                 targetY,
                 -targetWidth,
@@ -337,27 +438,24 @@ void paintNativeWindow(RyoikiHandle& handle, const HDC dc, const RECT& rect)
                 DIB_RGB_COLORS,
                 SRCCOPY);
 
-            RyoikiPalmResult palmSnapshot{};
-            RyoikiHandResult handSnapshot{};
-            {
-                std::lock_guard lock{handle.stateMutex};
-                palmSnapshot = handle.palm;
-                handSnapshot = handle.hand;
-            }
             drawPalmOverlay(
-                dc,
+                renderDc,
                 targetX,
                 targetY,
                 targetWidth,
                 targetHeight,
-                palmSnapshot);
+                frame->width(),
+                frame->height(),
+                packet->perception.palms);
             drawHandOverlay(
-                dc,
+                renderDc,
                 targetX,
                 targetY,
                 targetWidth,
                 targetHeight,
-                handSnapshot);
+                frame->width(),
+                frame->height(),
+                packet->perception.hand);
 
             frameId = frame->frameId();
             captureTimestampUs = frame->captureTimestampUs();
@@ -373,13 +471,17 @@ void paintNativeWindow(RyoikiHandle& handle, const HDC dc, const RECT& rect)
             error = handle.lastError;
         }
 
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, error.empty() ? RGB(0, 255, 180) : RGB(255, 120, 120));
+        SetBkMode(renderDc, TRANSPARENT);
+        SetTextColor(renderDc, error.empty() ? RGB(0, 255, 180) : RGB(255, 120, 120));
         const wchar_t* message = error.empty()
             ? L"Starting native camera..."
             : L"Native camera unavailable. See application log.";
-        auto textRect = rect;
-        DrawTextW(dc, message, -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawTextW(renderDc, message, -1, &renderRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    if (buffered)
+    {
+        BitBlt(dc, 0, 0, viewWidth, viewHeight, renderDc, 0, 0, SRCCOPY);
     }
 
     const auto renderCompleted = clock::now();
@@ -388,17 +490,24 @@ void paintNativeWindow(RyoikiHandle& handle, const HDC dc, const RECT& rect)
     const auto renderTimestampUs = std::chrono::duration_cast<std::chrono::microseconds>(
         renderCompleted.time_since_epoch()).count();
 
+    if (!frameDrawn || frameId == handle.lastPresentedFrameId)
+    {
+        return;
+    }
+    handle.lastPresentedFrameId = frameId;
+
     std::lock_guard lock{handle.stateMutex};
     if (handle.lastDisplayAt != clock::time_point{})
     {
-        const auto displayDelta = std::chrono::duration<double>(
+        const double displayDelta = std::chrono::duration<double>(
             renderCompleted - handle.lastDisplayAt).count();
         handle.metrics.display_fps = displayDelta > 0.0 ? 1.0 / displayDelta : 0.0;
     }
     handle.lastDisplayAt = renderCompleted;
+    handle.metrics.frame_id = frameId;
+    handle.metrics.capture_timestamp_us = captureTimestampUs;
     handle.metrics.overlay_render_ms = renderMs;
-    if (frameDrawn && frameId == handle.metrics.frame_id
-        && renderTimestampUs >= static_cast<std::int64_t>(captureTimestampUs))
+    if (renderTimestampUs >= static_cast<std::int64_t>(captureTimestampUs))
     {
         handle.metrics.end_to_end_latency_ms =
             (renderTimestampUs - static_cast<std::int64_t>(captureTimestampUs)) / 1000.0;
@@ -460,7 +569,6 @@ void runCaptureLoop(RyoikiHandle& handle)
         lastCaptureAt = now;
         ++frameId;
 
-        bool published = false;
         if (frame != nullptr
             && frame->prepare(
                 width,
@@ -469,16 +577,12 @@ void runCaptureLoop(RyoikiHandle& handle)
                 static_cast<std::uint64_t>(captureTimestamp)))
         {
             std::shared_ptr<const ryoiki::buffers::FrameBuffer> publishedFrame = frame;
-            handle.displayFrames.publish(publishedFrame);
             handle.perceptionMailbox.publish(std::move(publishedFrame));
-            published = true;
         }
 
         const auto perceptionDrops = handle.perceptionMailbox.droppedFrames();
         {
             std::lock_guard lock{handle.stateMutex};
-            handle.metrics.frame_id = frameId;
-            handle.metrics.capture_timestamp_us = static_cast<std::uint64_t>(captureTimestamp);
             handle.metrics.runtime_seconds = runtime;
             handle.metrics.camera_fps = cameraFps;
             handle.metrics.camera_wait_ms = cameraWaitMs;
@@ -489,10 +593,6 @@ void runCaptureLoop(RyoikiHandle& handle)
 
         }
 
-        if (published && handle.childHwnd != nullptr)
-        {
-            InvalidateRect(handle.childHwnd, nullptr, FALSE);
-        }
     }
 
     handle.perceptionMailbox.stop();
@@ -619,6 +719,7 @@ void runPerceptionLoop(RyoikiHandle& handle)
             }
         }
 
+        handle.renderPackets.publish({frame, perceptionResult});
         if (handle.childHwnd != nullptr)
         {
             InvalidateRect(handle.childHwnd, nullptr, FALSE);
@@ -716,9 +817,10 @@ RYOIKI_EXPORT std::int32_t ryoiki_start(RyoikiHandle* handle)
             handle->hand.struct_size = static_cast<std::uint32_t>(sizeof(RyoikiHandResult));
             handle->lastError.clear();
             handle->lastDisplayAt = {};
+            handle->lastPresentedFrameId = 0;
         }
         handle->framePool.resetStatistics();
-        handle->displayFrames.clear();
+        handle->renderPackets.clear();
         handle->perceptionMailbox.reset();
 
         handle->perceptionWorker = std::thread{[handle]
@@ -811,7 +913,7 @@ RYOIKI_EXPORT void ryoiki_stop(RyoikiHandle* handle)
         {
             handle->perceptionWorker.join();
         }
-        handle->displayFrames.clear();
+        handle->renderPackets.clear();
     }
     catch (...)
     {
