@@ -4,10 +4,12 @@ using System.Windows.Controls;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Shapes;
+using System.Windows.Threading;
 using RyoikiTenkai.Actions;
 using RyoikiTenkai.Core;
 using RyoikiTenkai.Storage;
 using RyoikiTenkai.Vision;
+using RyoikiTenkai.Wpf.Native;
 
 namespace RyoikiTenkai.Wpf;
 
@@ -39,6 +41,8 @@ public partial class MainWindow : Window
     private DateTimeOffset _lastExecution = DateTimeOffset.MinValue;
     private bool _isExecuting;
     private bool _isInferenceRunning;
+    private readonly DispatcherTimer _nativePollTimer;
+    private string? _lastNativeRuntimeError;
 
     public MainWindow()
     {
@@ -47,6 +51,12 @@ public partial class MainWindow : Window
         _store = new BindingStore(System.IO.Path.Combine(AppContext.BaseDirectory, "bindings.json"));
         _modelDirectory = System.IO.Path.Combine(AppContext.BaseDirectory, "models");
         _logPath = System.IO.Path.Combine(AppContext.BaseDirectory, "ryoikitenkai.log");
+        NativeVisionHostControl.DiagnosticLogged += Log;
+        _nativePollTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(250)
+        };
+        _nativePollTimer.Tick += NativePollTimer_Tick;
         EnsureSeedData();
         RefreshBindings();
         Log($"Ready. Log file: {_logPath}");
@@ -58,6 +68,16 @@ public partial class MainWindow : Window
         StopButton.IsEnabled = true;
         StateText.Text = "Starting camera and model...";
         OverlayStatusText.Text = "Starting";
+
+        if (UseNativeRuntimeCheckBox.IsChecked == true)
+        {
+            if (StartNativeRuntime())
+            {
+                return;
+            }
+
+            Log("Falling back to managed WPF camera pipeline.");
+        }
 
         _cameraLoopCts = new CancellationTokenSource();
         try
@@ -94,7 +114,100 @@ public partial class MainWindow : Window
 
     private void StopButton_Click(object sender, RoutedEventArgs e)
     {
+        var wasNativeStarted = NativeVisionHostControl.IsStarted;
+        StopNativeRuntime();
+        if (wasNativeStarted)
+        {
+            StateText.Text = "Stopped";
+            OverlayStatusText.Text = "Stopped";
+            StartButton.IsEnabled = true;
+            StopButton.IsEnabled = false;
+        }
+
         _cameraLoopCts?.Cancel();
+    }
+
+    private bool StartNativeRuntime()
+    {
+        CameraImage.Visibility = Visibility.Collapsed;
+        OverlayCanvas.Visibility = Visibility.Collapsed;
+        NativeVisionHostControl.Visibility = Visibility.Visible;
+
+        if (!NativeVisionHostControl.StartNativeRuntime())
+        {
+            NativeVisionHostControl.Visibility = Visibility.Collapsed;
+            CameraImage.Visibility = Visibility.Visible;
+            OverlayCanvas.Visibility = Visibility.Visible;
+            return false;
+        }
+
+        StateText.Text = "Running native runtime";
+        OverlayStatusText.Text = "Native runtime";
+        _lastNativeRuntimeError = null;
+        _nativePollTimer.Start();
+        Log("Using native runtime path.");
+        return true;
+    }
+
+    private void StopNativeRuntime()
+    {
+        _nativePollTimer.Stop();
+        NativeVisionHostControl.StopNativeRuntime();
+        NativeVisionHostControl.Visibility = Visibility.Collapsed;
+        CameraImage.Visibility = Visibility.Visible;
+        OverlayCanvas.Visibility = Visibility.Visible;
+    }
+
+    private void NativePollTimer_Tick(object? sender, EventArgs e)
+    {
+        if (!NativeVisionHostControl.NativeAvailable || !NativeVisionHostControl.IsStarted)
+        {
+            return;
+        }
+
+        if (NativeVisionHostControl.TryGetMetrics(out var metrics))
+        {
+            var nativeError = NativeVisionHostControl.GetLastErrorMessage();
+            if (!string.IsNullOrWhiteSpace(nativeError)
+                && !StringComparer.Ordinal.Equals(nativeError, _lastNativeRuntimeError))
+            {
+                _lastNativeRuntimeError = nativeError;
+                Log("Native runtime error: " + nativeError);
+            }
+
+            if (metrics.FrameId == 0)
+            {
+                if (!string.IsNullOrWhiteSpace(nativeError))
+                {
+                    StateText.Text = "Native camera error";
+                    OverlayStatusText.Text = "Native camera unavailable";
+                }
+                return;
+            }
+
+            GestureText.Text = "native";
+            ConfidenceText.Text = "-";
+            if (NativeVisionHostControl.TryGetPalm(out var palm)
+                && palm.FrameId > 0)
+            {
+                GestureText.Text = palm.PalmCount > 0 ? "palm" : "none";
+                ConfidenceText.Text = palm.PalmCount > 0
+                    ? palm.Confidence.ToString("0.000")
+                    : "-";
+            }
+            if (NativeVisionHostControl.TryGetHand(out var hand)
+                && hand.FrameId > 0
+                && hand.HandCount > 0)
+            {
+                GestureText.Text = "hand";
+                ConfidenceText.Text = hand.Confidence.ToString("0.000");
+            }
+            LatencyText.Text = $"{metrics.EndToEndLatencyMs:0.0} ms";
+            StateText.Text = $"Native frame {metrics.FrameId}";
+            OverlayStatusText.Text =
+                $"Native  camera {metrics.CameraFps:0.0}  display {metrics.DisplayFps:0.0} fps  " +
+                $"preprocess {metrics.PreprocessMs:0.0} ms  drops {metrics.FramePoolDroppedFrames}/{metrics.PerceptionDroppedFrames}";
+        }
     }
 
     private async Task RunCameraLoopAsync(CancellationToken cancellationToken)

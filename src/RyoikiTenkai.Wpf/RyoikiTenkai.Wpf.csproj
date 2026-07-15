@@ -6,6 +6,14 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <NativeRuntimeSourceDir>$(MSBuildProjectDirectory)\..\RyoikiTenkai.Native</NativeRuntimeSourceDir>
+    <NativeRuntimeBuildDir>$(MSBuildProjectDirectory)\..\..\build\RyoikiTenkai.Native.OpenCv</NativeRuntimeBuildDir>
+    <VcpkgRoot Condition="'$(VcpkgRoot)' == ''">$(VCPKG_ROOT)</VcpkgRoot>
+    <VcpkgRoot Condition="'$(VcpkgRoot)' == '' and '$(VSINSTALLDIR)' != ''">$(VSINSTALLDIR)VC\vcpkg</VcpkgRoot>
+    <VcpkgTriplet Condition="'$(VcpkgTriplet)' == ''">arm64-windows-static-md</VcpkgTriplet>
+    <VcpkgCMakeArgs Condition="'$(VcpkgRoot)' != '' and !Exists('$(NativeRuntimeBuildDir)\CMakeCache.txt')">-DCMAKE_TOOLCHAIN_FILE=&quot;$(VcpkgRoot)\scripts\buildsystems\vcpkg.cmake&quot; -DVCPKG_TARGET_TRIPLET=$(VcpkgTriplet)</VcpkgCMakeArgs>
+    <BuildNativeRuntime Condition="'$(BuildNativeRuntime)' == ''">false</BuildNativeRuntime>
   </PropertyGroup>
 
   <ItemGroup>
@@ -18,5 +26,20 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
+
+  <Target Name="BuildNativeRuntimeWithCMake"
+          BeforeTargets="Build"
+          Condition="'$(BuildNativeRuntime)' == 'true'">
+    <Exec Command="cmake -S &quot;$(NativeRuntimeSourceDir)&quot; -B &quot;$(NativeRuntimeBuildDir)&quot; -G Ninja -DCMAKE_BUILD_TYPE=$(Configuration) $(VcpkgCMakeArgs)" />
+    <Exec Command="cmake --build &quot;$(NativeRuntimeBuildDir)&quot;" />
+  </Target>
+
+  <Target Name="CopyNativeRuntime"
+          AfterTargets="Build"
+          Condition="Exists('$(NativeRuntimeBuildDir)\RyoikiTenkai.Native.dll')">
+    <Copy SourceFiles="$(NativeRuntimeBuildDir)\RyoikiTenkai.Native.dll"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true" />
+  </Target>
 
 </Project>
