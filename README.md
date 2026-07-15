@@ -51,6 +51,9 @@ src/RyoikiTenkai/
 
 src/RyoikiTenkai.Wpf/
   WPF demo UI.
+
+src/RyoikiTenkai.Native/
+  Experimental C++ native vision runtime DLL skeleton.
 ```
 
 ## First-Time Setup
@@ -124,7 +127,7 @@ hand_landmark.onnx
 The WPF project copies these files to its output directory at build time:
 
 ```text
-src/RyoikiTenkai.Wpf/bin/Debug/net10.0-windows10.0.26100.0/models/
+src/RyoikiTenkai.Wpf/bin/arm64/Debug/net10.0-windows10.0.26100.0/models/
 ```
 
 ## Common Commands
@@ -177,31 +180,181 @@ Stop a stuck app process:
 Get-Process | Where-Object { $_.ProcessName -like 'RyoikiTenkai*' } | Stop-Process
 ```
 
+## Native Runtime
+
+The repository includes an experimental C++ native runtime boundary:
+
+```text
+src/RyoikiTenkai.Native/
+  CMakeLists.txt
+  vcpkg.json
+  include/ryoiki_native.h
+  src/Buffers/
+  src/Geometry/
+  src/Pipeline/
+  src/camera_capture.cpp
+  src/ryoiki_native.cpp
+```
+
+This skeleton exposes a C ABI for lifecycle and polling:
+
+```text
+ryoiki_get_abi_version
+ryoiki_create
+ryoiki_start
+ryoiki_stop
+ryoiki_resize
+ryoiki_destroy
+ryoiki_get_latest_metrics
+ryoiki_get_latest_palm
+ryoiki_get_latest_hand
+ryoiki_get_last_error
+```
+
+The ABI, ownership, coordinate, timestamp, and metrics contracts are documented in
+[`doc/native-vision-runtime.md`](doc/native-vision-runtime.md). The WPF host checks the
+ABI version before creating a runtime and validates the version and size of every
+polled structure.
+
+The native runtime currently captures the first available camera through Media Foundation,
+converts frames to top-down BGRA32, publishes pooled native-owned frames to separate
+latest-display and capacity-one perception paths, and renders into the child HWND. The
+perception worker uses OpenCV to letterbox the palm input and pack an RGB NHWC float
+tensor. CPU model runners execute both ONNX models through ONNX Runtime. The
+MediaPipe-like graph decodes palm anchors, creates a rotated hand ROI, projects 21
+landmarks back to source coordinates, and reuses a landmark-derived ROI while tracking
+confidence remains above threshold. Palm bbox/keypoints and hand landmarks are exposed
+through ABI polling and rendered by the native HWND overlay. Direct2D/Direct3D
+rendering, DirectML, and QNN remain future phases.
+
+Required native build tools:
+
+```text
+Visual Studio 2022 or later
+Desktop development with C++
+MSVC ARM64 toolchain
+Windows 11 SDK 10.0.26100+
+CMake
+Ninja
+vcpkg (the Visual Studio bundled installation is supported)
+.NET SDK restore of Microsoft.ML.OnnxRuntime 1.27.0
+```
+
+### ARM64 Developer Shell
+
+For native C++ builds, use a Visual Studio developer shell configured for ARM64. A regular PowerShell may not have `cl.exe`, Windows SDK include paths, or MSVC library paths configured.
+
+The most explicit way is:
+
+```cmd
+cmd /k "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat" arm64
+```
+
+`vcvarsall.bat` is the Visual Studio/MSVC environment setup script. It configures:
+
+```text
+PATH
+INCLUDE
+LIB
+LIBPATH
+VCToolsInstallDir
+WindowsSdkDir
+WindowsSDKVersion
+VSCMD_ARG_HOST_ARCH
+VSCMD_ARG_TGT_ARCH
+```
+
+In the opened shell, verify that ARM64 is selected:
+
+```cmd
+where cl
+echo %VSCMD_ARG_HOST_ARCH%
+echo %VSCMD_ARG_TGT_ARCH%
+```
+
+Expected:
+
+```text
+...\Hostarm64\arm64\cl.exe
+arm64
+arm64
+```
+
+If you see `Hostx86\x86\cl.exe` or `x86`, close that shell and reopen an ARM64 developer shell. The native DLL loaded by the WPF app must match the process architecture.
+
+### Build Native DLL
+
+From the ARM64 developer shell:
+
+```powershell
+cd /d C:\Users\hyena\accessibility-app
+
+dotnet restore src/RyoikiTenkai.Wpf/RyoikiTenkai.Wpf.csproj
+cmake -S src/RyoikiTenkai.Native -B build/RyoikiTenkai.Native.OpenCv -G Ninja `
+  -DCMAKE_BUILD_TYPE=Debug `
+  -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
+  -DVCPKG_TARGET_TRIPLET=arm64-windows-static-md
+cmake --build build/RyoikiTenkai.Native.OpenCv
+ctest --test-dir build/RyoikiTenkai.Native.OpenCv --output-on-failure
+```
+
+CMake resolves ONNX Runtime headers and the architecture-specific import library from
+the restored NuGet cache. Override `ONNXRUNTIME_ROOT` only when using a nonstandard
+package location; it must point to the `microsoft.ml.onnxruntime/1.27.0` package root.
+
+The next WPF build automatically copies an existing native DLL into `$(OutDir)`:
+
+```powershell
+dotnet build src/RyoikiTenkai.Wpf/RyoikiTenkai.Wpf.csproj --no-restore
+```
+
+To configure, build, and copy native code through one MSBuild invocation, run this from
+the ARM64 developer shell:
+
+```powershell
+dotnet build src/RyoikiTenkai.Wpf/RyoikiTenkai.Wpf.csproj `
+  --no-restore -p:BuildNativeRuntime=true
+```
+
+If the build directory was previously configured for x86 or another architecture, delete it before reconfiguring:
+
+```cmd
+rmdir /s /q build\RyoikiTenkai.Native.OpenCv
+```
+
+Run WPF and enable the `Native runtime` checkbox before pressing Start.
+
+If the DLL is not present, WPF logs that the native runtime is unavailable and falls back to the managed C# camera pipeline.
+
+If loading fails with `0x800711C7`, Windows Application Control rejected the unsigned
+development DLL. Use the organization-approved development signing process or an
+approved development environment; do not disable the policy as a build workaround.
+
 ## Logs And Runtime Files
 
 WPF runtime log:
 
 ```text
-src/RyoikiTenkai.Wpf/bin/Debug/net10.0-windows10.0.26100.0/ryoikitenkai.log
+src/RyoikiTenkai.Wpf/bin/arm64/Debug/net10.0-windows10.0.26100.0/ryoikitenkai.log
 ```
 
 View latest log:
 
 ```powershell
-Get-Content src/RyoikiTenkai.Wpf/bin/Debug/net10.0-windows10.0.26100.0/ryoikitenkai.log -Tail 100
+Get-Content src/RyoikiTenkai.Wpf/bin/arm64/Debug/net10.0-windows10.0.26100.0/ryoikitenkai.log -Tail 100
 ```
 
 Gesture/action bindings are stored next to the running app:
 
 ```text
-src/RyoikiTenkai.Wpf/bin/Debug/net10.0-windows10.0.26100.0/bindings.json
-src/RyoikiTenkai/bin/Debug/net10.0-windows10.0.26100.0/bindings.json
+src/RyoikiTenkai.Wpf/bin/arm64/Debug/net10.0-windows10.0.26100.0/bindings.json
+src/RyoikiTenkai/bin/arm64/Debug/net10.0-windows10.0.26100.0/bindings.json
 ```
 
 Delete WPF bindings and let the app recreate the default sample:
 
 ```powershell
-Remove-Item src/RyoikiTenkai.Wpf/bin/Debug/net10.0-windows10.0.26100.0/bindings.json
+Remove-Item src/RyoikiTenkai.Wpf/bin/arm64/Debug/net10.0-windows10.0.26100.0/bindings.json
 ```
 
 ## Environment Variables
@@ -266,7 +419,7 @@ Open a new PowerShell session after setting persistent environment variables.
 If camera start fails, inspect:
 
 ```powershell
-Get-Content src/RyoikiTenkai.Wpf/bin/Debug/net10.0-windows10.0.26100.0/ryoikitenkai.log -Tail 200
+Get-Content src/RyoikiTenkai.Wpf/bin/arm64/Debug/net10.0-windows10.0.26100.0/ryoikitenkai.log -Tail 200
 ```
 
 If build fails because `RyoikiTenkai.exe` is locked, stop the running process:

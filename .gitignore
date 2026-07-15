@@ -1,6 +1,10 @@
 .dotnet/
 .nuget/
+.vs/
+build/
 bin/
 obj/
 **/bin/
 **/obj/
+**/out/
+**/vcpkg_installed/
