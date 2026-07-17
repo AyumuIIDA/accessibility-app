@@ -19,6 +19,7 @@ public:
     CameraCapture& operator=(CameraCapture&&) = delete;
 
     bool initialize(std::string& error);
+    [[nodiscard]] std::string subtype() const;
     void requestStop() noexcept;
     bool readFrame(
         std::vector<std::uint8_t>& bgra,

@@ -8,3 +8,13 @@ obj/
 **/obj/
 **/out/
 **/vcpkg_installed/
+
+# Local native diagnostics / probes
+tools/native_provider_probe.cpp
+tools/*probe*.cpp
+tools/*probe*.exe
+
+# Local signing artifacts
+*.pfx
+*.snk
+*.cer

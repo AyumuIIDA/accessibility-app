@@ -12,14 +12,16 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cwctype>
 #include <cstring>
 #include <filesystem>
+#include <iterator>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
-static_assert(sizeof(RyoikiMetrics) == 168);
+static_assert(sizeof(RyoikiMetrics) == 640);
 static_assert(sizeof(RyoikiPalmResult) == 96);
 static_assert(sizeof(RyoikiHandResult) == 296);
 
@@ -104,6 +106,66 @@ void copyString(const std::string& source, char* buffer, const std::int32_t buff
     const auto copy_length = (std::min)(source.size(), max_length);
     std::memcpy(buffer, source.data(), copy_length);
     buffer[copy_length] = '\0';
+}
+
+bool prefersQnnHtp()
+{
+    wchar_t buffer[32]{};
+    const DWORD length = GetEnvironmentVariableW(
+        L"RYOIKI_EXECUTION_PROVIDER",
+        buffer,
+        static_cast<DWORD>(std::size(buffer)));
+    if (length == 0 || length >= std::size(buffer))
+    {
+        return true;
+    }
+
+    std::wstring value{buffer, length};
+    std::ranges::transform(value, value.begin(), [](const wchar_t ch)
+    {
+        return static_cast<wchar_t>(std::towlower(ch));
+    });
+    return value != L"cpu";
+}
+
+bool requiresQnnHtp()
+{
+    wchar_t buffer[32]{};
+    const DWORD length = GetEnvironmentVariableW(
+        L"RYOIKI_EXECUTION_PROVIDER",
+        buffer,
+        static_cast<DWORD>(std::size(buffer)));
+    if (length == 0 || length >= std::size(buffer))
+    {
+        return true;
+    }
+
+    std::wstring value{buffer, length};
+    std::ranges::transform(value, value.begin(), [](const wchar_t ch)
+    {
+        return static_cast<wchar_t>(std::towlower(ch));
+    });
+    return value != L"cpu";
+}
+
+std::string combineFallbackReasons(
+    const std::string_view palmFallback,
+    const std::string_view handFallback)
+{
+    std::string combined;
+    if (!palmFallback.empty())
+    {
+        combined += palmFallback;
+    }
+    if (!handFallback.empty())
+    {
+        if (!combined.empty())
+        {
+            combined += " ";
+        }
+        combined += handFallback;
+    }
+    return combined;
 }
 }
 
@@ -191,6 +253,7 @@ void recordPresentation(
         handle.metrics.end_to_end_latency_ms =
             (renderTimestampUs - static_cast<std::int64_t>(presentation.captureTimestampUs))
             / 1000.0;
+        handle.metrics.render_frame_age_ms = handle.metrics.end_to_end_latency_ms;
     }
 }
 
@@ -227,17 +290,28 @@ void requestCaptureStop(RyoikiHandle& handle)
 
 std::filesystem::path getModelPath(const wchar_t* fileName)
 {
-    std::wstring executablePath(32768, L'\0');
+    HMODULE module{};
+    const auto flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+        | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+    if (GetModuleHandleExW(
+            flags,
+            reinterpret_cast<LPCWSTR>(&getModelPath),
+            &module) == 0)
+    {
+        module = nullptr;
+    }
+
+    std::wstring modulePath(32768, L'\0');
     const DWORD length = GetModuleFileNameW(
-        nullptr,
-        executablePath.data(),
-        static_cast<DWORD>(executablePath.size()));
-    if (length == 0 || length >= executablePath.size())
+        module,
+        modulePath.data(),
+        static_cast<DWORD>(modulePath.size()));
+    if (length == 0 || length >= modulePath.size())
     {
         return {};
     }
-    executablePath.resize(length);
-    return std::filesystem::path{executablePath}.parent_path()
+    modulePath.resize(length);
+    return std::filesystem::path{modulePath}.parent_path()
         / L"models" / fileName;
 }
 
@@ -311,6 +385,9 @@ void runCaptureLoop(RyoikiHandle& handle)
         }
 
         const auto perceptionDrops = handle.perceptionMailbox.droppedFrames();
+        const auto orientedSize = ryoiki::runtime::orientedSize(width, height, orientation);
+        const auto frameBytes = static_cast<std::uint64_t>(width)
+            * static_cast<std::uint64_t>(height) * 4U;
         {
             std::lock_guard lock{handle.stateMutex};
             handle.metrics.runtime_seconds = runtime;
@@ -320,6 +397,13 @@ void runCaptureLoop(RyoikiHandle& handle)
             handle.metrics.native_overhead_ms = 0.0;
             handle.metrics.frame_pool_dropped_frames = handle.framePool.droppedAcquisitions();
             handle.metrics.perception_dropped_frames = perceptionDrops;
+            handle.metrics.capture_width = width;
+            handle.metrics.capture_height = height;
+            handle.metrics.upright_width = orientedSize.width;
+            handle.metrics.upright_height = orientedSize.height;
+            handle.metrics.frame_bytes = frameBytes;
+            copyString(camera.subtype(), handle.metrics.camera_subtype,
+                static_cast<std::int32_t>(std::size(handle.metrics.camera_subtype)));
 
         }
 
@@ -333,8 +417,12 @@ void runPerceptionLoop(RyoikiHandle& handle)
 {
     using clock = std::chrono::steady_clock;
     std::string error;
+    const ryoiki::hand_perception::ModelRunnerExecutionSettings runnerSettings{
+        .preferQnnHtp = prefersQnnHtp(),
+        .requireQnnHtp = requiresQnnHtp()};
     auto palmRunner = ryoiki::hand_perception::CpuPalmDetectionRunner::create(
         getModelPath(L"palm_detection.onnx"),
+        runnerSettings,
         error);
     if (palmRunner == nullptr)
     {
@@ -344,6 +432,8 @@ void runPerceptionLoop(RyoikiHandle& handle)
     }
     auto handRunner = ryoiki::hand_perception::CpuHandLandmarkRunner::create(
         getModelPath(L"hand_landmark.onnx"),
+        ryoiki::hand_perception::HandLandmarkModelContract::openCvZoo2023(),
+        runnerSettings,
         error);
     if (handRunner == nullptr)
     {
@@ -352,6 +442,11 @@ void runPerceptionLoop(RyoikiHandle& handle)
         return;
     }
 
+    const std::string palmProvider{palmRunner->providerName()};
+    const std::string handProvider{handRunner->providerName()};
+    const std::string fallbackReason = combineFallbackReasons(
+        palmRunner->fallbackReason(),
+        handRunner->fallbackReason());
     ryoiki::hand_perception::HandPerceptionGraph graph{
         std::move(palmRunner),
         std::move(handRunner)};
@@ -361,6 +456,19 @@ void runPerceptionLoop(RyoikiHandle& handle)
     const std::string providerLog = "Hand perception runners selected: "
         + graph.providerSummary() + "\n";
     OutputDebugStringA(providerLog.c_str());
+    if (!fallbackReason.empty())
+    {
+        OutputDebugStringA((fallbackReason + "\n").c_str());
+    }
+    {
+        std::lock_guard lock{handle.stateMutex};
+        copyString(palmProvider, handle.metrics.palm_provider,
+            static_cast<std::int32_t>(std::size(handle.metrics.palm_provider)));
+        copyString(handProvider, handle.metrics.hand_provider,
+            static_cast<std::int32_t>(std::size(handle.metrics.hand_provider)));
+        copyString(fallbackReason, handle.metrics.provider_fallback_reason,
+            static_cast<std::int32_t>(std::size(handle.metrics.provider_fallback_reason)));
+    }
 
     while (handle.running.load())
     {
@@ -371,6 +479,7 @@ void runPerceptionLoop(RyoikiHandle& handle)
         }
 
         error.clear();
+        const auto graphStarted = clock::now();
         if (!graph.process(*frame, perceptionResult, graphMetrics, error))
         {
             handle.setError(error);
@@ -380,11 +489,18 @@ void runPerceptionLoop(RyoikiHandle& handle)
         }
 
         const auto completed = clock::now();
+        const double graphTotalMs = std::chrono::duration<double, std::milli>(
+            completed - graphStarted).count();
         const double perceptionFps = lastPerceptionAt == clock::time_point{}
             ? 0.0
             : 1.0 / std::chrono::duration<double>(completed - lastPerceptionAt).count();
         lastPerceptionAt = completed;
         const auto perceptionDrops = handle.perceptionMailbox.droppedFrames();
+        const auto completedTimestampUs = std::chrono::duration_cast<std::chrono::microseconds>(
+            completed.time_since_epoch()).count();
+        const double frameAgeMs = completedTimestampUs >= static_cast<std::int64_t>(frame->captureTimestampUs())
+            ? (completedTimestampUs - static_cast<std::int64_t>(frame->captureTimestampUs())) / 1000.0
+            : 0.0;
         {
             std::lock_guard lock{handle.stateMutex};
             handle.metrics.perception_fps = perceptionFps;
@@ -395,6 +511,11 @@ void runPerceptionLoop(RyoikiHandle& handle)
             handle.metrics.hand_inference_ms = graphMetrics.hand.inferenceMs;
             handle.metrics.landmark_postprocess_ms = graphMetrics.hand.postprocessMs;
             handle.metrics.tracking_update_ms = graphMetrics.trackingUpdateMs;
+            handle.metrics.graph_total_ms = graphTotalMs;
+            handle.metrics.perception_frame_age_ms = frameAgeMs;
+            handle.metrics.tensor_input_bytes =
+                (192ULL * 192ULL * 3ULL * sizeof(float))
+                + (224ULL * 224ULL * 3ULL * sizeof(float));
             handle.metrics.perception_dropped_frames = perceptionDrops;
             handle.palm.frame_id = frame->frameId();
             handle.palm.palm_count = static_cast<std::int32_t>(perceptionResult.palms.size());

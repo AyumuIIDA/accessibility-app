@@ -1,6 +1,6 @@
 # Native Vision Runtime Contract
 
-This document defines the version 4 contract between the WPF host and
+This document defines the version 6 contract between the WPF host and
 `RyoikiTenkai.Native.dll`. The public declarations are in
 `src/RyoikiTenkai.Native/include/ryoiki_native.h`.
 
@@ -18,7 +18,7 @@ CameraCapture
             -> PalmDetectionToRoi -> rotated hand ROI
             -> HandLandmarkGraph -> IHandLandmarkRunner
             -> HandLandmarksToRoi -> next-frame ROI loopback
-            -> CPU ONNX Runtime runners
+            -> ONNX Runtime runners (QNN/HTP required by default)
        -> Rendering/NativeRenderStage (latest value, render-thread ownership)
             -> D3D11 + DXGI flip swap chain + Direct2D -> atomic present
 ```
@@ -29,11 +29,14 @@ CameraCapture
   overwrites stale pending work.
 - `Geometry` owns OpenCV resize, letterbox, rotated ROI warp, coordinate transforms,
   and tensor packing. It does not select an execution provider or decode model output.
-- `ModelRunners` owns model loading, model-specific tensor contracts, and raw tensor
-  inference only. It does not decode detections or implement tracking policy. Model
-  input/output names, shapes, and element types are validated when a runner is created;
-  contract incompatibility is a fatal initialization error rather than a per-frame
-  fallback.
+- `ModelRunners` owns model loading, model-specific tensor contracts, execution
+  provider selection, and raw tensor inference only. It does not decode detections or
+  implement tracking policy. Native runners request QNN/HTP first unless
+  `RYOIKI_EXECUTION_PROVIDER=cpu` is set. In default native mode, QNN/HTP is required:
+  provider or model-session failure stops perception startup with an explicit error
+  instead of silently creating CPU sessions. Model input/output names, shapes, and
+  element types are validated when a runner is created; contract incompatibility is a
+  fatal initialization error rather than a per-frame fallback.
 - `MediaPipeGraph` owns anchor decode, confidence handling, NMS, palm-to-ROI,
   landmark projection, ROI loopback, and palm fallback. It depends on runner
   interfaces and does not select hardware providers.
@@ -42,9 +45,10 @@ CameraCapture
   a future D3D/DirectML implementation can be injected without adding device branches
   to the MediaPipe-like graph.
 - `CameraCapture` owns Media Foundation and copies samples into caller-provided native
-  storage. It normalizes signed scanline stride but preserves media-type rotation as
-  frame metadata. It does not allocate a rotated full-frame intermediate, publish
-  frames, or call perception.
+  storage. It prefers a small realtime camera mode, currently targeting 640x480,
+  normalizes signed scanline stride, and preserves media-type rotation as frame
+  metadata. It does not allocate a rotated full-frame intermediate, publish frames,
+  or call perception.
 - `Rendering` joins a source frame with the palm/hand result produced from that exact
   frame. `NativeRenderStage` retains only the latest completed packet and owns its
   D3D11 device, immediate context, DXGI flip-model swap chain, and Direct2D context on
@@ -69,6 +73,8 @@ to be tested without a camera, WPF, or a native window.
 - A layout, field meaning, calling convention, or ownership change requires an ABI
   version increment and matching native and managed changes.
 - Structures are blittable values. They contain no pointers or variable-length data.
+- `RyoikiMetrics` includes fixed UTF-8 provider fields for palm inference, hand
+  inference, and any provider fallback/blocking reason.
 - Status-returning functions use a signed 32-bit integer: zero is failure and one is
   success. The ABI does not expose C++ `bool`.
 
@@ -94,7 +100,7 @@ with a mutex and copies it into caller-owned structures.
 - WPF owns the output structure passed to a polling call.
 - A successful polling call copies one small metadata snapshot into that structure.
 - WPF never retains a native image or tensor pointer.
-- Version 4 camera and perception frames use CPU memory internally. Rendering uploads
+- Version 6 camera and perception frames use CPU memory internally. Rendering uploads
   the retained CPU BGRA frame into a reusable Direct2D bitmap. Future GPU or NPU
   buffers remain native-owned; capture-memory migration criteria are documented in
   `doc/native-frame-memory-roadmap.md`.
@@ -109,6 +115,8 @@ with a mutex and copies it into caller-owned structures.
 - `capture_timestamp_us` is a monotonic native timestamp in microseconds. Its epoch is
   unspecified, so it is valid for durations and ordering, not wall-clock display.
 - The capture worker acquires top-down BGRA32 frames from a fixed native frame pool.
+  Capture dimensions, upright dimensions, frame bytes, and camera subtype are exposed
+  in `RyoikiMetrics`.
 - The perception path has a capacity-one mailbox and overwrites stale pending work.
 - Every accepted perception frame produces one terminal render packet, including
   no-hand and recoverable-error results. A render packet always carries metadata from
@@ -133,7 +141,7 @@ with a mutex and copies it into caller-owned structures.
   rotation, so it must not receive a hard-coded 180-degree device correction.
 - `bbox` is `[left, top, right, bottom]`.
 - Palm results include the highest-scoring bbox and seven `[x, y]` keypoints. The
-  `palm_count` may be greater than one even though version 4 copies only the best palm.
+  `palm_count` may be greater than one even though version 6 copies only the best palm.
 - Image `x` and `y` values are expressed in the logical upright image defined by the
   frame orientation metadata, then normalized to `[0, 1]` before presentation
   mirroring. `x` increases right and `y` increases down. Storage width/height remain
@@ -170,6 +178,8 @@ with a mutex and copies it into caller-owned structures.
 - overlay render time
 - end-to-end latency and uncategorized native overhead
 - frame-pool acquisition drops and perception-mailbox overwrite drops
+- capture dimensions/subtype, frame bytes, tensor input bytes, total graph time,
+  perception frame age, and render frame age
 
 All durations use milliseconds. A zero value means the stage is not implemented or
 has not produced a sample yet. Optimization work must populate the relevant stage

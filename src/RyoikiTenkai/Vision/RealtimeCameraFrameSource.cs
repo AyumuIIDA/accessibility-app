@@ -146,8 +146,9 @@ internal sealed class RealtimeCameraFrameSource : IAsyncDisposable
         var preferred = source.SupportedFormats
             .Where(format => IsSupportedVideoSubtype(format.Subtype))
             .Where(format => format.VideoFormat.Width >= 640 && format.VideoFormat.Height >= 360)
-            .OrderBy(format => Math.Abs((int)format.VideoFormat.Width - 1280))
-            .ThenBy(format => Math.Abs((int)format.VideoFormat.Height - 720))
+            .OrderBy(format => format.VideoFormat.Width > 640 || format.VideoFormat.Height > 480 ? 1 : 0)
+            .ThenBy(format => Math.Abs((int)format.VideoFormat.Width - 640))
+            .ThenBy(format => Math.Abs((int)format.VideoFormat.Height - 480))
             .ThenBy(format => Math.Abs(GetFrameRate(format) - 30))
             .FirstOrDefault();
 

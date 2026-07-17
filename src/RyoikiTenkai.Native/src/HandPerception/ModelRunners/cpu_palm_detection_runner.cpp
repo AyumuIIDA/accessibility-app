@@ -1,4 +1,5 @@
 #include "HandPerception/ModelRunners/cpu_palm_detection_runner.h"
+#include "HandPerception/ModelRunners/qnn_execution_provider.h"
 
 #include <onnxruntime_cxx_api.h>
 
@@ -6,6 +7,7 @@
 #include <array>
 #include <chrono>
 #include <filesystem>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -23,11 +25,31 @@ bool hasShape(const std::vector<std::int64_t>& actual, const std::span<const std
     return actual.size() == expected.size()
         && std::equal(actual.begin(), actual.end(), expected.begin());
 }
+
+std::filesystem::path qnnHtpBackendPath()
+{
+    const auto currentPath = std::filesystem::current_path() / "QnnHtp.dll";
+    if (std::filesystem::is_regular_file(currentPath))
+    {
+        return currentPath;
+    }
+
+    return "QnnHtp.dll";
+}
+
+std::string describeOrtException(const Ort::Exception& exception)
+{
+    std::ostringstream stream;
+    stream << exception.what() << " (ORT code " << exception.GetOrtErrorCode() << ")";
+    return stream.str();
+}
 }
 
 struct CpuPalmDetectionRunner::Impl
 {
-    explicit Impl(const std::filesystem::path& modelPath)
+    explicit Impl(
+        const std::filesystem::path& modelPath,
+        const ModelRunnerExecutionSettings& settings)
         : environment{ORT_LOGGING_LEVEL_WARNING, "RyoikiTenkai"}
     {
         if (!std::filesystem::is_regular_file(modelPath))
@@ -35,12 +57,7 @@ struct CpuPalmDetectionRunner::Impl
             throw std::runtime_error{"Palm detection model was not found: " + modelPath.string()};
         }
 
-        sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-        sessionOptions.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
-        session = std::make_unique<Ort::Session>(
-            environment,
-            modelPath.c_str(),
-            sessionOptions);
+        createSession(modelPath, settings);
 
         Ort::AllocatorWithDefaultOptions allocator;
         if (session->GetInputCount() != 1)
@@ -84,9 +101,81 @@ struct CpuPalmDetectionRunner::Impl
 
     static constexpr std::size_t kMissingIndex = static_cast<std::size_t>(-1);
 
+    void configureBaseSessionOptions()
+    {
+        sessionOptions = Ort::SessionOptions{};
+        sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+        sessionOptions.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+    }
+
+    void createSession(
+        const std::filesystem::path& modelPath,
+        const ModelRunnerExecutionSettings& settings)
+    {
+        if (settings.preferQnnHtp)
+        {
+            std::string qnnRegistrationError;
+            try
+            {
+                configureBaseSessionOptions();
+                if (!tryAppendWindowsMlQnnHtp(
+                        environment,
+                        sessionOptions,
+                        providerName,
+                        qnnRegistrationError))
+                {
+                    const auto backendPath = qnnHtpBackendPath().string();
+                    sessionOptions.AppendExecutionProvider(
+                        "QNN",
+                        {{"backend_path", backendPath}});
+                    providerName = "QNNExecutionProvider(HTP)";
+                    if (!qnnRegistrationError.empty())
+                    {
+                        providerName += " after WindowsML registration failed";
+                    }
+                }
+                session = std::make_unique<Ort::Session>(
+                    environment,
+                    modelPath.c_str(),
+                    sessionOptions);
+                provider = ExecutionProvider::QnnHtp;
+                fallbackReason.clear();
+                return;
+            }
+            catch (const Ort::Exception& exception)
+            {
+                fallbackReason = settings.requireQnnHtp
+                    ? "QNN palm session unavailable; NPU is required. "
+                    : "QNN palm session unavailable; using CPU. ";
+                fallbackReason += describeOrtException(exception);
+                if (!qnnRegistrationError.empty())
+                {
+                    fallbackReason += " Windows ML QNN path also failed: "
+                        + qnnRegistrationError;
+                }
+                if (settings.requireQnnHtp)
+                {
+                    throw std::runtime_error{fallbackReason};
+                }
+                session.reset();
+            }
+        }
+
+        configureBaseSessionOptions();
+        session = std::make_unique<Ort::Session>(
+            environment,
+            modelPath.c_str(),
+            sessionOptions);
+        provider = ExecutionProvider::Cpu;
+        providerName = "CPUExecutionProvider";
+    }
+
     Ort::Env environment;
     Ort::SessionOptions sessionOptions;
     std::unique_ptr<Ort::Session> session;
+    ExecutionProvider provider{ExecutionProvider::Cpu};
+    std::string providerName{"CPUExecutionProvider"};
+    std::string fallbackReason;
     std::string inputNameStorage;
     std::string regressionOutputNameStorage;
     std::string scoreOutputNameStorage;
@@ -98,15 +187,23 @@ std::unique_ptr<CpuPalmDetectionRunner> CpuPalmDetectionRunner::create(
     const std::filesystem::path& modelPath,
     std::string& error)
 {
+    return create(modelPath, {}, error);
+}
+
+std::unique_ptr<CpuPalmDetectionRunner> CpuPalmDetectionRunner::create(
+    const std::filesystem::path& modelPath,
+    const ModelRunnerExecutionSettings& settings,
+    std::string& error)
+{
     try
     {
         error.clear();
         return std::unique_ptr<CpuPalmDetectionRunner>{
-            new CpuPalmDetectionRunner{std::make_unique<Impl>(modelPath)}};
+            new CpuPalmDetectionRunner{std::make_unique<Impl>(modelPath, settings)}};
     }
     catch (const Ort::Exception& exception)
     {
-        error = "ONNX Runtime palm session creation failed: " + std::string{exception.what()};
+        error = "ONNX Runtime palm session creation failed: " + describeOrtException(exception);
         return {};
     }
     catch (const std::exception& exception)
@@ -125,12 +222,17 @@ CpuPalmDetectionRunner::~CpuPalmDetectionRunner() = default;
 
 ExecutionProvider CpuPalmDetectionRunner::executionProvider() const noexcept
 {
-    return ExecutionProvider::Cpu;
+    return impl_->provider;
 }
 
 std::string_view CpuPalmDetectionRunner::providerName() const noexcept
 {
-    return "CPUExecutionProvider";
+    return impl_->providerName;
+}
+
+std::string_view CpuPalmDetectionRunner::fallbackReason() const noexcept
+{
+    return impl_->fallbackReason;
 }
 
 bool CpuPalmDetectionRunner::run(

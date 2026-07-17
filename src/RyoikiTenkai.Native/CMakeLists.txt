@@ -10,9 +10,32 @@ project(RyoikiTenkaiNative LANGUAGES CXX)
 
 find_package(OpenCV CONFIG REQUIRED COMPONENTS core imgproc)
 
+set(WINDOWS_AI_ML_VERSION "2.1.70" CACHE STRING "Windows AI MachineLearning NuGet package version")
+set(WINDOWS_APPSDK_FOUNDATION_VERSION "2.1.0" CACHE STRING "Windows App SDK Foundation NuGet package version")
 set(ONNXRUNTIME_VERSION "1.27.0" CACHE STRING "ONNX Runtime NuGet package version")
+set(QNN_RUNTIME_DIR "" CACHE PATH "Directory containing QNN HTP runtime DLLs such as QnnHtp.dll")
+if(NOT DEFINED WINDOWS_AI_ML_ROOT)
+    set(_local_windows_ai_ml "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/nuget/Microsoft.Windows.AI.MachineLearning.${WINDOWS_AI_ML_VERSION}")
+    if(EXISTS "${_local_windows_ai_ml}")
+        set(WINDOWS_AI_ML_ROOT
+            "${_local_windows_ai_ml}"
+            CACHE PATH "Windows AI MachineLearning NuGet package root")
+    endif()
+endif()
+if(NOT DEFINED WINDOWS_APPSDK_FOUNDATION_ROOT)
+    set(_local_windows_appsdk_foundation "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/nuget/Microsoft.WindowsAppSDK.Foundation.${WINDOWS_APPSDK_FOUNDATION_VERSION}")
+    if(EXISTS "${_local_windows_appsdk_foundation}")
+        set(WINDOWS_APPSDK_FOUNDATION_ROOT
+            "${_local_windows_appsdk_foundation}"
+            CACHE PATH "Windows App SDK Foundation NuGet package root")
+    endif()
+endif()
 if(NOT DEFINED ONNXRUNTIME_ROOT)
-    if(DEFINED ENV{NUGET_PACKAGES})
+    if(DEFINED WINDOWS_AI_ML_ROOT)
+        set(ONNXRUNTIME_ROOT
+            "${WINDOWS_AI_ML_ROOT}"
+            CACHE PATH "ONNX Runtime NuGet package root")
+    elseif(DEFINED ENV{NUGET_PACKAGES})
         set(_nuget_packages "$ENV{NUGET_PACKAGES}")
     elseif(DEFINED ENV{USERPROFILE})
         set(_nuget_packages "$ENV{USERPROFILE}/.nuget/packages")
@@ -26,18 +49,34 @@ endif()
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64)$")
     set(_onnxruntime_rid "win-arm64")
+    set(_native_arch "arm64")
 else()
     set(_onnxruntime_rid "win-x64")
+    set(_native_arch "x64")
 endif()
 
 find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
     PATHS "${ONNXRUNTIME_ROOT}/build/native/include"
+          "${ONNXRUNTIME_ROOT}/include/winml"
     NO_DEFAULT_PATH
     REQUIRED)
 find_library(ONNXRUNTIME_LIBRARY onnxruntime
     PATHS "${ONNXRUNTIME_ROOT}/runtimes/${_onnxruntime_rid}/native"
+          "${ONNXRUNTIME_ROOT}/lib/native/${_native_arch}"
     NO_DEFAULT_PATH
     REQUIRED)
+find_path(WINDOWS_AI_ML_INCLUDE_DIR WinMLEpCatalog.h
+    PATHS "${WINDOWS_AI_ML_ROOT}/include"
+    NO_DEFAULT_PATH)
+find_library(WINDOWS_AI_ML_LIBRARY Microsoft.Windows.AI.MachineLearning
+    PATHS "${WINDOWS_AI_ML_ROOT}/lib/native/${_native_arch}"
+    NO_DEFAULT_PATH)
+find_path(WINDOWS_APPSDK_FOUNDATION_INCLUDE_DIR MddBootstrap.h
+    PATHS "${WINDOWS_APPSDK_FOUNDATION_ROOT}/include"
+    NO_DEFAULT_PATH)
+find_library(WINDOWS_APPSDK_BOOTSTRAP_LIBRARY Microsoft.WindowsAppRuntime.Bootstrap
+    PATHS "${WINDOWS_APPSDK_FOUNDATION_ROOT}/lib/native/${_native_arch}"
+    NO_DEFAULT_PATH)
 
 add_library(onnxruntime SHARED IMPORTED GLOBAL)
 set_target_properties(onnxruntime PROPERTIES
@@ -63,6 +102,8 @@ add_library(RyoikiTenkai.VisionCore STATIC
     src/HandPerception/ModelRunners/hand_landmark_runner.h
     src/HandPerception/ModelRunners/hand_landmark_model_contract.cpp
     src/HandPerception/ModelRunners/palm_detection_runner.cpp
+    src/HandPerception/ModelRunners/qnn_execution_provider.cpp
+    src/HandPerception/ModelRunners/qnn_execution_provider.h
     src/Pipeline/latest_frame_slot.cpp
     src/Pipeline/perception_mailbox.cpp
     src/Rendering/frame_transforms.cpp
@@ -73,7 +114,15 @@ add_library(RyoikiTenkai.VisionCore STATIC
 
 target_include_directories(RyoikiTenkai.VisionCore PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${ONNXRUNTIME_INCLUDE_DIR}
 )
+if (WINDOWS_AI_ML_INCLUDE_DIR AND WINDOWS_APPSDK_FOUNDATION_INCLUDE_DIR)
+    target_include_directories(RyoikiTenkai.VisionCore PRIVATE
+        ${WINDOWS_AI_ML_INCLUDE_DIR}
+        ${WINDOWS_APPSDK_FOUNDATION_INCLUDE_DIR}
+    )
+    target_compile_definitions(RyoikiTenkai.VisionCore PRIVATE RYOIKI_ENABLE_WINDOWS_ML_EP_CATALOG=1)
+endif()
 
 target_compile_features(RyoikiTenkai.VisionCore PUBLIC cxx_std_20)
 
@@ -82,6 +131,12 @@ target_link_libraries(RyoikiTenkai.VisionCore PUBLIC
     opencv_imgproc
     onnxruntime
 )
+if (WINDOWS_AI_ML_LIBRARY AND WINDOWS_APPSDK_BOOTSTRAP_LIBRARY)
+    target_link_libraries(RyoikiTenkai.VisionCore PUBLIC
+        "${WINDOWS_AI_ML_LIBRARY}"
+        "${WINDOWS_APPSDK_BOOTSTRAP_LIBRARY}"
+    )
+endif()
 
 add_library(RyoikiTenkai.Native SHARED
     src/camera_capture.cpp
@@ -122,6 +177,47 @@ set_target_properties(RyoikiTenkai.Native PROPERTIES
     OUTPUT_NAME "RyoikiTenkai.Native"
 )
 
+add_custom_command(TARGET RyoikiTenkai.Native POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "$<TARGET_FILE:onnxruntime>"
+        "$<TARGET_FILE_DIR:RyoikiTenkai.Native>"
+)
+
+set(_ryoiki_windows_ml_runtime_dlls)
+if (WINDOWS_AI_ML_ROOT AND WINDOWS_APPSDK_FOUNDATION_ROOT)
+    foreach(_winml_dll
+        "${WINDOWS_AI_ML_ROOT}/runtimes/${_onnxruntime_rid}/native/Microsoft.Windows.AI.MachineLearning.dll"
+        "${WINDOWS_APPSDK_FOUNDATION_ROOT}/runtimes/${_onnxruntime_rid}/native/Microsoft.WindowsAppRuntime.Bootstrap.dll")
+        if (EXISTS "${_winml_dll}")
+            list(APPEND _ryoiki_windows_ml_runtime_dlls "${_winml_dll}")
+            add_custom_command(TARGET RyoikiTenkai.Native POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_winml_dll}"
+                    "$<TARGET_FILE_DIR:RyoikiTenkai.Native>"
+            )
+        endif()
+    endforeach()
+endif()
+
+if (QNN_RUNTIME_DIR)
+    foreach(_qnn_dll
+        QnnHtp.dll
+        QnnHtpPrepare.dll
+        QnnSystem.dll
+        QnnCpu.dll
+        QnnSaver.dll
+        onnxruntime_providers_qnn.dll
+        onnxruntime_providers_shared.dll)
+        if (EXISTS "${QNN_RUNTIME_DIR}/${_qnn_dll}")
+            add_custom_command(TARGET RyoikiTenkai.Native POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${QNN_RUNTIME_DIR}/${_qnn_dll}"
+                    "$<TARGET_FILE_DIR:RyoikiTenkai.Native>"
+            )
+        endif()
+    endforeach()
+endif()
+
 include(CTest)
 if (BUILD_TESTING)
     add_executable(RyoikiTenkai.VisionCore.Tests
@@ -139,6 +235,13 @@ if (BUILD_TESTING)
             "$<TARGET_FILE:onnxruntime>"
             "$<TARGET_FILE_DIR:RyoikiTenkai.VisionCore.Tests>"
     )
+    foreach(_winml_dll ${_ryoiki_windows_ml_runtime_dlls})
+        add_custom_command(TARGET RyoikiTenkai.VisionCore.Tests POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${_winml_dll}"
+                "$<TARGET_FILE_DIR:RyoikiTenkai.VisionCore.Tests>"
+        )
+    endforeach()
 
     add_executable(RyoikiTenkai.HandPerception.Tests
         tests/hand_perception_tests.cpp
@@ -159,4 +262,11 @@ if (BUILD_TESTING)
             "$<TARGET_FILE:onnxruntime>"
             "$<TARGET_FILE_DIR:RyoikiTenkai.HandPerception.Tests>"
     )
+    foreach(_winml_dll ${_ryoiki_windows_ml_runtime_dlls})
+        add_custom_command(TARGET RyoikiTenkai.HandPerception.Tests POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${_winml_dll}"
+                "$<TARGET_FILE_DIR:RyoikiTenkai.HandPerception.Tests>"
+        )
+    endforeach()
 endif()

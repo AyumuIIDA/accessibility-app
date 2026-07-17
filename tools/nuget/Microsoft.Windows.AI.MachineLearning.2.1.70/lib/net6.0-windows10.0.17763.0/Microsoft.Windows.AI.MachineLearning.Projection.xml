@@ -1,0 +1,251 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!-- Copyright (C) Microsoft Corporation. All rights reserved. -->
+<doc>
+  <assembly>
+    <name>Microsoft.Windows.AI.MachineLearning.Projection</name>
+  </assembly>
+  <members>
+    <member name="T:Microsoft.Windows.AI.MachineLearning.ExecutionProviderReadyState">
+      <summary>Indicates whether an execution provider is available for use by ONNX Runtime in the current process.</summary>
+    </member>
+    <member name="F:Microsoft.Windows.AI.MachineLearning.ExecutionProviderReadyState.Ready">
+      <summary>The execution provider is ready to be used with ONNX Runtime in the current process.</summary>
+    </member>
+    <member name="F:Microsoft.Windows.AI.MachineLearning.ExecutionProviderReadyState.NotReady">
+      <summary>The execution provider is present but is not ready to be used with ONNX Runtime in the current process.</summary>
+    </member>
+    <member name="F:Microsoft.Windows.AI.MachineLearning.ExecutionProviderReadyState.NotPresent">
+      <summary>The execution provider is not present on the system, but can be acquired.</summary>
+    </member>
+    <member name="T:Microsoft.Windows.AI.MachineLearning.ExecutionProviderReadyResultState">
+      <summary>Indicates the status of an execution provider readiness operation.</summary>
+    </member>
+    <member name="F:Microsoft.Windows.AI.MachineLearning.ExecutionProviderReadyResultState.InProgress">
+      <summary>The execution provider is transitioning to the ready state, such as while being acquired or installed.</summary>
+    </member>
+    <member name="F:Microsoft.Windows.AI.MachineLearning.ExecutionProviderReadyResultState.Success">
+      <summary>The execution provider is ready for use.</summary>
+    </member>
+    <member name="F:Microsoft.Windows.AI.MachineLearning.ExecutionProviderReadyResultState.Failure">
+      <summary>The execution provider failed to become ready.</summary>
+    </member>
+    <member name="T:Microsoft.Windows.AI.MachineLearning.ExecutionProviderCertification">
+      <summary>Indicates the certification state of an execution provider for Windows ML.</summary>
+    </member>
+    <member name="F:Microsoft.Windows.AI.MachineLearning.ExecutionProviderCertification.Unknown">
+      <summary>The execution provider certification state is not known.</summary>
+    </member>
+    <member name="F:Microsoft.Windows.AI.MachineLearning.ExecutionProviderCertification.Certified">
+      <summary>The execution provider is certified for use with Windows ML.</summary>
+    </member>
+    <member name="F:Microsoft.Windows.AI.MachineLearning.ExecutionProviderCertification.Uncertified">
+      <summary>The execution provider is not certified for use with Windows ML.</summary>
+    </member>
+    <member name="T:Microsoft.Windows.AI.MachineLearning.ExecutionProviderReadyResult">
+      <summary>Contains the result of an operation that prepares an execution provider for use.</summary>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.ExecutionProviderReadyResult.Status">
+      <summary>Gets the status of the readiness operation.</summary>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.ExecutionProviderReadyResult.ExtendedError">
+      <summary>Gets the error code returned when the readiness operation fails.</summary>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.ExecutionProviderReadyResult.DiagnosticText">
+      <summary>Gets diagnostic text that can help developers understand the execution provider state.</summary>
+    </member>
+    <member name="T:Microsoft.Windows.AI.MachineLearning.ExecutionProvider">
+      <summary>Represents an execution provider package that can be used by ONNX Runtime through Windows ML.</summary>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.ExecutionProvider.Name">
+      <summary>Gets the execution provider name as registered with ONNX Runtime.</summary>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.ExecutionProvider.LibraryPath">
+      <summary>Gets the absolute path to the execution provider library when the provider is ready for use.</summary>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.ExecutionProvider.PackageId">
+      <summary>Gets package identity information for the execution provider package.</summary>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.ExecutionProvider.ReadyState">
+      <summary>Gets the current readiness state of the execution provider in the current process.</summary>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.ExecutionProvider.Certification">
+      <summary>Gets the certification state of the execution provider.</summary>
+    </member>
+    <member name="M:Microsoft.Windows.AI.MachineLearning.ExecutionProvider.EnsureReadyAsync">
+      <summary>Makes the execution provider available to the current process, acquiring and installing the associated package if necessary.</summary>
+      <returns>An asynchronous operation that reports readiness progress and returns the readiness result.</returns>
+    </member>
+    <member name="M:Microsoft.Windows.AI.MachineLearning.ExecutionProvider.TryRegister">
+      <summary>Registers the execution provider with ONNX Runtime so it can be selected for model execution.</summary>
+      <returns>True if the provider was registered successfully; otherwise, false.</returns>
+    </member>
+    <member name="T:Microsoft.Windows.AI.MachineLearning.ExecutionProviderCatalog">
+      <summary>Provides access to execution providers that are compatible with the current system.</summary>
+    </member>
+    <member name="M:Microsoft.Windows.AI.MachineLearning.ExecutionProviderCatalog.GetDefault">
+      <summary>Gets the default execution provider catalog for the current system.</summary>
+      <returns>The default execution provider catalog, or null if the catalog is not available.</returns>
+    </member>
+    <member name="M:Microsoft.Windows.AI.MachineLearning.ExecutionProviderCatalog.FindAllProviders">
+      <summary>Returns all execution providers compatible with the current hardware.</summary>
+      <returns>The compatible execution providers.</returns>
+    </member>
+    <member name="M:Microsoft.Windows.AI.MachineLearning.ExecutionProviderCatalog.EnsureAndRegisterCertifiedAsync">
+      <summary>Acquires, prepares, and registers certified execution providers in the catalog with ONNX Runtime.</summary>
+      <returns>An asynchronous operation that reports progress and returns the providers that were registered successfully.</returns>
+    </member>
+    <member name="M:Microsoft.Windows.AI.MachineLearning.ExecutionProviderCatalog.RegisterCertifiedAsync">
+      <summary>Registers certified execution providers that are already present and ready to use with ONNX Runtime.</summary>
+      <returns>An asynchronous operation that reports progress and returns the providers that were registered successfully.</returns>
+    </member>
+    <member name="T:Microsoft.Windows.AI.MachineLearning.CatalogModelInstanceStatus">
+      <summary>Indicates whether a catalog model instance is available on the local system.</summary>
+    </member>
+    <member name="F:Microsoft.Windows.AI.MachineLearning.CatalogModelInstanceStatus.Available">
+      <summary>The model instance is available and downloaded.</summary>
+    </member>
+    <member name="F:Microsoft.Windows.AI.MachineLearning.CatalogModelInstanceStatus.InProgress">
+      <summary>The model instance is being downloaded or installed.</summary>
+    </member>
+    <member name="F:Microsoft.Windows.AI.MachineLearning.CatalogModelInstanceStatus.Unavailable">
+      <summary>The model instance is not available locally.</summary>
+    </member>
+    <member name="T:Microsoft.Windows.AI.MachineLearning.CatalogModelStatus">
+      <summary>Indicates whether a catalog model is ready for use.</summary>
+    </member>
+    <member name="F:Microsoft.Windows.AI.MachineLearning.CatalogModelStatus.Ready">
+      <summary>The model is ready for use.</summary>
+    </member>
+    <member name="F:Microsoft.Windows.AI.MachineLearning.CatalogModelStatus.NotReady">
+      <summary>The model is not ready for use.</summary>
+    </member>
+    <member name="T:Microsoft.Windows.AI.MachineLearning.CatalogModelInstanceResult">
+      <summary>Contains the result of a model acquisition operation.</summary>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.CatalogModelInstanceResult.Status">
+      <summary>Gets the model instance status.</summary>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.CatalogModelInstanceResult.ExtendedError">
+      <summary>Gets the error code returned when model acquisition fails.</summary>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.CatalogModelInstanceResult.DiagnosticText">
+      <summary>Gets diagnostic text that can help developers understand the model state.</summary>
+    </member>
+    <member name="M:Microsoft.Windows.AI.MachineLearning.CatalogModelInstanceResult.GetInstance">
+      <summary>Gets the acquired model instance.</summary>
+      <returns>The acquired model instance, or null if no instance is available.</returns>
+    </member>
+    <member name="T:Microsoft.Windows.AI.MachineLearning.CatalogModelInfo">
+      <summary>Describes a model discovered from a model catalog.</summary>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.CatalogModelInfo.Id">
+      <summary>Gets the model's unique identifier within the catalog.</summary>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.CatalogModelInfo.Name">
+      <summary>Gets the model name.</summary>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.CatalogModelInfo.Publisher">
+      <summary>Gets the model publisher name.</summary>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.CatalogModelInfo.SourceId">
+      <summary>Gets the identifier of the catalog source that provided the model information.</summary>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.CatalogModelInfo.Uri">
+      <summary>Gets the model location, or the local cache location after the model has been downloaded.</summary>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.CatalogModelInfo.ExecutionProviders">
+      <summary>Gets the execution providers supported by the model.</summary>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.CatalogModelInfo.ModelSizeInBytes">
+      <summary>Gets the model size in bytes.</summary>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.CatalogModelInfo.Version">
+      <summary>Gets the model version.</summary>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.CatalogModelInfo.License">
+      <summary>Gets the model license identifier or description.</summary>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.CatalogModelInfo.LicenseUri">
+      <summary>Gets the URI to the model license document.</summary>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.CatalogModelInfo.LicenseText">
+      <summary>Gets the model license text.</summary>
+    </member>
+    <member name="M:Microsoft.Windows.AI.MachineLearning.CatalogModelInfo.GetStatus">
+      <summary>Gets the current model status.</summary>
+      <returns>The current model status.</returns>
+    </member>
+    <member name="M:Microsoft.Windows.AI.MachineLearning.CatalogModelInfo.GetInstanceAsync">
+      <summary>Gets an instance of the model, downloading it first if necessary.</summary>
+      <returns>An asynchronous operation that reports acquisition progress and returns the model instance result.</returns>
+    </member>
+    <member name="M:Microsoft.Windows.AI.MachineLearning.CatalogModelInfo.GetInstanceAsync(Windows.Foundation.Collections.IIterable{Windows.Foundation.Collections.IKeyValuePair{System.String,System.String}})">
+      <summary>Gets an instance of the model using additional request headers, downloading it first if necessary.</summary>
+      <param name="additionalHeaders">Additional headers to include when accessing remote catalog or model content.</param>
+      <returns>An asynchronous operation that reports acquisition progress and returns the model instance result.</returns>
+    </member>
+    <member name="T:Microsoft.Windows.AI.MachineLearning.ModelCatalog">
+      <summary>Represents a collection of model catalog sources that can be searched for available models.</summary>
+    </member>
+    <member name="M:Microsoft.Windows.AI.MachineLearning.ModelCatalog.#ctor(Microsoft.Windows.AI.MachineLearning.ModelCatalogSource[])">
+      <summary>Creates a model catalog from the specified catalog sources.</summary>
+      <param name="sources">The catalog sources to use for model discovery.</param>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.ModelCatalog.Sources">
+      <summary>Gets the catalog sources used during model lookup and discovery operations.</summary>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.ModelCatalog.ExecutionProviders">
+      <summary>Gets the execution provider names used when finding and filtering models in the catalog.</summary>
+    </member>
+    <member name="M:Microsoft.Windows.AI.MachineLearning.ModelCatalog.GetAvailableModel(System.String)">
+      <summary>Gets a locally available model by name or full identifier.</summary>
+      <param name="idOrName">The model identifier or name.</param>
+      <returns>The matching locally available model, or null if no matching model is available.</returns>
+    </member>
+    <member name="M:Microsoft.Windows.AI.MachineLearning.ModelCatalog.GetAvailableModels">
+      <summary>Retrieves all locally available models from the catalog.</summary>
+      <returns>The locally available models.</returns>
+    </member>
+    <member name="M:Microsoft.Windows.AI.MachineLearning.ModelCatalog.FindModelAsync(System.String)">
+      <summary>Finds a model across all catalog sources that matches the specified name or full identifier.</summary>
+      <param name="idOrName">The model identifier or name.</param>
+      <returns>An asynchronous operation that returns the matching model, or null if no matching model is found.</returns>
+    </member>
+    <member name="M:Microsoft.Windows.AI.MachineLearning.ModelCatalog.FindAllModelsAsync">
+      <summary>Finds all models across all catalog sources.</summary>
+      <returns>An asynchronous operation that returns all matching models.</returns>
+    </member>
+    <member name="T:Microsoft.Windows.AI.MachineLearning.CatalogModelInstance">
+      <summary>Represents a locally available model instance and keeps it loaded while the object is alive.</summary>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.CatalogModelInstance.ModelPaths">
+      <summary>Gets the local paths to the model files.</summary>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.CatalogModelInstance.ModelInfo">
+      <summary>Gets model information for this model instance.</summary>
+    </member>
+    <member name="M:Microsoft.Windows.AI.MachineLearning.CatalogModelInstance.Dispose">
+      <summary>Releases resources associated with the model instance.</summary>
+    </member>
+    <member name="T:Microsoft.Windows.AI.MachineLearning.ModelCatalogSource">
+      <summary>Represents a source that provides model catalog data.</summary>
+    </member>
+    <member name="M:Microsoft.Windows.AI.MachineLearning.ModelCatalogSource.CreateFromUriAsync(Windows.Foundation.Uri)">
+      <summary>Creates a model catalog source from the specified URI.</summary>
+      <param name="location">The URI of the catalog source.</param>
+      <returns>An asynchronous operation that returns the created catalog source.</returns>
+    </member>
+    <member name="M:Microsoft.Windows.AI.MachineLearning.ModelCatalogSource.CreateFromUriAsync(Windows.Foundation.Uri,Windows.Foundation.Collections.IIterable{Windows.Foundation.Collections.IKeyValuePair{System.String,System.String}})">
+      <summary>Creates a model catalog source from the specified URI using additional request headers.</summary>
+      <param name="location">The URI of the catalog source.</param>
+      <param name="additionalHeaders">Additional headers to include when accessing the catalog source.</param>
+      <returns>An asynchronous operation that returns the created catalog source.</returns>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.ModelCatalogSource.Id">
+      <summary>Gets the catalog source identifier.</summary>
+    </member>
+    <member name="P:Microsoft.Windows.AI.MachineLearning.ModelCatalogSource.Uri">
+      <summary>Gets the URI where the catalog source can be accessed.</summary>
+    </member>
+  </members>
+</doc>

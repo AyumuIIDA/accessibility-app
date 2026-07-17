@@ -12,6 +12,12 @@ enum class ExecutionProvider
     QnnHtp
 };
 
+struct ModelRunnerExecutionSettings
+{
+    bool preferQnnHtp{false};
+    bool requireQnnHtp{false};
+};
+
 class IHandModelRunner
 {
 public:
@@ -19,5 +25,9 @@ public:
 
     [[nodiscard]] virtual ExecutionProvider executionProvider() const noexcept = 0;
     [[nodiscard]] virtual std::string_view providerName() const noexcept = 0;
+    [[nodiscard]] virtual std::string_view fallbackReason() const noexcept
+    {
+        return {};
+    }
 };
 }

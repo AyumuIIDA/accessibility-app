@@ -4,12 +4,14 @@
 
 #include <Windows.h>
 #include <mfapi.h>
+#include <mferror.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
 #include <wrl/client.h>
 
 #include <chrono>
 #include <bit>
+#include <cmath>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -87,6 +89,104 @@ ryoiki::runtime::FrameRotation toFrameRotation(const UINT32 counterClockwiseRota
         return ryoiki::runtime::FrameRotation::None;
     }
 }
+
+std::string videoSubtypeName(const GUID& subtype)
+{
+    if (subtype == MFVideoFormat_NV12)
+    {
+        return "NV12";
+    }
+    if (subtype == MFVideoFormat_RGB32)
+    {
+        return "RGB32";
+    }
+    if (subtype == MFVideoFormat_YUY2)
+    {
+        return "YUY2";
+    }
+    return "unknown";
+}
+
+bool isSupportedSourceSubtype(const GUID& subtype)
+{
+    return subtype == MFVideoFormat_NV12
+        || subtype == MFVideoFormat_RGB32
+        || subtype == MFVideoFormat_YUY2;
+}
+
+double frameRate(IMFMediaType& mediaType)
+{
+    UINT32 numerator = 0;
+    UINT32 denominator = 0;
+    if (FAILED(MFGetAttributeRatio(
+            &mediaType,
+            MF_MT_FRAME_RATE,
+            &numerator,
+            &denominator))
+        || denominator == 0)
+    {
+        return 0.0;
+    }
+    return numerator / static_cast<double>(denominator);
+}
+
+int preferredFormatScore(
+    const UINT32 width,
+    const UINT32 height,
+    const double fps,
+    const GUID& subtype)
+{
+    const int targetWidth = 640;
+    const int targetHeight = 480;
+    const int sizeScore = std::abs(static_cast<int>(width) - targetWidth)
+        + std::abs(static_cast<int>(height) - targetHeight);
+    const int fpsScore = static_cast<int>(std::abs(fps - 30.0) * 10.0);
+    const int subtypeScore = subtype == MFVideoFormat_NV12 ? 0
+        : subtype == MFVideoFormat_RGB32 ? 20
+        : subtype == MFVideoFormat_YUY2 ? 40
+        : 1000;
+    const int oversizedPenalty = width > 640 || height > 480 ? 500 : 0;
+    return sizeScore + fpsScore + subtypeScore + oversizedPenalty;
+}
+
+ComPtr<IMFMediaType> findPreferredNativeFormat(IMFSourceReader& reader)
+{
+    ComPtr<IMFMediaType> bestType;
+    int bestScore = (std::numeric_limits<int>::max)();
+    for (DWORD index = 0;; ++index)
+    {
+        ComPtr<IMFMediaType> type;
+        const HRESULT result = reader.GetNativeMediaType(kVideoStream, index, &type);
+        if (result == MF_E_NO_MORE_TYPES)
+        {
+            break;
+        }
+        if (FAILED(result))
+        {
+            continue;
+        }
+
+        GUID subtype{};
+        UINT32 width = 0;
+        UINT32 height = 0;
+        if (FAILED(type->GetGUID(MF_MT_SUBTYPE, &subtype))
+            || !isSupportedSourceSubtype(subtype)
+            || FAILED(MFGetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, &width, &height))
+            || width == 0
+            || height == 0)
+        {
+            continue;
+        }
+
+        const int score = preferredFormatScore(width, height, frameRate(*type.Get()), subtype);
+        if (score < bestScore)
+        {
+            bestScore = score;
+            bestType = type;
+        }
+    }
+    return bestType;
+}
 }
 
 struct CameraCapture::Impl
@@ -99,6 +199,7 @@ struct CameraCapture::Impl
     std::uint32_t height{0};
     LONG defaultStride{0};
     ryoiki::runtime::FrameRotation rotation{ryoiki::runtime::FrameRotation::None};
+    std::string subtype{"unknown"};
 
     ~Impl()
     {
@@ -221,6 +322,33 @@ bool CameraCapture::initialize(std::string& error)
         return false;
     }
 
+    if (auto preferredNativeType = findPreferredNativeFormat(*impl_->sourceReader.Get());
+        preferredNativeType != nullptr)
+    {
+        UINT32 preferredWidth = 0;
+        UINT32 preferredHeight = 0;
+        GUID preferredSubtype{};
+        MFGetAttributeSize(
+            preferredNativeType.Get(),
+            MF_MT_FRAME_SIZE,
+            &preferredWidth,
+            &preferredHeight);
+        preferredNativeType->GetGUID(MF_MT_SUBTYPE, &preferredSubtype);
+        const std::string diagnostic = "Native camera requested format: "
+            + std::to_string(preferredWidth) + "x" + std::to_string(preferredHeight)
+            + ", subtype=" + videoSubtypeName(preferredSubtype)
+            + ", fps=" + std::to_string(frameRate(*preferredNativeType.Get())) + "\n";
+        OutputDebugStringA(diagnostic.c_str());
+        result = impl_->sourceReader->SetCurrentMediaType(
+            kVideoStream,
+            nullptr,
+            preferredNativeType.Get());
+        if (failed(result, "Set preferred native camera format", error))
+        {
+            return false;
+        }
+    }
+
     UINT32 sourceRotation = 0;
     ComPtr<IMFMediaType> sourceType;
     if (SUCCEEDED(impl_->sourceReader->GetCurrentMediaType(kVideoStream, &sourceType)))
@@ -273,6 +401,11 @@ bool CameraCapture::initialize(std::string& error)
 
     impl_->width = width;
     impl_->height = height;
+    GUID currentSubtype{};
+    if (SUCCEEDED(currentType->GetGUID(MF_MT_SUBTYPE, &currentSubtype)))
+    {
+        impl_->subtype = videoSubtypeName(currentSubtype);
+    }
     UINT32 strideValue = 0;
     if (SUCCEEDED(currentType->GetUINT32(MF_MT_DEFAULT_STRIDE, &strideValue)))
     {
@@ -298,7 +431,16 @@ bool CameraCapture::initialize(std::string& error)
         sourceRotation = outputRotation;
     }
     impl_->rotation = toFrameRotation(sourceRotation);
+    const std::string activeFormatDiagnostic = "Native camera active format: "
+        + std::to_string(impl_->width) + "x" + std::to_string(impl_->height)
+        + ", subtype=" + impl_->subtype + "\n";
+    OutputDebugStringA(activeFormatDiagnostic.c_str());
     return true;
+}
+
+std::string CameraCapture::subtype() const
+{
+    return impl_->subtype;
 }
 
 void CameraCapture::requestStop() noexcept
