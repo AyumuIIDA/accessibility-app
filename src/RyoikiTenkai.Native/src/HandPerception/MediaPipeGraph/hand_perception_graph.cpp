@@ -12,6 +12,16 @@ HandPerceptionGraph::HandPerceptionGraph(
 {
 }
 
+HandPerceptionGraph::HandPerceptionGraph(
+    std::unique_ptr<IPalmDetectionRunner> palmRunner,
+    std::unique_ptr<IHandLandmarkRunner> handRunner,
+    std::unique_ptr<geometry::IGeometryProcessor> palmGeometryProcessor,
+    std::unique_ptr<geometry::IGeometryProcessor> handGeometryProcessor)
+    : palmGraph_{std::move(palmRunner), std::move(palmGeometryProcessor)},
+      handGraph_{std::move(handRunner), std::move(handGeometryProcessor)}
+{
+}
+
 bool HandPerceptionGraph::process(
     const buffers::FrameBuffer& frame,
     HandPerceptionResult& result,

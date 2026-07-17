@@ -48,11 +48,18 @@ AffineTransform toTransform(const cv::Mat& matrix)
     }
     return transform;
 }
+
+cv::Matx23f toCvTransform(const AffineTransform& transform)
+{
+    const auto& value = transform.values;
+    return {
+        value[0], value[1], value[2],
+        value[3], value[4], value[5]};
+}
 }
 
 struct HandGeometryProcessor::Impl
 {
-    cv::Mat resizedPalmBgra;
     cv::Mat palmBgra{cv::Mat::zeros(kPalmInputSize, kPalmInputSize, CV_8UC4)};
     cv::Mat handBgra{cv::Mat::zeros(kHandInputSize, kHandInputSize, CV_8UC4)};
 };
@@ -62,6 +69,16 @@ HandGeometryProcessor::HandGeometryProcessor() : impl_{std::make_unique<Impl>()}
 }
 
 HandGeometryProcessor::~HandGeometryProcessor() = default;
+
+buffers::MemoryLocation HandGeometryProcessor::inputMemoryLocation() const noexcept
+{
+    return buffers::MemoryLocation::Cpu;
+}
+
+buffers::MemoryLocation HandGeometryProcessor::outputMemoryLocation() const noexcept
+{
+    return buffers::MemoryLocation::Cpu;
+}
 
 bool HandGeometryProcessor::preprocessPalm(
     const buffers::FrameBuffer& frame,
@@ -81,30 +98,48 @@ bool HandGeometryProcessor::preprocessPalm(
         const_cast<std::uint8_t*>(frame.pixels().data()),
         frame.stride());
 
+    const auto uprightWidth = frame.uprightWidth();
+    const auto uprightHeight = frame.uprightHeight();
     const float ratio = (std::min)(
-        kPalmInputSize / static_cast<float>(frame.width()),
-        kPalmInputSize / static_cast<float>(frame.height()));
-    const int resizedWidth = (std::max)(1, static_cast<int>(frame.width() * ratio));
-    const int resizedHeight = (std::max)(1, static_cast<int>(frame.height() * ratio));
+        kPalmInputSize / static_cast<float>(uprightWidth),
+        kPalmInputSize / static_cast<float>(uprightHeight));
+    const int resizedWidth = (std::max)(1, static_cast<int>(uprightWidth * ratio));
+    const int resizedHeight = (std::max)(1, static_cast<int>(uprightHeight * ratio));
     const int left = (kPalmInputSize - resizedWidth) / 2;
     const int top = (kPalmInputSize - resizedHeight) / 2;
 
-    cv::resize(
-        source,
-        impl_->resizedPalmBgra,
-        cv::Size{resizedWidth, resizedHeight},
-        0.0,
-        0.0,
-        cv::INTER_LINEAR);
-    impl_->palmBgra.setTo(cv::Scalar{});
-    impl_->resizedPalmBgra.copyTo(
-        impl_->palmBgra(cv::Rect{left, top, resizedWidth, resizedHeight}));
-    packBgraToRgbNhwc(impl_->palmBgra, tensor);
-
-    result.transform.scaleX = resizedWidth / static_cast<float>(frame.width());
-    result.transform.scaleY = resizedHeight / static_cast<float>(frame.height());
+    result.transform.scaleX = resizedWidth / static_cast<float>(uprightWidth);
+    result.transform.scaleY = resizedHeight / static_cast<float>(uprightHeight);
     result.transform.padLeft = static_cast<float>(left);
     result.transform.padTop = static_cast<float>(top);
+
+    const AffineTransform tensorToUpright{{
+        1.0F / result.transform.scaleX,
+        0.0F,
+        (0.5F - result.transform.padLeft) / result.transform.scaleX - 0.5F,
+        0.0F,
+        1.0F / result.transform.scaleY,
+        (0.5F - result.transform.padTop) / result.transform.scaleY - 0.5F}};
+    AffineTransform uprightToStorageEdges{};
+    if (!invert(createStorageToUprightTransform(
+            frame.width(), frame.height(), frame.orientation()), uprightToStorageEdges))
+    {
+        return false;
+    }
+    const auto tensorToStorageCenters = compose(
+        tensorToUpright,
+        toPixelCenterTransform(uprightToStorageEdges));
+    const auto tensorToStorage = toCvTransform(tensorToStorageCenters);
+    cv::warpAffine(
+        source,
+        impl_->palmBgra,
+        tensorToStorage,
+        cv::Size{kPalmInputSize, kPalmInputSize},
+        cv::INTER_LINEAR | cv::WARP_INVERSE_MAP,
+        cv::BORDER_CONSTANT,
+        cv::Scalar{});
+    packBgraToRgbNhwc(impl_->palmBgra, tensor);
+
     return true;
 }
 
@@ -139,17 +174,26 @@ bool HandGeometryProcessor::preprocessHand(
         cv::Point2f{static_cast<float>(kHandInputSize), 0.0F},
         cv::Point2f{0.0F, static_cast<float>(kHandInputSize)}
     };
-    const std::array<cv::Point2f, 3> sourcePoints{
+    const std::array<cv::Point2f, 3> uprightPoints{
         center - horizontal - vertical,
         center + horizontal - vertical,
         center - horizontal + vertical
     };
-
-    const cv::Mat tensorToSource = cv::getAffineTransform(tensorPoints.data(), sourcePoints.data());
+    const cv::Mat tensorToSource = cv::getAffineTransform(tensorPoints.data(), uprightPoints.data());
+    AffineTransform uprightToStorageEdges{};
+    if (!invert(createStorageToUprightTransform(
+            frame.width(), frame.height(), frame.orientation()), uprightToStorageEdges))
+    {
+        return false;
+    }
+    const auto tensorToStorageCenters = compose(
+        toTransform(tensorToSource),
+        toPixelCenterTransform(uprightToStorageEdges));
+    const auto tensorToStorage = toCvTransform(tensorToStorageCenters);
     cv::warpAffine(
         source,
         impl_->handBgra,
-        tensorToSource,
+        tensorToStorage,
         cv::Size{kHandInputSize, kHandInputSize},
         cv::INTER_LINEAR | cv::WARP_INVERSE_MAP,
         cv::BORDER_CONSTANT,

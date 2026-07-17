@@ -4,8 +4,11 @@
 #include "Pipeline/latest_frame_slot.h"
 #include "Pipeline/perception_mailbox.h"
 #include "Rendering/latest_render_packet_slot.h"
+#include "Rendering/frame_transforms.h"
 #include "Runtime/camera_device_selection.h"
+#include "Runtime/frame_orientation.h"
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -39,10 +42,13 @@ std::shared_ptr<ryoiki::buffers::FrameBuffer> createFrame(
     const std::uint32_t height = 2,
     const std::uint8_t blue = 10,
     const std::uint8_t green = 20,
-    const std::uint8_t red = 30)
+    const std::uint8_t red = 30,
+    const ryoiki::runtime::FrameRotation orientation =
+        ryoiki::runtime::FrameRotation::None)
 {
     auto frame = std::make_shared<ryoiki::buffers::FrameBuffer>();
-    require(frame->prepare(width, height, frameId, frameId * 100), "Frame preparation failed.");
+    require(frame->prepare(width, height, frameId, frameId * 100, orientation),
+        "Frame preparation failed.");
     auto& pixels = frame->writablePixels();
     for (std::size_t offset = 0; offset < pixels.size(); offset += 4)
     {
@@ -175,6 +181,88 @@ void testPalmLetterboxAndRgbPacking()
     requireNear(result.transform.padTop, 0.0F, 0.0001F, "Tall-image vertical padding is incorrect.");
 }
 
+void testPalmSamplingUsesSharedPixelCenterOrientation()
+{
+    using ryoiki::geometry::Point2f;
+    using ryoiki::runtime::FrameRotation;
+
+    constexpr std::uint32_t kWidth = 192;
+    constexpr std::uint32_t kHeight = 96;
+    auto frame = createFrame(
+        31, kWidth, kHeight, 0, 0, 0, FrameRotation::Clockwise90);
+    auto& pixels = frame->writablePixels();
+    const auto setMarker = [&pixels](
+        const int x,
+        const int y,
+        const std::uint8_t blue,
+        const std::uint8_t green,
+        const std::uint8_t red)
+    {
+        const auto offset = static_cast<std::size_t>((y * kWidth + x) * 4);
+        pixels[offset] = blue;
+        pixels[offset + 1] = green;
+        pixels[offset + 2] = red;
+        pixels[offset + 3] = 255;
+    };
+    setMarker(0, 0, 11, 21, 31);
+    setMarker(191, 0, 41, 51, 61);
+    setMarker(0, 95, 71, 81, 91);
+    setMarker(191, 95, 101, 111, 121);
+
+    ryoiki::geometry::HandGeometryProcessor processor;
+    ryoiki::buffers::FloatTensorBuffer tensor{{1, 192, 192, 3}};
+    ryoiki::geometry::PalmPreprocessResult result{};
+    require(processor.preprocessPalm(*frame, tensor, result),
+        "Oriented marker preprocessing failed.");
+
+    auto storageToUprightCenters = ryoiki::geometry::toPixelCenterTransform(
+        ryoiki::geometry::createStorageToUprightTransform(
+            kWidth, kHeight, FrameRotation::Clockwise90));
+    ryoiki::geometry::AffineTransform uprightToStorageCenters{};
+    require(ryoiki::geometry::invert(
+            storageToUprightCenters, uprightToStorageCenters),
+        "Pixel-center orientation transform was not invertible.");
+
+    struct Marker
+    {
+        Point2f storage;
+        float red;
+        float green;
+        float blue;
+    };
+    constexpr std::array<Marker, 4> kMarkers{{
+        {{0.0F, 0.0F}, 31.0F, 21.0F, 11.0F},
+        {{191.0F, 0.0F}, 61.0F, 51.0F, 41.0F},
+        {{0.0F, 95.0F}, 91.0F, 81.0F, 71.0F},
+        {{191.0F, 95.0F}, 121.0F, 111.0F, 101.0F}}};
+
+    for (const auto& marker : kMarkers)
+    {
+        const auto upright = storageToUprightCenters.transform(marker.storage);
+        const auto tensorPoint = result.transform.sourceToTensor(upright);
+        requireNear(tensorPoint.x, std::round(tensorPoint.x), 0.0001F,
+            "Marker did not map to an exact tensor pixel X.");
+        requireNear(tensorPoint.y, std::round(tensorPoint.y), 0.0001F,
+            "Marker did not map to an exact tensor pixel Y.");
+        requireRgb(
+            tensor,
+            static_cast<int>(std::round(tensorPoint.x)),
+            static_cast<int>(std::round(tensorPoint.y)),
+            192,
+            marker.red / 255.0F,
+            marker.green / 255.0F,
+            marker.blue / 255.0F,
+            "Palm sampling did not preserve the oriented corner marker.");
+
+        const auto restoredUpright = result.transform.tensorToSource(tensorPoint);
+        const auto restoredStorage = uprightToStorageCenters.transform(restoredUpright);
+        requireNear(restoredStorage.x, marker.storage.x, 0.0001F,
+            "Palm tensor round trip did not restore storage pixel-center X.");
+        requireNear(restoredStorage.y, marker.storage.y, 0.0001F,
+            "Palm tensor round trip did not restore storage pixel-center Y.");
+    }
+}
+
 void requireRegionMapping(
     ryoiki::geometry::HandGeometryProcessor& processor,
     const ryoiki::buffers::FrameBuffer& frame,
@@ -304,6 +392,151 @@ void testLatestRenderPacketKeepsFrameAndMetadataTogether()
     slot.clear();
     require(!slot.snapshot().has_value(), "Render packet slot clear retained a packet.");
 }
+
+std::vector<std::uint8_t> createOrientationSource(const bool bottomUp)
+{
+    constexpr std::size_t kStride = 12;
+    std::vector<std::uint8_t> pixels(kStride * 3, 0);
+    const std::uint8_t logicalRows[3][2]{{1, 2}, {3, 4}, {5, 6}};
+    for (std::size_t logicalY = 0; logicalY < 3; ++logicalY)
+    {
+        const std::size_t memoryY = bottomUp ? 2 - logicalY : logicalY;
+        for (std::size_t x = 0; x < 2; ++x)
+        {
+            const std::size_t offset = memoryY * kStride + x * 4;
+            pixels[offset] = logicalRows[logicalY][x];
+            pixels[offset + 3] = 255;
+        }
+    }
+    return pixels;
+}
+
+void requireOrientedBlueValues(
+    const std::vector<std::uint8_t>& pixels,
+    const std::vector<std::uint8_t>& expected,
+    const char* message)
+{
+    require(pixels.size() == expected.size() * 4, message);
+    for (std::size_t index = 0; index < expected.size(); ++index)
+    {
+        require(pixels[index * 4] == expected[index], message);
+    }
+}
+
+void testFrameOrientationNormalization()
+{
+    using ryoiki::runtime::FrameRotation;
+
+    std::vector<std::uint8_t> destination;
+    const auto topDown = createOrientationSource(false);
+    require(ryoiki::runtime::copyStorageBgra32(
+            topDown.data(), 12, 2, 3, destination),
+        "Top-down storage copy failed.");
+    requireOrientedBlueValues(destination, {1, 2, 3, 4, 5, 6},
+        "Positive stride changed top-down row order.");
+
+    const auto bottomUp = createOrientationSource(true);
+    require(ryoiki::runtime::copyStorageBgra32(
+            bottomUp.data() + 24, -12, 2, 3, destination),
+        "Bottom-up storage copy failed.");
+    requireOrientedBlueValues(destination, {1, 2, 3, 4, 5, 6},
+        "Negative stride did not restore top-down row order.");
+
+    require(!ryoiki::runtime::copyStorageBgra32(
+            topDown.data(), 4, 2, 3, destination),
+        "Storage copy accepted a stride shorter than one row.");
+
+    require(ryoiki::runtime::orientedSize(2, 3, FrameRotation::Clockwise90).width == 3,
+        "90-degree orientation did not swap width.");
+    require(ryoiki::runtime::orientedSize(2, 3, FrameRotation::Clockwise270).height == 2,
+        "270-degree orientation did not swap height.");
+    require(ryoiki::runtime::orientedSize(2, 3, FrameRotation::Clockwise180).width == 2,
+        "180-degree orientation changed width.");
+}
+
+void testFrameOrientationRemainsMetadataUntilSampling()
+{
+    using ryoiki::runtime::FrameRotation;
+
+    const auto source = createOrientationSource(false);
+    std::vector<std::uint8_t> storagePixels;
+    require(ryoiki::runtime::copyStorageBgra32(
+            source.data(), 12, 2, 3, storagePixels),
+        "Storage-order frame copy failed.");
+    requireOrientedBlueValues(storagePixels, {1, 2, 3, 4, 5, 6},
+        "Capture copy physically rotated storage pixels.");
+
+    ryoiki::buffers::FrameBuffer frame;
+    require(frame.prepare(2, 3, 19, 1900, FrameRotation::Clockwise90),
+        "Oriented frame preparation failed.");
+    frame.writablePixels() = storagePixels;
+    require(frame.width() == 2 && frame.height() == 3,
+        "Storage dimensions were replaced by upright dimensions.");
+    require(frame.uprightWidth() == 3 && frame.uprightHeight() == 2,
+        "Upright dimensions did not apply orientation metadata.");
+
+    ryoiki::geometry::HandGeometryProcessor processor;
+    ryoiki::buffers::FloatTensorBuffer tensor{{1, 192, 192, 3}};
+    ryoiki::geometry::PalmPreprocessResult result{};
+    require(processor.preprocessPalm(frame, tensor, result),
+        "Palm preprocessing did not consume orientation metadata.");
+    requireNear(result.transform.scaleX, 64.0F, 0.0001F,
+        "Palm X scale did not use upright width.");
+    requireNear(result.transform.scaleY, 64.0F, 0.0001F,
+        "Palm Y scale did not use upright height.");
+    requireNear(result.transform.padLeft, 0.0F, 0.0001F,
+        "Palm orientation introduced incorrect horizontal padding.");
+    requireNear(result.transform.padTop, 32.0F, 0.0001F,
+        "Palm orientation introduced incorrect vertical padding.");
+}
+
+void testFrameTransformsShareOneViewportContract()
+{
+    using ryoiki::rendering::FrameTransforms;
+    using ryoiki::geometry::Point2f;
+    using ryoiki::runtime::FrameRotation;
+
+    FrameTransforms transforms{};
+    require(ryoiki::rendering::createFrameTransforms(
+            2, 3, FrameRotation::Clockwise90, 8, 8, true, transforms),
+        "Frame transform creation failed.");
+    requireNear(transforms.contentLeft, 0.0F, 0.0001F,
+        "Letterbox horizontal offset was incorrect.");
+    requireNear(transforms.contentTop, 4.0F / 3.0F, 0.0001F,
+        "Letterbox vertical offset was incorrect.");
+
+    const Point2f storageTopLeft{0.0F, 0.0F};
+    const auto uprightTopRight = transforms.storageToUpright.transform(storageTopLeft);
+    requireNear(uprightTopRight.x, 3.0F, 0.0001F,
+        "Storage rotation did not map the top-left boundary to upright top-right.");
+    requireNear(uprightTopRight.y, 0.0F, 0.0001F,
+        "Storage rotation changed the expected upright Y coordinate.");
+
+    const auto viewportPoint = transforms.storageToViewport.transform(storageTopLeft);
+    const auto composedPoint = transforms.uprightToViewport.transform(uprightTopRight);
+    requireNear(viewportPoint.x, composedPoint.x, 0.0001F,
+        "Storage and metadata transforms did not share the same viewport mapping.");
+    requireNear(viewportPoint.y, composedPoint.y, 0.0001F,
+        "Storage and metadata transforms disagreed on viewport Y.");
+
+    const auto uprightRoundTrip = transforms.viewportToUpright.transform(composedPoint);
+    requireNear(uprightRoundTrip.x, uprightTopRight.x, 0.0001F,
+        "Viewport inverse did not restore upright X.");
+    requireNear(uprightRoundTrip.y, uprightTopRight.y, 0.0001F,
+        "Viewport inverse did not restore upright Y.");
+
+    FrameTransforms oddDimensions{};
+    require(ryoiki::rendering::createFrameTransforms(
+            641, 479, FrameRotation::Clockwise270, 1001, 701, false, oddDimensions),
+        "Odd-dimension frame transform creation failed.");
+    const Point2f nonSymmetric{137.25F, 288.75F};
+    const auto upright = oddDimensions.storageToUpright.transform(nonSymmetric);
+    const auto storageRoundTrip = oddDimensions.uprightToStorage.transform(upright);
+    requireNear(storageRoundTrip.x, nonSymmetric.x, 0.0001F,
+        "Orientation inverse did not restore odd-dimension X.");
+    requireNear(storageRoundTrip.y, nonSymmetric.y, 0.0001F,
+        "Orientation inverse did not restore odd-dimension Y.");
+}
 }
 
 int main()
@@ -314,10 +547,14 @@ int main()
         testLatestFrameDelivery();
         testMailboxProducerConsumer();
         testPalmLetterboxAndRgbPacking();
+        testPalmSamplingUsesSharedPixelCenterOrientation();
         testRotatedHandRegions();
         testInvalidGeometryInputs();
         testUserFacingCameraSelection();
         testLatestRenderPacketKeepsFrameAndMetadataTogether();
+        testFrameOrientationNormalization();
+        testFrameOrientationRemainsMetadataUntilSampling();
+        testFrameTransformsShareOneViewportContract();
         std::cout << "VisionCore tests passed.\n";
         return 0;
     }

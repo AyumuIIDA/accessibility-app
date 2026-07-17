@@ -7,9 +7,18 @@
 namespace ryoiki::hand_perception
 {
 PalmDetectionGraph::PalmDetectionGraph(std::unique_ptr<IPalmDetectionRunner> runner)
-    : runner_{std::move(runner)}
+    : PalmDetectionGraph{
+        std::move(runner),
+        std::make_unique<geometry::HandGeometryProcessor>()}
 {
-    if (runner_ == nullptr)
+}
+
+PalmDetectionGraph::PalmDetectionGraph(
+    std::unique_ptr<IPalmDetectionRunner> runner,
+    std::unique_ptr<geometry::IGeometryProcessor> geometryProcessor)
+    : runner_{std::move(runner)}, geometryProcessor_{std::move(geometryProcessor)}
+{
+    if (runner_ == nullptr || geometryProcessor_ == nullptr)
     {
         throw std::invalid_argument{"Palm detection graph requires a model runner."};
     }
@@ -24,7 +33,7 @@ bool PalmDetectionGraph::process(
     using clock = std::chrono::steady_clock;
     geometry::PalmPreprocessResult preprocessResult{};
     const auto preprocessStarted = clock::now();
-    if (!geometryProcessor_.preprocessPalm(frame, inputTensor_, preprocessResult))
+    if (!geometryProcessor_->preprocessPalm(frame, inputTensor_, preprocessResult))
     {
         error = "Palm input preprocessing failed.";
         return false;

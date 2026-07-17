@@ -41,6 +41,9 @@ class HandLandmarkGraph final
 {
 public:
     explicit HandLandmarkGraph(std::unique_ptr<IHandLandmarkRunner> runner);
+    HandLandmarkGraph(
+        std::unique_ptr<IHandLandmarkRunner> runner,
+        std::unique_ptr<geometry::IGeometryProcessor> geometryProcessor);
 
     bool process(
         const buffers::FrameBuffer& frame,
@@ -54,7 +57,7 @@ public:
 
 private:
     std::unique_ptr<IHandLandmarkRunner> runner_;
-    geometry::HandGeometryProcessor geometryProcessor_;
+    std::unique_ptr<geometry::IGeometryProcessor> geometryProcessor_;
     buffers::FloatTensorBuffer inputTensor_{{1, 224, 224, 3}};
     HandLandmarkRawOutput rawOutput_;
 };

@@ -10,9 +10,18 @@
 namespace ryoiki::hand_perception
 {
 HandLandmarkGraph::HandLandmarkGraph(std::unique_ptr<IHandLandmarkRunner> runner)
-    : runner_{std::move(runner)}
+    : HandLandmarkGraph{
+        std::move(runner),
+        std::make_unique<geometry::HandGeometryProcessor>()}
 {
-    if (runner_ == nullptr)
+}
+
+HandLandmarkGraph::HandLandmarkGraph(
+    std::unique_ptr<IHandLandmarkRunner> runner,
+    std::unique_ptr<geometry::IGeometryProcessor> geometryProcessor)
+    : runner_{std::move(runner)}, geometryProcessor_{std::move(geometryProcessor)}
+{
+    if (runner_ == nullptr || geometryProcessor_ == nullptr)
     {
         throw std::invalid_argument{"Hand landmark graph requires a model runner."};
     }
@@ -30,7 +39,7 @@ bool HandLandmarkGraph::process(
     result = {};
     geometry::HandPreprocessResult preprocessResult{};
     const auto preprocessStarted = clock::now();
-    if (!geometryProcessor_.preprocessHand(frame, region, inputTensor_, preprocessResult))
+    if (!geometryProcessor_->preprocessHand(frame, region, inputTensor_, preprocessResult))
     {
         error = "Hand ROI preprocessing failed.";
         return false;

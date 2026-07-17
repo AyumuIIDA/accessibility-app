@@ -8,7 +8,27 @@
 
 namespace ryoiki::geometry
 {
-class HandGeometryProcessor final
+class IGeometryProcessor
+{
+public:
+    virtual ~IGeometryProcessor() = default;
+
+    [[nodiscard]] virtual buffers::MemoryLocation inputMemoryLocation() const noexcept = 0;
+    [[nodiscard]] virtual buffers::MemoryLocation outputMemoryLocation() const noexcept = 0;
+
+    virtual bool preprocessPalm(
+        const buffers::FrameBuffer& frame,
+        buffers::FloatTensorBuffer& tensor,
+        PalmPreprocessResult& result) = 0;
+
+    virtual bool preprocessHand(
+        const buffers::FrameBuffer& frame,
+        const RotatedRegion& region,
+        buffers::FloatTensorBuffer& tensor,
+        HandPreprocessResult& result) = 0;
+};
+
+class HandGeometryProcessor final : public IGeometryProcessor
 {
 public:
     static constexpr int kPalmInputSize = 192;
@@ -20,16 +40,19 @@ public:
     HandGeometryProcessor(const HandGeometryProcessor&) = delete;
     HandGeometryProcessor& operator=(const HandGeometryProcessor&) = delete;
 
+    [[nodiscard]] buffers::MemoryLocation inputMemoryLocation() const noexcept override;
+    [[nodiscard]] buffers::MemoryLocation outputMemoryLocation() const noexcept override;
+
     bool preprocessPalm(
         const buffers::FrameBuffer& frame,
         buffers::FloatTensorBuffer& tensor,
-        PalmPreprocessResult& result);
+        PalmPreprocessResult& result) override;
 
     bool preprocessHand(
         const buffers::FrameBuffer& frame,
         const RotatedRegion& region,
         buffers::FloatTensorBuffer& tensor,
-        HandPreprocessResult& result);
+        HandPreprocessResult& result) override;
 
 private:
     struct Impl;

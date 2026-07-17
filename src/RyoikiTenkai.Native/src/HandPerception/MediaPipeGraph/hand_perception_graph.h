@@ -32,6 +32,11 @@ public:
     HandPerceptionGraph(
         std::unique_ptr<IPalmDetectionRunner> palmRunner,
         std::unique_ptr<IHandLandmarkRunner> handRunner);
+    HandPerceptionGraph(
+        std::unique_ptr<IPalmDetectionRunner> palmRunner,
+        std::unique_ptr<IHandLandmarkRunner> handRunner,
+        std::unique_ptr<geometry::IGeometryProcessor> palmGeometryProcessor,
+        std::unique_ptr<geometry::IGeometryProcessor> handGeometryProcessor);
 
     bool process(
         const buffers::FrameBuffer& frame,

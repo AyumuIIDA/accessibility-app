@@ -22,6 +22,9 @@ class PalmDetectionGraph final
 {
 public:
     explicit PalmDetectionGraph(std::unique_ptr<IPalmDetectionRunner> runner);
+    PalmDetectionGraph(
+        std::unique_ptr<IPalmDetectionRunner> runner,
+        std::unique_ptr<geometry::IGeometryProcessor> geometryProcessor);
 
     bool process(
         const buffers::FrameBuffer& frame,
@@ -33,7 +36,7 @@ public:
 
 private:
     std::unique_ptr<IPalmDetectionRunner> runner_;
-    geometry::HandGeometryProcessor geometryProcessor_;
+    std::unique_ptr<geometry::IGeometryProcessor> geometryProcessor_;
     buffers::FloatTensorBuffer inputTensor_{{1, 192, 192, 3}};
     PalmDetectionRawOutput rawOutput_;
     PalmDetectionPostprocessor postprocessor_;
