@@ -19,8 +19,8 @@ CameraCapture
             -> HandLandmarkGraph -> IHandLandmarkRunner
             -> HandLandmarksToRoi -> next-frame ROI loopback
             -> CPU ONNX Runtime runners
-       -> Rendering/LatestRenderPacketSlot
-            -> reusable GDI back buffer -> HWND present
+       -> Rendering/NativeRenderStage (latest value, render-thread ownership)
+            -> D3D11 + DXGI flip swap chain + Direct2D -> atomic present
 ```
 
 - `Buffers` owns reusable image/tensor storage and memory-location metadata. It does
@@ -37,12 +37,23 @@ CameraCapture
 - `MediaPipeGraph` owns anchor decode, confidence handling, NMS, palm-to-ROI,
   landmark projection, ROI loopback, and palm fallback. It depends on runner
   interfaces and does not select hardware providers.
+- `IGeometryProcessor` owns orientation-aware palm/hand tensor sampling and declares
+  its input/output memory locations. The current OpenCV implementation is CPU-to-CPU;
+  a future D3D/DirectML implementation can be injected without adding device branches
+  to the MediaPipe-like graph.
 - `CameraCapture` owns Media Foundation and copies samples into caller-provided native
-  storage. It does not publish frames or call perception.
+  storage. It normalizes signed scanline stride but preserves media-type rotation as
+  frame metadata. It does not allocate a rotated full-frame intermediate, publish
+  frames, or call perception.
 - `Rendering` joins a source frame with the palm/hand result produced from that exact
-  frame. It retains only the latest completed render packet. The HWND draws the image
-  and overlays into a reusable offscreen buffer, then presents the completed image in
-  one `BitBlt` operation.
+  frame. `NativeRenderStage` retains only the latest completed packet and owns its
+  D3D11 device, immediate context, DXGI flip-model swap chain, and Direct2D context on
+  one render thread. It uploads CPU BGRA once per accepted frame, draws the image and
+  overlays into the same DXGI back buffer, and calls `Present` once. The child HWND has
+  no GDI, DIB, OpenCV, or WPF image writer.
+  Redraw and resize reuse the uploaded camera bitmap when `frame_id` is unchanged.
+  A new frame, camera-bitmap recreation, or device-resource recreation invalidates the
+  upload cache.
 - `ryoiki_native.cpp` is the runtime/C ABI composition root. It owns lifecycle,
   workers, polling snapshots, and the current HWND adapter.
 
@@ -83,7 +94,10 @@ with a mutex and copies it into caller-owned structures.
 - WPF owns the output structure passed to a polling call.
 - A successful polling call copies one small metadata snapshot into that structure.
 - WPF never retains a native image or tensor pointer.
-- Version 4 uses CPU memory internally. Future GPU or NPU buffers remain native-owned.
+- Version 4 camera and perception frames use CPU memory internally. Rendering uploads
+  the retained CPU BGRA frame into a reusable Direct2D bitmap. Future GPU or NPU
+  buffers remain native-owned; capture-memory migration criteria are documented in
+  `doc/native-frame-memory-roadmap.md`.
 
 ## Frame identity and time
 
@@ -99,17 +113,43 @@ with a mutex and copies it into caller-owned structures.
 - Every accepted perception frame produces one terminal render packet, including
   no-hand and recoverable-error results. A render packet always carries metadata from
   the same `frame_id` as its retained frame.
-- The display path retains the latest completed render packet. Packets superseded
-  before `WM_PAINT` are intentionally dropped. Camera capture does not independently
-  trigger a normal frame paint.
+- The display path retains the latest completed render packet. A newer publish
+  replaces an unrendered packet; camera capture does not independently trigger a
+  normal frame render. `WM_PAINT` only validates the HWND and requests redraw of the
+  last retained packet. `WM_SIZE` publishes a latest-only resize command. Resource
+  creation, resize, drawing, presentation, and destruction remain on the render
+  thread.
 
 ## Coordinates
 
+- Camera buffers use the signed Media Foundation stride contract. `IMF2DBuffer` pitch
+  is consumed directly; contiguous buffers use `MF_MT_DEFAULT_STRIDE`, including its
+  sign. `MF_MT_VIDEO_ROTATION`, when present, is stored on `FrameBuffer`. The CPU
+  geometry backend fuses it into the 192x192 palm and 224x224 hand sampling transforms.
+  The renderer preserves storage pixels during upload and applies
+  `storageToViewport` on the GPU; upright palm/hand metadata uses the matching
+  `uprightToViewport` transform. The
+  front camera on the current Surface reports enclosure rotation `0` and no media-type
+  rotation, so it must not receive a hard-coded 180-degree device correction.
 - `bbox` is `[left, top, right, bottom]`.
 - Palm results include the highest-scoring bbox and seven `[x, y]` keypoints. The
   `palm_count` may be greater than one even though version 4 copies only the best palm.
-- Image `x` and `y` values are normalized to `[0, 1]` in the captured image before
-  presentation mirroring. `x` increases right and `y` increases down.
+- Image `x` and `y` values are expressed in the logical upright image defined by the
+  frame orientation metadata, then normalized to `[0, 1]` before presentation
+  mirroring. `x` increases right and `y` increases down. Storage width/height remain
+  the unrotated buffer dimensions; upright width/height swap for 90/270-degree frames.
+- Renderer coordinates are physical back-buffer pixels. The Direct2D context uses 96
+  DPI, so DPI is not applied a second time by Direct2D. Continuous image boundaries
+  are `[0, width] x [0, height]`; normalized ABI metadata remains `[0, 1]`.
+- `FrameTransforms` is the only display transform authority. It provides
+  `storageToUpright`, `uprightToViewport`, their composition, and inverse transforms.
+  Letterbox and front-camera mirroring are part of `uprightToViewport`.
+- Storage orientation is defined once by `geometry::createStorageToUprightTransform`
+  and consumed by both perception and rendering. Its matrices use continuous image
+  edges. OpenCV sampling converts them to integer pixel-center coordinates through
+  `toPixelCenterTransform`, which explicitly applies the `+0.5` input and `-0.5`
+  output adapter. Palm tensor sampling and `LetterboxTransform::tensorToSource`
+  therefore use the same half-pixel convention.
 - Each landmark is `[x, y, z]`. `x` and `y` use the image convention above. `z` is
   model-relative and must not be interpreted as a metric depth value.
 - `handedness` is the model's right-hand score in `[0, 1]`; a negative value means
@@ -140,7 +180,23 @@ zero on frames that successfully use the landmark ROI loopback; they run again a
 tracking confidence falls below the fallback threshold.
 
 Display FPS counts newly presented render packet frame IDs. Window exposure or resize
-paints that re-present the same packet do not increment the display cadence metric.
+redraws that re-present the same packet do not increment the display cadence metric.
+`overlay_render_ms` currently measures the complete render operation: BGRA upload,
+camera draw, overlay draw, `EndDraw`, and synchronized `Present`.
+
+## Renderer recovery
+
+- Renderer initialization is synchronous with `ryoiki_start`; failure returns an ABI
+  failure and records the DirectX diagnostic.
+- `DXGI_ERROR_DEVICE_REMOVED`, `DXGI_ERROR_DEVICE_RESET`, and
+  `D2DERR_RECREATE_TARGET` trigger one rebuild of device-dependent resources and one
+  retry of the retained packet.
+- Resize releases the Direct2D target before `ResizeBuffers`, recreates it from the new
+  DXGI surface, and redraws the retained packet.
+- The initial policy is `Present(1, 0)` with maximum frame latency set to one when
+  `IDXGIDevice1` is available. The two-buffer swap chain uses
+  `DXGI_SWAP_EFFECT_FLIP_DISCARD`. A waitable swap chain is deferred until latency
+  metrics show that it improves this device.
 
 ## Failure handling
 

@@ -17,6 +17,7 @@ camera
 
 - Windows 11
 - .NET SDK 10
+- Visual Studio 2026 with Desktop development with C++
 - A webcam
 - PowerShell
 - Internet access for first-time NuGet/model download
@@ -53,15 +54,15 @@ src/RyoikiTenkai.Wpf/
   WPF demo UI.
 
 src/RyoikiTenkai.Native/
-  Experimental C++ native vision runtime DLL skeleton.
+  C++ camera, perception, geometry, and DirectX rendering runtime DLL.
 ```
 
 ## First-Time Setup
 
-From the repository root:
+Clone the repository, then run all commands below from its root. For example:
 
 ```powershell
-cd C:\Users\hyena\accessibility-app
+Set-Location accessibility-app
 ```
 
 Restore NuGet packages:
@@ -217,42 +218,87 @@ ABI version before creating a runtime and validates the version and size of ever
 polled structure.
 
 The native runtime currently captures a user-facing camera through Media Foundation,
-converts frames to top-down BGRA32, and sends pooled native-owned frames through a
-capacity-one perception path. Perception completion publishes one synchronized render
+normalizes signed stride into tightly packed top-down BGRA32, retains camera rotation
+as frame metadata, and sends pooled native-owned frames through a capacity-one
+perception path. Perception completion
+publishes one synchronized render
 packet containing the source frame and its palm/hand metadata. The child HWND composes
-that packet in a reusable GDI back buffer and presents it with one blit. The
+that packet on a dedicated render thread using a D3D11 device, DXGI flip-model swap
+chain, and Direct2D device context. CPU BGRA pixels are uploaded once per accepted
+frame; orientation, front-camera mirroring, letterbox fitting, and overlays are drawn
+into the same back buffer before one synchronized present. No GDI or OpenCV display
+path writes to the child HWND. The
 perception worker uses OpenCV to letterbox the palm input and pack an RGB NHWC float
-tensor. CPU model runners execute both ONNX models through ONNX Runtime. The
+tensor. Camera orientation is fused into palm and hand tensor sampling, so capture
+does not create a rotated full-resolution intermediate. CPU model runners execute
+both ONNX models through ONNX Runtime. The
 MediaPipe-like graph decodes palm anchors, creates a rotated hand ROI, projects 21
 landmarks back to source coordinates, and reuses a landmark-derived ROI while tracking
 confidence remains above threshold. Palm bbox/keypoints and hand landmarks are exposed
 through ABI polling and rendered by the native HWND overlay. Direct2D/Direct3D
-rendering, DirectML, and QNN remain future phases.
+rendering is the sole native display path; DirectML and QNN remain future phases.
+Camera frame memory placement options and the criteria for moving capture from CPU
+buffers to DXGI surfaces are documented in
+[`doc/native-frame-memory-roadmap.md`](doc/native-frame-memory-roadmap.md).
 
-Required native build tools:
+### Install Visual Studio 2026 Components
+
+Open Visual Studio Installer, select **Visual Studio 2026**, and install the
+**Desktop development with C++** workload. Ensure these individual components are
+included:
 
 ```text
-Visual Studio 2022 or later
-Desktop development with C++
-MSVC ARM64 toolchain
-Windows 11 SDK 10.0.26100+
-CMake
-Ninja
-vcpkg (the Visual Studio bundled installation is supported)
-.NET SDK restore of Microsoft.ML.OnnxRuntime 1.27.0
+MSVC C++ ARM64/ARM64EC build tools
+Windows 11 SDK 10.0.26100.0 or later
+C++ CMake tools for Windows
+vcpkg package manager
+```
+
+The verified environment uses Visual Studio 2026 (version 18), the MSVC 14.5x
+toolset, CMake, Ninja, and the vcpkg installation bundled with Visual Studio. The
+repository's `vcpkg.json` pins the OpenCV dependency baseline. NuGet restore supplies
+the ONNX Runtime 1.27.0 native headers, import library, and DLL.
+
+Also install the .NET 10 SDK, then verify the command-line tools:
+
+```powershell
+dotnet --version
+cmake --version
+ninja --version
 ```
 
 ### ARM64 Developer Shell
 
-For native C++ builds, use a Visual Studio developer shell configured for ARM64. A regular PowerShell may not have `cl.exe`, Windows SDK include paths, or MSVC library paths configured.
+For native C++ builds, use a Visual Studio 2026 developer environment configured for
+ARM64. A regular PowerShell does not normally have `cl.exe`, Windows SDK include
+paths, or MSVC library paths configured.
 
-The most explicit way is:
+The following commands locate any installed Visual Studio 2026 edition and configure
+the current PowerShell process without assuming Community, Professional, or Enterprise:
 
-```cmd
-cmd /k "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat" arm64
+```powershell
+$vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+$vsPath = & $vswhere -latest -products * `
+  -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 `
+  -property installationPath
+
+if (-not $vsPath) {
+  throw "Visual Studio 2026 with the ARM64 C++ tools was not found."
+}
+
+Import-Module (Join-Path $vsPath "Common7\Tools\Microsoft.VisualStudio.DevShell.dll")
+if ($env:VSCMD_ARG_TGT_ARCH -ne "arm64") {
+  Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation `
+    -Arch arm64 -HostArch arm64
+}
+
+$env:VCPKG_ROOT = Join-Path $vsPath "VC\vcpkg"
 ```
 
-`vcvarsall.bat` is the Visual Studio/MSVC environment setup script. It configures:
+Alternatively, open **ARM64 Native Tools PowerShell for VS 2026** from the Start
+menu and set `VCPKG_ROOT` to the bundled `VC\vcpkg` directory if needed.
+
+The developer environment configures:
 
 ```text
 PATH
@@ -266,12 +312,13 @@ VSCMD_ARG_HOST_ARCH
 VSCMD_ARG_TGT_ARCH
 ```
 
-In the opened shell, verify that ARM64 is selected:
+Verify that ARM64 is selected and the required tools are visible:
 
-```cmd
-where cl
-echo %VSCMD_ARG_HOST_ARCH%
-echo %VSCMD_ARG_TGT_ARCH%
+```powershell
+Get-Command cl, cmake, ninja
+$env:VSCMD_ARG_HOST_ARCH
+$env:VSCMD_ARG_TGT_ARCH
+Test-Path (Join-Path $env:VCPKG_ROOT "scripts\buildsystems\vcpkg.cmake")
 ```
 
 Expected:
@@ -280,17 +327,16 @@ Expected:
 ...\Hostarm64\arm64\cl.exe
 arm64
 arm64
+True
 ```
 
 If you see `Hostx86\x86\cl.exe` or `x86`, close that shell and reopen an ARM64 developer shell. The native DLL loaded by the WPF app must match the process architecture.
 
 ### Build Native DLL
 
-From the ARM64 developer shell:
+From the repository root in that ARM64 Developer PowerShell:
 
 ```powershell
-cd /d C:\Users\hyena\accessibility-app
-
 dotnet restore src/RyoikiTenkai.Wpf/RyoikiTenkai.Wpf.csproj
 cmake -S src/RyoikiTenkai.Native -B build/RyoikiTenkai.Native.OpenCv -G Ninja `
   -DCMAKE_BUILD_TYPE=Debug `
@@ -298,6 +344,14 @@ cmake -S src/RyoikiTenkai.Native -B build/RyoikiTenkai.Native.OpenCv -G Ninja `
   -DVCPKG_TARGET_TRIPLET=arm64-windows-static-md
 cmake --build build/RyoikiTenkai.Native.OpenCv
 ctest --test-dir build/RyoikiTenkai.Native.OpenCv --output-on-failure
+```
+
+The expected native outputs are:
+
+```text
+build/RyoikiTenkai.Native.OpenCv/RyoikiTenkai.Native.dll
+build/RyoikiTenkai.Native.OpenCv/RyoikiTenkai.VisionCore.Tests.exe
+build/RyoikiTenkai.Native.OpenCv/RyoikiTenkai.HandPerception.Tests.exe
 ```
 
 CMake resolves ONNX Runtime headers and the architecture-specific import library from
@@ -322,10 +376,14 @@ This target fails before CMake runs when the Visual Studio target architecture i
 ARM64 or the vcpkg toolchain cannot be found. This prevents a regular PowerShell or a
 stale x86 developer environment from silently producing an incompatible native DLL.
 
-If the build directory was previously configured for x86 or another architecture, delete it before reconfiguring:
+If the build directory was previously configured for x86, x64, or another vcpkg
+triplet, remove only that generated directory before reconfiguring:
 
-```cmd
-rmdir /s /q build\RyoikiTenkai.Native.OpenCv
+```powershell
+$nativeBuild = Resolve-Path build/RyoikiTenkai.Native.OpenCv -ErrorAction SilentlyContinue
+if ($nativeBuild -and $nativeBuild.Path.StartsWith((Resolve-Path .).Path)) {
+  Remove-Item -LiteralPath $nativeBuild.Path -Recurse -Force
+}
 ```
 
 Run WPF and enable the `Native runtime` checkbox before pressing Start.
@@ -380,10 +438,10 @@ Optional local NuGet package cache location:
 $env:NUGET_PACKAGES = "$HOME\.nuget\packages"
 ```
 
-Optional model directory helper for scripts:
+Optional model directory helper for scripts, set from the repository root:
 
 ```powershell
-$env:RYOIKI_MODELS_DIR = "C:\Users\hyena\accessibility-app\src\RyoikiTenkai\models"
+$env:RYOIKI_MODELS_DIR = Join-Path (Get-Location) "src\RyoikiTenkai\models"
 ```
 
 Download using `RYOIKI_MODELS_DIR`:
@@ -405,7 +463,7 @@ Make environment variables persistent for the current Windows user:
 ```powershell
 [Environment]::SetEnvironmentVariable("DOTNET_CLI_TELEMETRY_OPTOUT", "1", "User")
 [Environment]::SetEnvironmentVariable("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1", "User")
-[Environment]::SetEnvironmentVariable("RYOIKI_MODELS_DIR", "C:\Users\hyena\accessibility-app\src\RyoikiTenkai\models", "User")
+[Environment]::SetEnvironmentVariable("RYOIKI_MODELS_DIR", $env:RYOIKI_MODELS_DIR, "User")
 ```
 
 Open a new PowerShell session after setting persistent environment variables.
