@@ -1,5 +1,6 @@
 #include "camera_capture.h"
 #include "Runtime/camera_device_selection.h"
+#include "Runtime/frame_orientation.h"
 
 #include <Windows.h>
 #include <mfapi.h>
@@ -8,7 +9,7 @@
 #include <wrl/client.h>
 
 #include <chrono>
-#include <cstring>
+#include <bit>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -54,6 +55,38 @@ std::wstring getCameraFriendlyName(IMFActivate& device)
     CoTaskMemFree(allocatedName);
     return name;
 }
+
+bool readRotation(IMFMediaType& mediaType, UINT32& rotation)
+{
+    UINT32 value = 0;
+    if (FAILED(mediaType.GetUINT32(MF_MT_VIDEO_ROTATION, &value)))
+    {
+        return false;
+    }
+    if (value != 0 && value != 90 && value != 180 && value != 270)
+    {
+        return false;
+    }
+    rotation = value;
+    return true;
+}
+
+ryoiki::runtime::FrameRotation toFrameRotation(const UINT32 counterClockwiseRotation)
+{
+    // MF_MT_VIDEO_ROTATION describes how far the content is rotated counter-clockwise.
+    // Applying the same numeric angle clockwise restores an upright frame.
+    switch (counterClockwiseRotation)
+    {
+    case 90:
+        return ryoiki::runtime::FrameRotation::Clockwise90;
+    case 180:
+        return ryoiki::runtime::FrameRotation::Clockwise180;
+    case 270:
+        return ryoiki::runtime::FrameRotation::Clockwise270;
+    default:
+        return ryoiki::runtime::FrameRotation::None;
+    }
+}
 }
 
 struct CameraCapture::Impl
@@ -64,6 +97,8 @@ struct CameraCapture::Impl
     ComPtr<IMFSourceReader> sourceReader;
     std::uint32_t width{0};
     std::uint32_t height{0};
+    LONG defaultStride{0};
+    ryoiki::runtime::FrameRotation rotation{ryoiki::runtime::FrameRotation::None};
 
     ~Impl()
     {
@@ -186,6 +221,13 @@ bool CameraCapture::initialize(std::string& error)
         return false;
     }
 
+    UINT32 sourceRotation = 0;
+    ComPtr<IMFMediaType> sourceType;
+    if (SUCCEEDED(impl_->sourceReader->GetCurrentMediaType(kVideoStream, &sourceType)))
+    {
+        readRotation(*sourceType.Get(), sourceRotation);
+    }
+
     ComPtr<IMFMediaType> outputType;
     result = MFCreateMediaType(&outputType);
     if (failed(result, "MFCreateMediaType", error))
@@ -231,6 +273,31 @@ bool CameraCapture::initialize(std::string& error)
 
     impl_->width = width;
     impl_->height = height;
+    UINT32 strideValue = 0;
+    if (SUCCEEDED(currentType->GetUINT32(MF_MT_DEFAULT_STRIDE, &strideValue)))
+    {
+        impl_->defaultStride = std::bit_cast<LONG>(strideValue);
+    }
+    else
+    {
+        result = MFGetStrideForBitmapInfoHeader(MFVideoFormat_RGB32.Data1, width, &impl_->defaultStride);
+        if (failed(result, "Get camera frame stride", error))
+        {
+            return false;
+        }
+    }
+    if (impl_->defaultStride == 0)
+    {
+        error = "The camera returned an invalid frame stride.";
+        return false;
+    }
+
+    UINT32 outputRotation = 0;
+    if (readRotation(*currentType.Get(), outputRotation))
+    {
+        sourceRotation = outputRotation;
+    }
+    impl_->rotation = toFrameRotation(sourceRotation);
     return true;
 }
 
@@ -250,6 +317,7 @@ bool CameraCapture::readFrame(
     std::vector<std::uint8_t>& bgra,
     std::uint32_t& width,
     std::uint32_t& height,
+    ryoiki::runtime::FrameRotation& orientation,
     double& cameraWaitMs,
     double& frameCopyMs,
     std::string& error)
@@ -315,7 +383,6 @@ bool CameraCapture::readFrame(
 
     const auto copyStarted = clock::now();
     bgra.resize(static_cast<std::size_t>(requiredBytes64));
-
     ComPtr<IMF2DBuffer> buffer2d;
     if (SUCCEEDED(buffer.As(&buffer2d)))
     {
@@ -327,14 +394,20 @@ bool CameraCapture::readFrame(
             return false;
         }
 
-        const auto rowBytes = static_cast<std::size_t>(impl_->width) * 4U;
-        for (std::uint32_t y = 0; y < impl_->height; ++y)
+        if (!ryoiki::runtime::copyStorageBgra32(
+                firstScanline,
+                pitch,
+                impl_->width,
+                impl_->height,
+                bgra))
         {
-            const auto* sourceRow = firstScanline + static_cast<std::ptrdiff_t>(y) * pitch;
-            auto* destinationRow = bgra.data() + static_cast<std::size_t>(y) * rowBytes;
-            std::memcpy(destinationRow, sourceRow, rowBytes);
+            buffer2d->Unlock2D();
+            error = "The camera 2D buffer has an invalid stride or orientation.";
+            return false;
         }
         buffer2d->Unlock2D();
+        width = impl_->width;
+        height = impl_->height;
     }
     else
     {
@@ -347,27 +420,43 @@ bool CameraCapture::readFrame(
             return false;
         }
 
-        if (currentLength < requiredBytes64)
+        const auto strideMagnitude = static_cast<std::uint64_t>(
+            impl_->defaultStride < 0 ? -static_cast<std::int64_t>(impl_->defaultStride)
+                                     : impl_->defaultStride);
+        const auto rowBytes = static_cast<std::uint64_t>(impl_->width) * 4U;
+        const auto requiredBufferBytes = strideMagnitude * (impl_->height - 1U) + rowBytes;
+        if (currentLength < requiredBufferBytes)
         {
             buffer->Unlock();
             error = "The camera buffer is smaller than the declared frame size.";
             return false;
         }
 
-        const auto rowBytes = static_cast<std::size_t>(impl_->width) * 4U;
-        for (std::uint32_t y = 0; y < impl_->height; ++y)
+        const BYTE* firstScanline = data;
+        if (impl_->defaultStride < 0)
         {
-            const auto sourceY = impl_->height - 1U - y;
-            const auto* sourceRow = data + static_cast<std::size_t>(sourceY) * rowBytes;
-            auto* destinationRow = bgra.data() + static_cast<std::size_t>(y) * rowBytes;
-            std::memcpy(destinationRow, sourceRow, rowBytes);
+            firstScanline += static_cast<std::size_t>(impl_->height - 1U)
+                * static_cast<std::size_t>(strideMagnitude);
+        }
+
+        if (!ryoiki::runtime::copyStorageBgra32(
+                firstScanline,
+                impl_->defaultStride,
+                impl_->width,
+                impl_->height,
+                bgra))
+        {
+            buffer->Unlock();
+            error = "The camera buffer has an invalid stride or orientation.";
+            return false;
         }
         buffer->Unlock();
+        width = impl_->width;
+        height = impl_->height;
     }
 
     const auto copyCompleted = clock::now();
     frameCopyMs = std::chrono::duration<double, std::milli>(copyCompleted - copyStarted).count();
-    width = impl_->width;
-    height = impl_->height;
+    orientation = impl_->rotation;
     return true;
 }

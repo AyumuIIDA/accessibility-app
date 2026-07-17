@@ -85,6 +85,8 @@ target_link_libraries(RyoikiTenkai.VisionCore PUBLIC
 
 add_library(RyoikiTenkai.Native SHARED
     src/camera_capture.cpp
+    src/Rendering/d3d11_d2d_renderer.cpp
+    src/Rendering/native_render_stage.cpp
     src/ryoiki_native.cpp
 )
 
@@ -104,6 +106,9 @@ target_link_libraries(RyoikiTenkai.Native PRIVATE
     mfreadwrite
     mfuuid
     ole32
+    d2d1
+    d3d11
+    dxgi
 )
 
 if (MSVC)

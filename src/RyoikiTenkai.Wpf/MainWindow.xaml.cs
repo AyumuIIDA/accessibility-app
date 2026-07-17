@@ -206,7 +206,8 @@ public partial class MainWindow : Window
             StateText.Text = $"Native frame {metrics.FrameId}";
             OverlayStatusText.Text =
                 $"Native  camera {metrics.CameraFps:0.0}  display {metrics.DisplayFps:0.0} fps  " +
-                $"preprocess {metrics.PreprocessMs:0.0} ms  drops {metrics.FramePoolDroppedFrames}/{metrics.PerceptionDroppedFrames}";
+                $"copy {metrics.FrameCopyMs:0.0} ms  preprocess {metrics.PreprocessMs:0.0} ms  " +
+                $"drops {metrics.FramePoolDroppedFrames}/{metrics.PerceptionDroppedFrames}";
         }
     }
 

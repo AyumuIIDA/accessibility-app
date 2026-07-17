@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Runtime/frame_orientation.h"
+
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -22,6 +24,7 @@ public:
         std::vector<std::uint8_t>& bgra,
         std::uint32_t& width,
         std::uint32_t& height,
+        ryoiki::runtime::FrameRotation& orientation,
         double& cameraWaitMs,
         double& frameCopyMs,
         std::string& error);
