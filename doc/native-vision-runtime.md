@@ -1,6 +1,6 @@
 # Native Vision Runtime Contract
 
-This document defines the version 4 contract between the WPF host and
+This document defines the version 5 contract between the WPF host and
 `RyoikiTenkai.Native.dll`. The public declarations are in
 `src/RyoikiTenkai.Native/include/ryoiki_native.h`.
 
@@ -122,10 +122,13 @@ with a mutex and copies it into caller-owned structures.
 
 ## Coordinates
 
-- Camera buffers use the signed Media Foundation stride contract. `IMF2DBuffer` pitch
-  is consumed directly; contiguous buffers use `MF_MT_DEFAULT_STRIDE`, including its
-  sign. `MF_MT_VIDEO_ROTATION`, when present, is stored on `FrameBuffer`. The CPU
+- The default camera path configures an `IMFDXGIDeviceManager` with the renderer's
+  shared, multithread-protected D3D11 device. ARGB32 samples remain retained D3D11
+  textures. `MF_MT_VIDEO_ROTATION`, when present, is stored on `FrameBuffer`. The GPU
   geometry backend fuses it into the 192x192 palm and 224x224 hand sampling transforms.
+  It performs inverse affine sampling, border fill, RGB conversion, `[0,1]`
+  normalization, and NHWC packing in one compute dispatch. The legacy CPU geometry
+  backend applies the same contract with OpenCV and is retained as a test reference.
   The renderer preserves storage pixels during upload and applies
   `storageToViewport` on the GPU; upright palm/hand metadata uses the matching
   `uprightToViewport` transform. The
@@ -133,7 +136,7 @@ with a mutex and copies it into caller-owned structures.
   rotation, so it must not receive a hard-coded 180-degree device correction.
 - `bbox` is `[left, top, right, bottom]`.
 - Palm results include the highest-scoring bbox and seven `[x, y]` keypoints. The
-  `palm_count` may be greater than one even though version 4 copies only the best palm.
+  `palm_count` may be greater than one even though version 5 copies only the best palm.
 - Image `x` and `y` values are expressed in the logical upright image defined by the
   frame orientation metadata, then normalized to `[0, 1]` before presentation
   mirroring. `x` increases right and `y` increases down. Storage width/height remain
@@ -144,6 +147,20 @@ with a mutex and copies it into caller-owned structures.
 - `FrameTransforms` is the only display transform authority. It provides
   `storageToUpright`, `uprightToViewport`, their composition, and inverse transforms.
   Letterbox and front-camera mirroring are part of `uprightToViewport`.
+- The native back buffer is split into a camera viewport and a right-side hand plot.
+  `Rendering/hand_3d_plot` owns the wrist-relative orthographic projection of the 21
+  world landmarks. The renderer draws its grid, axes, bones, and joints in the existing
+  Direct2D pass; it does not allocate a second bitmap or upload landmark geometry. The
+  plot converts model +Y-down coordinates to a Y-up 3D basis and applies the same
+  horizontal front-camera mirror as the camera viewport before projection.
+- Right-pane drag and wheel input are reduced to a latest-value `Hand3dView` command.
+  The render thread alone applies view changes and redraws the retained packet; window
+  messages never access Direct2D or Direct3D resources. Double-click restores the
+  camera-aligned front view.
+- A fixed-length cyan palm-normal vector is derived from the palm MCP basis and starts
+  at the average of wrist and four MCP landmarks. It is projected in the same pass as
+  the skeleton to provide a visual orientation-quality check without another buffer or
+  model invocation.
 - Storage orientation is defined once by `geometry::createStorageToUprightTransform`
   and consumed by both perception and rendering. Its matrices use continuous image
   edges. OpenCV sampling converts them to integer pixel-center coordinates through
@@ -168,6 +185,8 @@ with a mutex and copies it into caller-owned structures.
 - hand inference and landmark postprocess time
 - tracking update time
 - overlay render time
+- camera upload, camera draw submission, overlay draw submission, `EndDraw`, and
+  synchronized `Present` wait time
 - end-to-end latency and uncategorized native overhead
 - frame-pool acquisition drops and perception-mailbox overwrite drops
 
@@ -175,14 +194,23 @@ All durations use milliseconds. A zero value means the stage is not implemented 
 has not produced a sample yet. Optimization work must populate the relevant stage
 instead of hiding it in `native_overhead_ms`.
 
-The current native implementation populates all listed CPU stages. Palm stages are
+The current default populates preprocess timings around GPU dispatch plus the
+model-sized staging readback. `frame_copy_ms` is zero when the camera sample remains
+GPU-only. Palm stages are
 zero on frames that successfully use the landmark ROI loopback; they run again after
 tracking confidence falls below the fallback threshold.
 
 Display FPS counts newly presented render packet frame IDs. Window exposure or resize
 redraws that re-present the same packet do not increment the display cadence metric.
-`overlay_render_ms` currently measures the complete render operation: BGRA upload,
-camera draw, overlay draw, `EndDraw`, and synchronized `Present`.
+`camera_upload_ms`, `camera_draw_ms`, `overlay_draw_ms`, `hand_3d_draw_ms`, `end_draw_ms`, and
+`present_wait_ms` are CPU wall-clock measurements around the corresponding Direct2D
+and DXGI calls. They identify caller-visible waits; they are not GPU timestamp-query
+measurements. `overlay_render_ms` measures the complete render operation, including
+those stages and transform/resource bookkeeping.
+
+Set `RYOIKI_NATIVE_METRICS_CSV` to an output path before starting WPF to sample these
+metrics as CSV. The initial ARM64 Release baseline and its limitations are recorded in
+`doc/native-render-performance-baseline.md`.
 
 ## Renderer recovery
 
@@ -210,3 +238,59 @@ The runtime separates initialization failures from frame-local processing failur
   that processed frame, and continues with the next capacity-one mailbox item.
 - Low confidence and an invalid tracking ROI are normal graph outcomes. They clear
   tracking and return to palm detection instead of stopping the worker.
+
+## ONNX Runtime execution providers
+
+Execution-provider selection is owned by the native runtime and injected into the ORT
+model runners. `HandPerceptionGraph` and its ROI loopback do not branch on hardware.
+
+```text
+RYOIKI_EXECUTION_PROVIDER unset or cpu
+  -> float32 palm_detection.onnx + hand_landmark.onnx
+  -> CPUExecutionProvider
+
+RYOIKI_EXECUTION_PROVIDER=qnn-htp
+  -> fixed-shape palm_detection_qdq.onnx + hand_landmark_qdq.onnx
+  -> QNNExecutionProvider with HTP backend
+
+RYOIKI_EXECUTION_PROVIDER=directml
+  -> float32 palm_detection.onnx + hand_landmark.onnx
+  -> DmlExecutionProvider on GPU adapter 0
+```
+
+The HTP configuration uses balanced performance mode, keeps graph I/O quantization on
+QNN, and sets `session.disable_cpu_ep_fallback=1`. This makes unsupported QNN nodes or
+an incompatible model visible during session creation instead of producing a hidden
+mixed CPU/NPU measurement. CPU preprocessing and CPU-owned float graph I/O remain the
+initial baseline; shared-memory tensors and context caching are deferred until the
+first compatible QDQ models run correctly.
+
+`Microsoft.ML.OnnxRuntime.QNN` 1.24.4 is the version-matched source for ORT headers,
+the import library, CPU EP, QNN provider, HTP backend/stubs, and DSP skeleton files.
+
+The DirectML build variant uses `Microsoft.ML.OnnxRuntime.DirectML` 1.24.4 and the
+`OrtDmlApi` provider-registration API. It enforces sequential execution, disables ORT
+memory-pattern optimization as required by DirectML, and disables CPU EP fallback.
+The variants use separate native and WPF output directories because their
+`onnxruntime.dll` files are different distributions with the same module name.
+
+The default DirectML baseline still accepts a CPU `Ort::Value`. The opt-in
+`RYOIKI_DIRECTML_GPU_TENSOR=1` path instead builds capture D3D11 on the same D3D12
+device used by DirectML. It unwraps the Media Foundation camera texture for each
+model preprocess, generates the 192x192 or 224x224 float tensor with a D3D12 compute
+shader, and binds that D3D12 buffer to ONNX Runtime. The camera texture is returned to
+D3D11 with the preprocess fence before inference continues. This avoids both the
+full-frame shared-texture copy and the model-sized CPU staging round trip while keeping
+the MediaPipe-like graph independent of execution placement.
+
+The asynchronous implementation uses separate queues on one D3D12 device. Camera
+capture and D3D11/D2D presentation use the D3D11On12 direct queue. Tensor generation
+and DirectML use a compute queue. A pooled GPU-local display texture receives one
+D3D11 copy per accepted frame, while the original Media Foundation texture is
+unwrapped only by preprocessing. Latest frame and latest perception metadata are
+published independently, so rendering can proceed while DirectML consumes the
+model-sized tensor. Both paths retain latest-value semantics rather than FIFO queues.
+CMake copies the complete architecture-specific native directory beside the native DLL
+and native tests. QNN execution is not considered validated until both QDQ models pass
+session creation, inference smoke, accuracy comparison, and the same stage-timing run
+as the CPU baseline.

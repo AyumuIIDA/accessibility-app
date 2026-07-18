@@ -98,6 +98,17 @@ src/RyoikiTenkai/models/palm_detection.onnx
 src/RyoikiTenkai/models/hand_landmark.onnx
 ```
 
+These float32 models are the default CPU path. The experimental QNN HTP path requires
+separately calibrated, fixed-shape QDQ models with the same graph input/output contract:
+
+```text
+src/RyoikiTenkai/models/palm_detection_qdq.onnx
+src/RyoikiTenkai/models/hand_landmark_qdq.onnx
+```
+
+Do not rename the float models to these names. HTP model compatibility and accuracy
+must be validated after quantization.
+
 Download models with PowerShell:
 
 ```powershell
@@ -217,29 +228,36 @@ The ABI, ownership, coordinate, timestamp, and metrics contracts are documented 
 ABI version before creating a runtime and validates the version and size of every
 polled structure.
 
-The native runtime currently captures a user-facing camera through Media Foundation,
-normalizes signed stride into tightly packed top-down BGRA32, retains camera rotation
-as frame metadata, and sends pooled native-owned frames through a capacity-one
-perception path. Perception completion
-publishes one synchronized render
-packet containing the source frame and its palm/hand metadata. The child HWND composes
-that packet on a dedicated render thread using a D3D11 device, DXGI flip-model swap
-chain, and Direct2D device context. CPU BGRA pixels are uploaded once per accepted
-frame; orientation, front-camera mirroring, letterbox fitting, and overlays are drawn
-into the same back buffer before one synchronized present. No GDI or OpenCV display
+The native runtime captures a user-facing camera through Media Foundation using an
+`IMFDXGIDeviceManager` and retains ARGB32 samples as native-owned D3D11 textures.
+Camera rotation remains frame metadata, and latest-value packets pass through a
+capacity-one perception path without a full-resolution CPU readback. In the DirectML
+GPU path, capture publishes the latest display frame independently from perception
+metadata, so inference does not block preview updates. The child HWND composes the
+latest frame and metadata on a dedicated render thread using a D3D11 device, DXGI flip-model swap
+chain, and Direct2D device context. The retained camera texture is drawn without a
+CPU upload; orientation, front-camera mirroring, letterbox fitting, and overlays are drawn
+into the same back buffer before one synchronized present. The renderer reserves the
+right side for a lightweight 3D hand plot: the existing 21 world landmarks are projected
+from a wrist-relative orthographic view and drawn with Direct2D lines and points. This
+does not create another image, texture upload, offscreen target, or render loop. No GDI or OpenCV display
 path writes to the child HWND. The
-perception worker uses OpenCV to letterbox the palm input and pack an RGB NHWC float
-tensor. Camera orientation is fused into palm and hand tensor sampling, so capture
-does not create a rotated full-resolution intermediate. CPU model runners execute
-both ONNX models through ONNX Runtime. The
+perception worker uses a fused D3D11 compute shader to sample orientation-corrected
+192x192 palm and 224x224 hand ROI tensors, convert to RGB, normalize, and pack NHWC.
+The current CPU/QNN model runners receive only these model-sized tensors through a
+staging readback; OpenCV remains the fixed-input numerical reference. CPU or QNN HTP
+model runners execute both ONNX models through ONNX Runtime. The
 MediaPipe-like graph decodes palm anchors, creates a rotated hand ROI, projects 21
 landmarks back to source coordinates, and reuses a landmark-derived ROI while tracking
 confidence remains above threshold. Palm bbox/keypoints and hand landmarks are exposed
 through ABI polling and rendered by the native HWND overlay. Direct2D/Direct3D
-rendering is the sole native display path; DirectML and QNN remain future phases.
-Camera frame memory placement options and the criteria for moving capture from CPU
-buffers to DXGI surfaces are documented in
+rendering is the sole native display path. DirectML GPU tensor binding is available
+behind `RYOIKI_DIRECTML_GPU_TENSOR=1`; QNN HTP remains an independently selectable
+runner with quantized QDQ models. Camera and tensor memory
+placement are documented in
 [`doc/native-frame-memory-roadmap.md`](doc/native-frame-memory-roadmap.md).
+Measured hardware behavior and the current architecture decision are summarized in
+[`doc/hardware-runtime-findings.md`](doc/hardware-runtime-findings.md).
 
 ### Install Visual Studio 2026 Components
 
@@ -257,7 +275,8 @@ vcpkg package manager
 The verified environment uses Visual Studio 2026 (version 18), the MSVC 14.5x
 toolset, CMake, Ninja, and the vcpkg installation bundled with Visual Studio. The
 repository's `vcpkg.json` pins the OpenCV dependency baseline. NuGet restore supplies
-the ONNX Runtime 1.27.0 native headers, import library, and DLL.
+the version-matched ONNX Runtime QNN 1.24.4 headers, import library, CPU runtime, and
+ARM64 QNN provider files.
 
 Also install the .NET 10 SDK, then verify the command-line tools:
 
@@ -354,9 +373,68 @@ build/RyoikiTenkai.Native.OpenCv/RyoikiTenkai.VisionCore.Tests.exe
 build/RyoikiTenkai.Native.OpenCv/RyoikiTenkai.HandPerception.Tests.exe
 ```
 
+The default native build uses the QNN ONNX Runtime distribution. Build the DirectML
+variant in a separate directory so the two different `onnxruntime.dll` files can
+never overwrite each other:
+
+```powershell
+dotnet restore src/RyoikiTenkai.Wpf/RyoikiTenkai.Wpf.csproj `
+  -p:Platform=ARM64 -p:NativeInferenceBackend=directml
+cmake -S src/RyoikiTenkai.Native -B build/RyoikiTenkai.Native.DirectMl.Arm64 -G Ninja `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
+  -DVCPKG_TARGET_TRIPLET=arm64-windows-static-md `
+  -DRYOIKI_ORT_BACKEND=directml
+cmake --build build/RyoikiTenkai.Native.DirectMl.Arm64
+ctest --test-dir build/RyoikiTenkai.Native.DirectMl.Arm64 --output-on-failure
+dotnet build src/RyoikiTenkai.Wpf/RyoikiTenkai.Wpf.csproj --no-restore `
+  -p:Platform=ARM64 `
+  -p:NativeInferenceBackend=directml `
+  -p:NativeRuntimeBuildDir="$PWD\build\RyoikiTenkai.Native.DirectMl.Arm64" `
+  -p:BaseOutputPath="$PWD\build\wpf-directml\"
+$env:RYOIKI_EXECUTION_PROVIDER = "directml"
+& build/wpf-directml/ARM64/Debug/net10.0-windows10.0.26100.0/RyoikiTenkai.Wpf.exe
+```
+
+To exercise the experimental GPU-resident camera-to-tensor path, set this before
+starting the DirectML build:
+
+```powershell
+$env:RYOIKI_EXECUTION_PROVIDER = "directml"
+$env:RYOIKI_DIRECTML_GPU_TENSOR = "1"
+& build/wpf-directml/ARM64/Debug/net10.0-windows10.0.26100.0/RyoikiTenkai.Wpf.exe
+```
+
+This selects D3D11On12 camera capture, D3D12 palm/hand tensor generation, and DirectML
+GPU tensor binding. It remains opt-in while accuracy, stability, latency, and power are
+compared with the CPU-staging baseline. Do not set it with the QNN build.
+
+Do not copy QNN and DirectML runtime assets into the same output directory. CPU EP is
+available in both variants; QNN HTP is available only in the QNN variant and DirectML
+only in the DirectML variant.
+
 CMake resolves ONNX Runtime headers and the architecture-specific import library from
 the restored NuGet cache. Override `ONNXRUNTIME_ROOT` only when using a nonstandard
-package location; it must point to the `microsoft.ml.onnxruntime/1.27.0` package root.
+package location; it must point to the
+`microsoft.ml.onnxruntime.qnn/1.24.4` package root. The QNN package supplies both the
+CPU EP and the ARM64 QNN provider/backend binaries, so the native build uses one
+version-matched ORT distribution for both paths.
+
+The CPU EP remains the default. Select QNN HTP before starting the WPF process only
+after the QDQ models above are present:
+
+```powershell
+$env:RYOIKI_EXECUTION_PROVIDER = "qnn-htp"
+dotnet run --project src/RyoikiTenkai.Wpf/RyoikiTenkai.Wpf.csproj -r win-arm64
+```
+
+Use `cpu` or unset the variable to select the baseline. An unknown value, missing QDQ
+model, QNN session creation failure, or unsupported node is reported as a startup
+error. QNN does not silently fall back to the CPU EP.
+
+See [QNN hand model quantization](doc/qnn-hand-model-quantization.md) before generating
+or accepting QDQ models. It documents the original model types, native calibration
+capture, the x64 quantization tool, and the required accuracy/runtime gates.
 
 The next WPF build automatically copies an existing native DLL into `$(OutDir)`:
 
@@ -386,7 +464,34 @@ if ($nativeBuild -and $nativeBuild.Path.StartsWith((Resolve-Path .).Path)) {
 }
 ```
 
-Run WPF and enable the `Native runtime` checkbox before pressing Start.
+### Run The Native Viewer
+
+After the native DLL has been built, copy it and the ONNX Runtime dependencies to the
+ARM64 WPF output, then launch that exact executable from the repository root:
+
+```powershell
+dotnet build src/RyoikiTenkai.Wpf/RyoikiTenkai.Wpf.csproj `
+  -p:Platform=arm64 --no-restore
+
+& (Resolve-Path `
+  "src/RyoikiTenkai.Wpf/bin/arm64/Debug/net10.0-windows10.0.26100.0/RyoikiTenkai.Wpf.exe")
+```
+
+In the application, enable the `Native runtime` checkbox and press `Start`. The native
+viewer displays the mirrored camera and 2D landmarks on the left and the wrist-relative
+3D world-landmark plot on the right. Close the application normally or press `Stop`
+before rebuilding the native DLL.
+
+The 3D plot accepts direct mouse navigation:
+
+- Drag inside the right pane to rotate yaw and pitch.
+- Use the mouse wheel inside the right pane to zoom.
+- Double-click the right pane to restore the camera-aligned front view.
+
+The cyan vector starts at the five-point palm center and follows the palm normal. It is
+computed from wrist, index-MCP, middle-MCP, and pinky-MCP world landmarks and uses the
+same projection as the hand skeleton, so hand rotation and mouse view rotation affect
+both consistently.
 
 If the DLL is not present, WPF logs that the native runtime is unavailable and falls back to the managed C# camera pipeline.
 
@@ -471,9 +576,12 @@ Open a new PowerShell session after setting persistent environment variables.
 ## Current Runtime Notes
 
 - Inference uses `Microsoft.ML.OnnxRuntime`.
-- The current execution provider is CPU.
-- NPU/QNN execution is not wired yet.
+- CPU is the compatibility baseline.
+- DirectML GPU inference is available in the DirectML build variant.
+- QNN HTP/NPU inference is available in the QNN build variant with compatible QDQ models.
+- Execution-provider fallback is disabled for hardware measurements so failures remain visible.
 - The WPF camera path uses Windows `MediaFrameReader`.
+- The native camera path uses Media Foundation and retained D3D11 textures.
 - Display frames and model frames are separated:
   - display: high-resolution camera frame
   - model: resized frame for MediaPipe-style ONNX pipeline
