@@ -80,10 +80,11 @@ replacing the tracked ROI or changing the normal MediaPipe-like loop. Leave the 
 unset during normal execution.
 
 Collect varied lighting, backgrounds, skin tones, left/right hands, distance, rotation,
-partial visibility, motion blur, and no-hand frames. Palm tensors are produced only
-when the graph invokes palm fallback, so deliberately make the hand enter and leave the
-frame and break/recover tracking. A long sequence of one stable tracked hand is not a
-representative palm calibration set.
+partial visibility, motion blur, and no-hand frames. Without the explicit interval,
+palm tensors are produced only when the graph invokes palm fallback, so deliberately
+make the hand enter and leave the frame and break/recover tracking. Even with the
+interval enabled, a long sequence of one stable tracked hand is not a representative
+palm calibration set.
 
 Captured tensors retain low-resolution visual information. Keep them below ignored
 `tmp/qnn-calibration/`, obtain consent where necessary, and do not commit or distribute
@@ -231,6 +232,52 @@ The HTP trial reported 20 perception drops before its first sampled result. Thos
 occurred while the perception worker created the QNN sessions concurrently with camera
 startup; the count stayed constant during steady-state processing. Treat session warmup
 and startup ordering as a separate runtime issue from per-frame NPU latency.
+
+## Validated per-channel W8A16 result (2026-07-18)
+
+Per-channel U8 convolution weights with per-tensor U16 activations removed most of the
+uniform per-tensor candidate's hand-landmark error. QNN compatibility keeps MatMul/Gemm
+weights per-tensor and retains float32 graph I/O. The final `enriched_v2` experiment
+combined complete native CPU capture sessions into 3,950 hand tensors and 566 palm
+tensors. One all-zero palm tensor from an earlier fallback capture was excluded.
+
+The dedicated periodic-palm session used an interval of five processed perception
+frames and produced 1,000 hand tensors and 410 palm tensors. Palm exact-duplicate rate
+was 0.73%, median adjacent-frame input MAE was 0.0112, and no tensor was malformed or
+all-zero. The periodic detector output was discarded; it did not replace the landmark
+tracking ROI. The interval is ignored unless `RYOIKI_CALIBRATION_DIR` is also set.
+
+The original session-isolated holdout remained unchanged: 1,000 hand inputs and seven
+palm inputs. Results compare QDQ output with the float32 model, not human-annotated
+ground truth.
+
+| Metric | Enriched v1 | Enriched v2 |
+| --- | ---: | ---: |
+| Hand presence decision flip rate | 0.00% | 0.00% |
+| Hand handedness decision flip rate | 0.00% | 0.00% |
+| Hand landmark XY MAE | 0.55277 px | 0.55272 px |
+| Hand landmark XY p95 | 1.32049 px | 1.31936 px |
+| Palm detection decision flip rate | 0.00% | 0.00% |
+| Palm top-score MAE | 0.01502 | 0.01435 |
+| Palm selected-anchor regression MAE | 0.4952 | 0.4810 |
+
+The seven-input palm holdout is too small for a promotion-quality recall or top-anchor
+conclusion. A separate periodic-palm capture session must be reserved entirely for
+holdout before making that claim.
+
+Both v2 models created QNN HTP sessions and ran as W8A16 without CPU fallback in the
+WinML performance path:
+
+| Model | Mean | p50 | p95 |
+| --- | ---: | ---: | ---: |
+| Hand landmark | 1.746 ms | 1.613 ms | 2.518 ms |
+| Palm detection | 2.975 ms | 2.515 ms | 6.251 ms |
+
+ORT still warns that 16 hand-model biases exceed the int32 quantized range because the
+bias scale is too small. The model passes current fidelity and NPU execution checks,
+but this warning remains a tracked limitation for future mixed-precision or scale
+experiments. Generated tensors, models, and JSON reports remain below ignored `tmp/`;
+the reproducible code and commands are the committed artifacts.
 
 ## Primary references
 
