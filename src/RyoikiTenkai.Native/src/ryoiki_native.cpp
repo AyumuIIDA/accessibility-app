@@ -427,6 +427,11 @@ std::filesystem::path getModelPath(const wchar_t* fileName)
 
 std::uint64_t getCalibrationPalmIntervalFrames()
 {
+    if (GetEnvironmentVariableW(L"RYOIKI_CALIBRATION_DIR", nullptr, 0) <= 1)
+    {
+        return 0;
+    }
+
     std::array<wchar_t, 32> value{};
     const DWORD length = GetEnvironmentVariableW(
         L"RYOIKI_CALIBRATION_PALM_INTERVAL",
