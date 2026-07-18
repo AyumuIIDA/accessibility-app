@@ -7,9 +7,14 @@
 #include "HandPerception/MediaPipeGraph/palm_detection_graph.h"
 #include "HandPerception/MediaPipeGraph/palm_detection_postprocessor.h"
 #include "HandPerception/MediaPipeGraph/palm_detection_to_roi.h"
-#include "HandPerception/ModelRunners/cpu_hand_landmark_runner.h"
-#include "HandPerception/ModelRunners/cpu_palm_detection_runner.h"
+#include "HandPerception/ModelRunners/ort_hand_landmark_runner.h"
+#include "HandPerception/ModelRunners/ort_palm_detection_runner.h"
 #include "HandPerception/ModelRunners/hand_landmark_model_contract.h"
+#if defined(RYOIKI_ORT_DIRECTML)
+#include "Geometry/d3d12_hand_geometry_processor.h"
+#include "Runtime/d3d11_device.h"
+#include "Runtime/directml_runtime.h"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -536,6 +541,38 @@ void testHandPerceptionTrackingAndPalmFallback()
         "Palm fallback invoked an incorrect model runner sequence.");
 }
 
+void testCalibrationPalmProbeKeepsTrackedRoi()
+{
+    auto palmRunner = std::make_unique<FakePalmDetectionRunner>(true);
+    auto* palmObserver = palmRunner.get();
+    auto handRunner = std::make_unique<FakeHandLandmarkRunner>();
+    auto* handObserver = handRunner.get();
+    handObserver->rawOutput = createTrackedHandOutput(0.8F);
+
+    ryoiki::hand_perception::HandPerceptionGraph graph{
+        std::move(palmRunner),
+        std::move(handRunner),
+        {.calibrationPalmIntervalFrames = 2}};
+    const auto frame = createFrame();
+    ryoiki::hand_perception::HandPerceptionResult result;
+    ryoiki::hand_perception::HandPerceptionGraphMetrics metrics{};
+    std::string error;
+
+    require(graph.process(frame, result, metrics, error),
+        "Calibration palm probe test could not establish tracking.");
+    require(palmObserver->runCallCount == 1 && handObserver->runCallCount == 1,
+        "Initial calibration probe test frame invoked an incorrect model sequence.");
+
+    require(graph.process(frame, result, metrics, error),
+        "Periodic calibration palm probe failed.");
+    require(result.usedTracking && result.hand.detected && result.palms.size() == 0,
+        "Calibration palm probe replaced or exposed the tracked ROI result.");
+    require(palmObserver->runCallCount == 2 && handObserver->runCallCount == 2,
+        "Periodic calibration palm probe did not invoke both model runners.");
+    require(metrics.palm.inferenceMs == 12.5,
+        "Calibration palm probe timing was not exposed in graph metrics.");
+}
+
 void testHandPerceptionContinuesAfterSingleFrameRunnerFailures()
 {
     const auto frame = createFrame();
@@ -632,18 +669,140 @@ void testHandLandmarkModelContractUsesSemanticNamesAndShapes()
     require(!error.empty(), "Wrong hand input shape did not produce a contract error.");
 }
 
-void testCpuRunnerSmoke()
+void testOrtProviderDistribution()
+{
+    const auto providers = Ort::GetAvailableProviders();
+    require(std::find(providers.begin(), providers.end(), "CPUExecutionProvider")
+            != providers.end(),
+        "ONNX Runtime distribution did not expose CPUExecutionProvider.");
+#if defined(RYOIKI_ORT_QNN)
+    require(std::find(providers.begin(), providers.end(), "QNNExecutionProvider") != providers.end(),
+        "ONNX Runtime distribution did not expose QNNExecutionProvider.");
+    const auto qnnConfiguration =
+        ryoiki::hand_perception::OrtSessionConfiguration::qnnHtp();
+    require(qnnConfiguration.executionProvider()
+            == ryoiki::hand_perception::ExecutionProvider::QnnHtp,
+        "QNN HTP configuration reported the wrong execution provider.");
+    require(qnnConfiguration.providerName() == "QNNExecutionProvider(HTP)",
+        "QNN HTP configuration reported the wrong provider name.");
+
+    Ort::SessionOptions options;
+    qnnConfiguration.apply(options);
+#elif defined(RYOIKI_ORT_DIRECTML)
+    require(std::find(providers.begin(), providers.end(), "DmlExecutionProvider") != providers.end(),
+        "ONNX Runtime distribution did not expose DmlExecutionProvider.");
+    const auto directMlConfiguration =
+        ryoiki::hand_perception::OrtSessionConfiguration::directMl();
+    require(directMlConfiguration.executionProvider()
+            == ryoiki::hand_perception::ExecutionProvider::DirectMl,
+        "DirectML configuration reported the wrong execution provider.");
+    Ort::SessionOptions options;
+    directMlConfiguration.apply(options);
+#endif
+}
+
+void testDirectMlOrtRunnerSmoke()
+{
+#if defined(RYOIKI_ORT_DIRECTML) && defined(RYOIKI_PALM_MODEL_PATH) && defined(RYOIKI_HAND_MODEL_PATH)
+    const auto configuration = ryoiki::hand_perception::OrtSessionConfiguration::directMl();
+    std::string error;
+    auto palmRunner = ryoiki::hand_perception::OrtPalmDetectionRunner::create(
+        std::filesystem::path{RYOIKI_PALM_MODEL_PATH}, configuration, error);
+    require(palmRunner != nullptr, error.c_str());
+    ryoiki::buffers::FloatTensorBuffer palmInput{{1, 192, 192, 3}};
+    PalmDetectionRawOutput palmOutput;
+    ryoiki::hand_perception::ModelRunResult palmResult{};
+    require(palmRunner->run(palmInput, palmOutput, palmResult, error), error.c_str());
+
+    auto handRunner = ryoiki::hand_perception::OrtHandLandmarkRunner::create(
+        std::filesystem::path{RYOIKI_HAND_MODEL_PATH},
+        ryoiki::hand_perception::HandLandmarkModelContract::openCvZoo2023(),
+        configuration,
+        error);
+    require(handRunner != nullptr, error.c_str());
+    ryoiki::buffers::FloatTensorBuffer handInput{{1, 224, 224, 3}};
+    ryoiki::hand_perception::HandLandmarkRawOutput handOutput{};
+    ryoiki::hand_perception::ModelRunResult handResult{};
+    require(handRunner->run(handInput, handOutput, handResult, error), error.c_str());
+    require(palmResult.inferenceMs >= 0.0 && handResult.inferenceMs >= 0.0,
+        "DirectML runner reported a negative inference duration.");
+#endif
+}
+
+void testDirectMlCustomDeviceRunnerSmoke()
+{
+#if defined(RYOIKI_ORT_DIRECTML) && defined(RYOIKI_PALM_MODEL_PATH)
+    std::string error;
+    const auto d3d11 = ryoiki::runtime::D3d11Device::create(error);
+    require(d3d11 != nullptr, error.c_str());
+    const auto runtime = ryoiki::runtime::DirectMlRuntime::create(d3d11, error);
+    require(runtime != nullptr, error.c_str());
+    const auto configuration =
+        ryoiki::hand_perception::OrtSessionConfiguration::directMl(runtime);
+    auto runner = ryoiki::hand_perception::OrtPalmDetectionRunner::create(
+        std::filesystem::path{RYOIKI_PALM_MODEL_PATH}, configuration, error);
+    require(runner != nullptr, error.c_str());
+    ryoiki::buffers::FloatTensorBuffer input{{1, 192, 192, 3}};
+    PalmDetectionRawOutput output;
+    ryoiki::hand_perception::ModelRunResult result{};
+    require(runner->run(input, output, result, error), error.c_str());
+#endif
+}
+
+void testDirectMlD3d12PreprocessRunnerSmoke()
+{
+#if defined(RYOIKI_ORT_DIRECTML) && defined(RYOIKI_PALM_MODEL_PATH)
+    std::string error;
+    const auto d3d11 = ryoiki::runtime::D3d11Device::createOn12(error);
+    require(d3d11 != nullptr, error.c_str());
+    const auto runtime = ryoiki::runtime::DirectMlRuntime::create(d3d11, error);
+    require(runtime != nullptr, error.c_str());
+    D3D11_TEXTURE2D_DESC description{};
+    description.Width=320; description.Height=240; description.MipLevels=1;
+    description.ArraySize=1; description.Format=DXGI_FORMAT_B8G8R8A8_UNORM;
+    description.SampleDesc.Count=1; description.Usage=D3D11_USAGE_DEFAULT;
+    description.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+    require(SUCCEEDED(d3d11->device()->CreateTexture2D(&description,nullptr,&texture)),
+        "Failed to create D3D12 preprocess input.");
+    ryoiki::buffers::FrameBuffer frame;
+    require(frame.prepareGpu(320,240,1,0,texture,0,{},
+        ryoiki::runtime::FrameRotation::None),"Failed to prepare GPU frame.");
+    auto geometry=ryoiki::geometry::D3d12HandGeometryProcessor::create(runtime,error);
+    require(geometry!=nullptr,error.c_str());
+    ryoiki::buffers::FloatTensorBuffer input{{1,192,192,3}};
+    ryoiki::geometry::PalmPreprocessResult preprocess{};
+    auto runner=ryoiki::hand_perception::OrtPalmDetectionRunner::create(
+        std::filesystem::path{RYOIKI_PALM_MODEL_PATH},
+        ryoiki::hand_perception::OrtSessionConfiguration::directMl(runtime),error);
+    require(runner!=nullptr,error.c_str());
+    for (std::uint64_t iteration = 1; iteration <= 30; ++iteration)
+    {
+        require(frame.prepareGpu(320,240,iteration,0,texture,0,{},
+            ryoiki::runtime::FrameRotation::None),"Failed to update GPU frame.");
+        require(geometry->preprocessPalm(frame,input,preprocess),
+            "D3D12 palm preprocess failed.");
+        require(input.gpuResource()!=nullptr,"D3D12 preprocess produced no GPU tensor.");
+        PalmDetectionRawOutput output;
+        ryoiki::hand_perception::ModelRunResult result{};
+        require(runner->run(input,output,result,error),error.c_str());
+    }
+#endif
+}
+
+
+void testCpuOrtPalmRunnerSmoke()
 {
 #ifdef RYOIKI_PALM_MODEL_PATH
     const std::filesystem::path modelPath{RYOIKI_PALM_MODEL_PATH};
     if (!std::filesystem::is_regular_file(modelPath))
     {
-        std::cout << "CpuPalmDetectionRunner smoke skipped: model not found.\n";
+        std::cout << "CPU ORT palm runner smoke skipped: model not found.\n";
         return;
     }
 
     std::string error;
-    auto runner = ryoiki::hand_perception::CpuPalmDetectionRunner::create(modelPath, error);
+    auto runner = ryoiki::hand_perception::OrtPalmDetectionRunner::create(modelPath, error);
     require(runner != nullptr, error.c_str());
     require(runner->executionProvider() == ryoiki::hand_perception::ExecutionProvider::Cpu,
         "CPU runner reported the wrong execution provider.");
@@ -662,18 +821,18 @@ void testCpuRunnerSmoke()
 #endif
 }
 
-void testCpuHandLandmarkRunnerSmoke()
+void testCpuOrtHandLandmarkRunnerSmoke()
 {
 #ifdef RYOIKI_HAND_MODEL_PATH
     const std::filesystem::path modelPath{RYOIKI_HAND_MODEL_PATH};
     if (!std::filesystem::is_regular_file(modelPath))
     {
-        std::cout << "CpuHandLandmarkRunner smoke skipped: model not found.\n";
+        std::cout << "CPU ORT hand runner smoke skipped: model not found.\n";
         return;
     }
 
     std::string error;
-    auto runner = ryoiki::hand_perception::CpuHandLandmarkRunner::create(modelPath, error);
+    auto runner = ryoiki::hand_perception::OrtHandLandmarkRunner::create(modelPath, error);
     require(runner != nullptr, error.c_str());
     require(runner->executionProvider() == ryoiki::hand_perception::ExecutionProvider::Cpu,
         "CPU hand runner reported the wrong execution provider.");
@@ -724,10 +883,15 @@ int main()
         testPalmDetectionGraphSuccess();
         testPalmDetectionGraphFailure();
         testHandPerceptionTrackingAndPalmFallback();
+        testCalibrationPalmProbeKeepsTrackedRoi();
         testHandPerceptionContinuesAfterSingleFrameRunnerFailures();
         testHandLandmarkModelContractUsesSemanticNamesAndShapes();
-        testCpuRunnerSmoke();
-        testCpuHandLandmarkRunnerSmoke();
+        testOrtProviderDistribution();
+        testDirectMlOrtRunnerSmoke();
+        testDirectMlCustomDeviceRunnerSmoke();
+        testDirectMlD3d12PreprocessRunnerSmoke();
+        testCpuOrtPalmRunnerSmoke();
+        testCpuOrtHandLandmarkRunnerSmoke();
         std::cout << "HandPerception tests passed.\n";
         return 0;
     }

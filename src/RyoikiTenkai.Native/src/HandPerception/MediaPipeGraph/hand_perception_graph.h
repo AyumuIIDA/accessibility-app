@@ -7,6 +7,7 @@
 #include "HandPerception/MediaPipeGraph/palm_detection_to_roi.h"
 
 #include <memory>
+#include <cstdint>
 #include <string>
 
 namespace ryoiki::hand_perception
@@ -26,17 +27,24 @@ struct HandPerceptionGraphMetrics
     double trackingUpdateMs{0.0};
 };
 
+struct HandPerceptionGraphOptions
+{
+    std::uint64_t calibrationPalmIntervalFrames{0};
+};
+
 class HandPerceptionGraph final
 {
 public:
     HandPerceptionGraph(
         std::unique_ptr<IPalmDetectionRunner> palmRunner,
-        std::unique_ptr<IHandLandmarkRunner> handRunner);
+        std::unique_ptr<IHandLandmarkRunner> handRunner,
+        HandPerceptionGraphOptions options = {});
     HandPerceptionGraph(
         std::unique_ptr<IPalmDetectionRunner> palmRunner,
         std::unique_ptr<IHandLandmarkRunner> handRunner,
         std::unique_ptr<geometry::IGeometryProcessor> palmGeometryProcessor,
-        std::unique_ptr<geometry::IGeometryProcessor> handGeometryProcessor);
+        std::unique_ptr<geometry::IGeometryProcessor> handGeometryProcessor,
+        HandPerceptionGraphOptions options = {});
 
     bool process(
         const buffers::FrameBuffer& frame,
@@ -52,6 +60,8 @@ private:
     PalmDetectionToRoiCalculator detectionToRoi_;
     HandLandmarksToRoiCalculator landmarksToRoi_;
     geometry::RotatedRegion trackedRegion_{};
+    HandPerceptionGraphOptions options_{};
+    std::uint64_t processedFrameCount_{0};
     bool hasTrackedRegion_{false};
 };
 }

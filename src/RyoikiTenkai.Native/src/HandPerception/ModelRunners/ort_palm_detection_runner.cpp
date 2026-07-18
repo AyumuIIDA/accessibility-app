@@ -1,6 +1,11 @@
-#include "HandPerception/ModelRunners/cpu_palm_detection_runner.h"
+#include "HandPerception/ModelRunners/ort_palm_detection_runner.h"
+#include "HandPerception/ModelRunners/calibration_tensor_capture.h"
 
 #include <onnxruntime_cxx_api.h>
+#if defined(RYOIKI_ORT_DIRECTML)
+#include <dml_provider_factory.h>
+#include "Runtime/directml_runtime.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -25,10 +30,15 @@ bool hasShape(const std::vector<std::int64_t>& actual, const std::span<const std
 }
 }
 
-struct CpuPalmDetectionRunner::Impl
+struct OrtPalmDetectionRunner::Impl
 {
-    explicit Impl(const std::filesystem::path& modelPath)
-        : environment{ORT_LOGGING_LEVEL_WARNING, "RyoikiTenkai"}
+    Impl(
+        const std::filesystem::path& modelPath,
+        const OrtSessionConfiguration& configuration)
+        : environment{ORT_LOGGING_LEVEL_WARNING, "RyoikiTenkai"},
+          executionProvider{configuration.executionProvider()},
+          providerName{configuration.providerName()},
+          directMlRuntime{configuration.directMlRuntime()}
     {
         if (!std::filesystem::is_regular_file(modelPath))
         {
@@ -37,6 +47,7 @@ struct CpuPalmDetectionRunner::Impl
 
         sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
         sessionOptions.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+        configuration.apply(sessionOptions);
         session = std::make_unique<Ort::Session>(
             environment,
             modelPath.c_str(),
@@ -92,17 +103,29 @@ struct CpuPalmDetectionRunner::Impl
     std::string scoreOutputNameStorage;
     std::size_t regressionOutputIndex{kMissingIndex};
     std::size_t scoreOutputIndex{kMissingIndex};
+    ExecutionProvider executionProvider{ExecutionProvider::Cpu};
+    std::string providerName;
+    CalibrationTensorCapture calibrationCapture{"palm", kInputShape};
+    std::shared_ptr<runtime::DirectMlRuntime> directMlRuntime;
 };
 
-std::unique_ptr<CpuPalmDetectionRunner> CpuPalmDetectionRunner::create(
+std::unique_ptr<OrtPalmDetectionRunner> OrtPalmDetectionRunner::create(
     const std::filesystem::path& modelPath,
+    std::string& error)
+{
+    return create(modelPath, OrtSessionConfiguration::cpu(), error);
+}
+
+std::unique_ptr<OrtPalmDetectionRunner> OrtPalmDetectionRunner::create(
+    const std::filesystem::path& modelPath,
+    const OrtSessionConfiguration& configuration,
     std::string& error)
 {
     try
     {
         error.clear();
-        return std::unique_ptr<CpuPalmDetectionRunner>{
-            new CpuPalmDetectionRunner{std::make_unique<Impl>(modelPath)}};
+        return std::unique_ptr<OrtPalmDetectionRunner>{
+            new OrtPalmDetectionRunner{std::make_unique<Impl>(modelPath, configuration)}};
     }
     catch (const Ort::Exception& exception)
     {
@@ -116,24 +139,24 @@ std::unique_ptr<CpuPalmDetectionRunner> CpuPalmDetectionRunner::create(
     }
 }
 
-CpuPalmDetectionRunner::CpuPalmDetectionRunner(std::unique_ptr<Impl> impl)
+OrtPalmDetectionRunner::OrtPalmDetectionRunner(std::unique_ptr<Impl> impl)
     : impl_{std::move(impl)}
 {
 }
 
-CpuPalmDetectionRunner::~CpuPalmDetectionRunner() = default;
+OrtPalmDetectionRunner::~OrtPalmDetectionRunner() = default;
 
-ExecutionProvider CpuPalmDetectionRunner::executionProvider() const noexcept
+ExecutionProvider OrtPalmDetectionRunner::executionProvider() const noexcept
 {
-    return ExecutionProvider::Cpu;
+    return impl_->executionProvider;
 }
 
-std::string_view CpuPalmDetectionRunner::providerName() const noexcept
+std::string_view OrtPalmDetectionRunner::providerName() const noexcept
 {
-    return "CPUExecutionProvider";
+    return impl_->providerName;
 }
 
-bool CpuPalmDetectionRunner::run(
+bool OrtPalmDetectionRunner::run(
     const buffers::FloatTensorBuffer& input,
     PalmDetectionRawOutput& output,
     ModelRunResult& result,
@@ -148,14 +171,32 @@ bool CpuPalmDetectionRunner::run(
 
     try
     {
+        if (input.gpuResource() == nullptr) impl_->calibrationCapture.capture(input);
         const auto started = clock::now();
         auto memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-        auto inputValue = Ort::Value::CreateTensor<float>(
-            memoryInfo,
-            const_cast<float*>(input.data()),
-            input.elementCount(),
-            kInputShape.data(),
-            kInputShape.size());
+        void* dmlAllocation = nullptr;
+        Ort::Value inputValue{nullptr};
+        if (input.gpuResource() != nullptr && impl_->directMlRuntime != nullptr)
+        {
+#if defined(RYOIKI_ORT_DIRECTML)
+            impl_->directMlRuntime->waitForPreprocess(input.readyFenceValue());
+            const OrtDmlApi* dmlApi = nullptr;
+            Ort::ThrowOnError(Ort::GetApi().GetExecutionProviderApi(
+                "DML", ORT_API_VERSION, reinterpret_cast<const void**>(&dmlApi)));
+            Ort::ThrowOnError(dmlApi->CreateGPUAllocationFromD3DResource(
+                input.gpuResource(), &dmlAllocation));
+            Ort::MemoryInfo dmlMemory{"DML", OrtDeviceAllocator, 0, OrtMemTypeDefault};
+            inputValue = Ort::Value::CreateTensor(
+                dmlMemory, dmlAllocation, input.elementCount() * sizeof(float),
+                kInputShape.data(), kInputShape.size(), ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
+#endif
+        }
+        else
+        {
+            inputValue = Ort::Value::CreateTensor<float>(
+                memoryInfo, const_cast<float*>(input.data()), input.elementCount(),
+                kInputShape.data(), kInputShape.size());
+        }
         auto regressions = output.regressions();
         auto scores = output.scores();
         std::array<Ort::Value, 2> outputValues{
@@ -183,6 +224,15 @@ bool CpuPalmDetectionRunner::run(
             outputNames,
             outputValues.data(),
             outputValues.size());
+#if defined(RYOIKI_ORT_DIRECTML)
+        if (dmlAllocation != nullptr)
+        {
+            const OrtDmlApi* dmlApi = nullptr;
+            Ort::ThrowOnError(Ort::GetApi().GetExecutionProviderApi(
+                "DML", ORT_API_VERSION, reinterpret_cast<const void**>(&dmlApi)));
+            dmlApi->FreeGPUAllocation(dmlAllocation);
+        }
+#endif
         result.inferenceMs = std::chrono::duration<double, std::milli>(
             clock::now() - started).count();
         error.clear();

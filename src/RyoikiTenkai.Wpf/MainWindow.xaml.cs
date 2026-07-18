@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
@@ -31,6 +32,7 @@ public partial class MainWindow : Window
     private readonly ActionExecutor _executor = new();
     private readonly string _modelDirectory;
     private readonly string _logPath;
+    private readonly string? _nativeMetricsPath;
 
     private CancellationTokenSource? _cameraLoopCts;
     private RealtimeCameraFrameSource? _camera;
@@ -43,6 +45,7 @@ public partial class MainWindow : Window
     private bool _isInferenceRunning;
     private readonly DispatcherTimer _nativePollTimer;
     private string? _lastNativeRuntimeError;
+    private ulong _lastSampledNativeFrameId;
 
     public MainWindow()
     {
@@ -51,6 +54,10 @@ public partial class MainWindow : Window
         _store = new BindingStore(System.IO.Path.Combine(AppContext.BaseDirectory, "bindings.json"));
         _modelDirectory = System.IO.Path.Combine(AppContext.BaseDirectory, "models");
         _logPath = System.IO.Path.Combine(AppContext.BaseDirectory, "ryoikitenkai.log");
+        var nativeMetricsPath = Environment.GetEnvironmentVariable("RYOIKI_NATIVE_METRICS_CSV");
+        _nativeMetricsPath = string.IsNullOrWhiteSpace(nativeMetricsPath)
+            ? null
+            : System.IO.Path.GetFullPath(nativeMetricsPath);
         NativeVisionHostControl.DiagnosticLogged += Log;
         _nativePollTimer = new DispatcherTimer
         {
@@ -144,6 +151,8 @@ public partial class MainWindow : Window
         StateText.Text = "Running native runtime";
         OverlayStatusText.Text = "Native runtime";
         _lastNativeRuntimeError = null;
+        _lastSampledNativeFrameId = 0;
+        InitializeNativeMetricsFile();
         _nativePollTimer.Start();
         Log("Using native runtime path.");
         return true;
@@ -206,8 +215,92 @@ public partial class MainWindow : Window
             StateText.Text = $"Native frame {metrics.FrameId}";
             OverlayStatusText.Text =
                 $"Native  camera {metrics.CameraFps:0.0}  display {metrics.DisplayFps:0.0} fps  " +
-                $"copy {metrics.FrameCopyMs:0.0} ms  preprocess {metrics.PreprocessMs:0.0} ms  " +
+                $"copy {metrics.FrameCopyMs:0.0}  upload {metrics.CameraUploadMs:0.0}  " +
+                $"present {metrics.PresentWaitMs:0.0} ms  " +
+                $"gpu {metrics.GpuRenderedFrames}/{metrics.GpuCameraFrames}  " +
                 $"drops {metrics.FramePoolDroppedFrames}/{metrics.PerceptionDroppedFrames}";
+            AppendNativeMetrics(metrics);
+        }
+    }
+
+    private void InitializeNativeMetricsFile()
+    {
+        if (_nativeMetricsPath is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var directory = System.IO.Path.GetDirectoryName(_nativeMetricsPath);
+            if (!string.IsNullOrEmpty(directory))
+            {
+                System.IO.Directory.CreateDirectory(directory);
+            }
+            System.IO.File.WriteAllText(
+                _nativeMetricsPath,
+                "sample_time,frame_id,camera_fps,display_fps,perception_fps,camera_wait_ms," +
+                "frame_copy_ms,preprocess_ms,palm_inference_ms,palm_postprocess_ms," +
+                "roi_crop_warp_ms,hand_inference_ms,landmark_postprocess_ms,tracking_update_ms," +
+                "camera_upload_ms,camera_draw_ms,overlay_draw_ms,hand_3d_draw_ms,end_draw_ms,present_wait_ms," +
+                "render_total_ms,end_to_end_ms,frame_pool_drops,perception_drops," +
+                "gpu_camera_frames,gpu_rendered_frames,gpu_dxgi_format,gpu_subresource" + Environment.NewLine);
+        }
+        catch (Exception ex)
+        {
+            Log("Native metrics file initialization failed: " + ex.Message);
+        }
+    }
+
+    private void AppendNativeMetrics(NativeVisionMetrics metrics)
+    {
+        if (_nativeMetricsPath is null || metrics.FrameId == _lastSampledNativeFrameId)
+        {
+            return;
+        }
+
+        _lastSampledNativeFrameId = metrics.FrameId;
+        var values = new object[]
+        {
+            DateTimeOffset.Now.ToString("O", CultureInfo.InvariantCulture),
+            metrics.FrameId,
+            metrics.CameraFps,
+            metrics.DisplayFps,
+            metrics.PerceptionFps,
+            metrics.CameraWaitMs,
+            metrics.FrameCopyMs,
+            metrics.PreprocessMs,
+            metrics.PalmInferenceMs,
+            metrics.PalmPostprocessMs,
+            metrics.RoiCropWarpMs,
+            metrics.HandInferenceMs,
+            metrics.LandmarkPostprocessMs,
+            metrics.TrackingUpdateMs,
+            metrics.CameraUploadMs,
+            metrics.CameraDrawMs,
+            metrics.OverlayDrawMs,
+            metrics.Hand3dDrawMs,
+            metrics.EndDrawMs,
+            metrics.PresentWaitMs,
+            metrics.OverlayRenderMs,
+            metrics.EndToEndLatencyMs,
+            metrics.FramePoolDroppedFrames,
+            metrics.PerceptionDroppedFrames,
+            metrics.GpuCameraFrames,
+            metrics.GpuRenderedFrames,
+            metrics.GpuCameraDxgiFormat,
+            metrics.GpuCameraSubresource
+        };
+        try
+        {
+            System.IO.File.AppendAllText(
+                _nativeMetricsPath,
+                string.Join(',', values.Select(static value =>
+                    Convert.ToString(value, CultureInfo.InvariantCulture))) + Environment.NewLine);
+        }
+        catch (Exception ex)
+        {
+            Log("Native metrics sample failed: " + ex.Message);
         }
     }
 

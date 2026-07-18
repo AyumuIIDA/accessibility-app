@@ -30,4 +30,18 @@ const std::array<std::int64_t, 4>& FloatTensorBuffer::shape() const noexcept { r
 std::size_t FloatTensorBuffer::elementCount() const noexcept { return values_.size(); }
 float* FloatTensorBuffer::data() noexcept { return values_.data(); }
 const float* FloatTensorBuffer::data() const noexcept { return values_.data(); }
+void FloatTensorBuffer::setGpuResource(
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource,
+    const std::uint64_t readyFenceValue) noexcept
+{
+    gpuResource_ = std::move(resource);
+    readyFenceValue_ = readyFenceValue;
+}
+void FloatTensorBuffer::clearGpuResource() noexcept
+{
+    gpuResource_.Reset();
+    readyFenceValue_ = 0;
+}
+ID3D12Resource* FloatTensorBuffer::gpuResource() const noexcept { return gpuResource_.Get(); }
+std::uint64_t FloatTensorBuffer::readyFenceValue() const noexcept { return readyFenceValue_; }
 }

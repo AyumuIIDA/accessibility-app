@@ -1,25 +1,37 @@
 #include "ryoiki_native.h"
 #include "Buffers/frame_pool.h"
+#include "Geometry/d3d11_hand_geometry_processor.h"
 #include "HandPerception/MediaPipeGraph/hand_perception_graph.h"
-#include "HandPerception/ModelRunners/cpu_hand_landmark_runner.h"
-#include "HandPerception/ModelRunners/cpu_palm_detection_runner.h"
+#include "HandPerception/ModelRunners/ort_hand_landmark_runner.h"
+#include "HandPerception/ModelRunners/ort_palm_detection_runner.h"
 #include "Pipeline/perception_mailbox.h"
 #include "Rendering/native_render_stage.h"
+#if defined(RYOIKI_ORT_DIRECTML)
+#include "Geometry/d3d12_hand_geometry_processor.h"
+#include "Runtime/directml_runtime.h"
+#endif
 #include "camera_capture.h"
 
 #include <Windows.h>
+#include <windowsx.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cwctype>
 #include <cstring>
 #include <filesystem>
+#include <iomanip>
 #include <mutex>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
 
-static_assert(sizeof(RyoikiMetrics) == 168);
+static_assert(sizeof(RyoikiMetrics) == 240);
 static_assert(sizeof(RyoikiPalmResult) == 96);
 static_assert(sizeof(RyoikiHandResult) == 296);
 
@@ -28,6 +40,11 @@ namespace
 constexpr wchar_t kWindowClassName[] = L"RyoikiTenkaiNativeView";
 void requestNativeRedraw(RyoikiHandle& handle);
 void resizeNativeRenderer(RyoikiHandle& handle, std::uint32_t width, std::uint32_t height);
+bool beginHand3dViewDrag(RyoikiHandle& handle, HWND hwnd, int x, int y);
+bool updateHand3dViewDrag(RyoikiHandle& handle, int x, int y);
+void endHand3dViewDrag(RyoikiHandle& handle, HWND hwnd);
+bool zoomHand3dView(RyoikiHandle& handle, HWND hwnd, int x, int y, int wheelDelta);
+bool resetHand3dView(RyoikiHandle& handle, HWND hwnd, int x, int y);
 
 LRESULT CALLBACK NativeWindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
 {
@@ -68,6 +85,58 @@ LRESULT CALLBACK NativeWindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM
         }
         return 0;
     }
+    case WM_LBUTTONDOWN:
+    {
+        auto* handle = reinterpret_cast<RyoikiHandle*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (handle != nullptr && beginHand3dViewDrag(
+                *handle, hwnd, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)))
+        {
+            return 0;
+        }
+        return DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+    case WM_MOUSEMOVE:
+    {
+        auto* handle = reinterpret_cast<RyoikiHandle*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (handle != nullptr && updateHand3dViewDrag(
+                *handle, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)))
+        {
+            return 0;
+        }
+        return DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+    case WM_LBUTTONUP:
+    case WM_CAPTURECHANGED:
+    {
+        auto* handle = reinterpret_cast<RyoikiHandle*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (handle != nullptr)
+        {
+            endHand3dViewDrag(*handle, hwnd);
+        }
+        return 0;
+    }
+    case WM_MOUSEWHEEL:
+    {
+        POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+        ScreenToClient(hwnd, &point);
+        auto* handle = reinterpret_cast<RyoikiHandle*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (handle != nullptr && zoomHand3dView(
+                *handle, hwnd, point.x, point.y, GET_WHEEL_DELTA_WPARAM(wparam)))
+        {
+            return 0;
+        }
+        return DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+    case WM_LBUTTONDBLCLK:
+    {
+        auto* handle = reinterpret_cast<RyoikiHandle*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (handle != nullptr && resetHand3dView(
+                *handle, hwnd, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)))
+        {
+            return 0;
+        }
+        return DefWindowProcW(hwnd, message, wparam, lparam);
+    }
     case WM_NCDESTROY:
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         return DefWindowProcW(hwnd, message, wparam, lparam);
@@ -87,6 +156,7 @@ bool registerWindowClass()
         window_class.hInstance = GetModuleHandleW(nullptr);
         window_class.lpszClassName = kWindowClassName;
         window_class.hCursor = LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW));
+        window_class.style = CS_DBLCLKS;
         registered = RegisterClassW(&window_class) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
     });
 
@@ -130,13 +200,19 @@ struct RyoikiHandle
     RyoikiPalmResult palm{};
     RyoikiHandResult hand{};
     ryoiki::buffers::FramePool framePool{4};
+    ryoiki::buffers::FramePool renderFramePool{4};
     ryoiki::pipeline::PerceptionMailbox perceptionMailbox;
     ryoiki::rendering::NativeRenderStage renderStage;
+    std::shared_ptr<ryoiki::runtime::D3d11Device> d3dDevice;
     CameraCapture* activeCapture{nullptr};
     std::string lastError;
     std::chrono::steady_clock::time_point startedAt{};
     std::chrono::steady_clock::time_point lastDisplayAt{};
     std::uint64_t lastPresentedFrameId{0};
+    bool asynchronousGpuRendering{false};
+    ryoiki::rendering::Hand3dView hand3dView{};
+    POINT lastHand3dDragPoint{};
+    bool hand3dDragging{false};
 
     void setError(const std::string& message)
     {
@@ -158,6 +234,104 @@ void resizeNativeRenderer(
     const std::uint32_t height)
 {
     handle.renderStage.resize(width, height);
+}
+
+bool isPointInHand3dViewport(const HWND hwnd, const int x, const int y)
+{
+    RECT client{};
+    if (!GetClientRect(hwnd, &client))
+    {
+        return false;
+    }
+    const int width = client.right - client.left;
+    const int height = client.bottom - client.top;
+    constexpr int kMinimumSplitWidth = 480;
+    const int plotLeft = static_cast<int>(static_cast<double>(width) * 0.70);
+    return width >= kMinimumSplitWidth && x >= plotLeft && x < width && y >= 0 && y < height;
+}
+
+bool beginHand3dViewDrag(
+    RyoikiHandle& handle,
+    const HWND hwnd,
+    const int x,
+    const int y)
+{
+    if (!isPointInHand3dViewport(hwnd, x, y))
+    {
+        return false;
+    }
+    handle.hand3dDragging = true;
+    handle.lastHand3dDragPoint = {x, y};
+    SetCapture(hwnd);
+    return true;
+}
+
+bool updateHand3dViewDrag(RyoikiHandle& handle, const int x, const int y)
+{
+    if (!handle.hand3dDragging)
+    {
+        return false;
+    }
+    constexpr float kRadiansPerPixel = 0.008F;
+    constexpr float kPitchLimit = 1.45F;
+    const int deltaX = x - handle.lastHand3dDragPoint.x;
+    const int deltaY = y - handle.lastHand3dDragPoint.y;
+    handle.lastHand3dDragPoint = {x, y};
+    handle.hand3dView.yawRadians += static_cast<float>(deltaX) * kRadiansPerPixel;
+    handle.hand3dView.pitchRadians = std::clamp(
+        handle.hand3dView.pitchRadians + static_cast<float>(deltaY) * kRadiansPerPixel,
+        -kPitchLimit,
+        kPitchLimit);
+    handle.renderStage.updateHand3dView(handle.hand3dView);
+    return true;
+}
+
+void endHand3dViewDrag(RyoikiHandle& handle, const HWND hwnd)
+{
+    if (!handle.hand3dDragging)
+    {
+        return;
+    }
+    handle.hand3dDragging = false;
+    if (GetCapture() == hwnd)
+    {
+        ReleaseCapture();
+    }
+}
+
+bool zoomHand3dView(
+    RyoikiHandle& handle,
+    const HWND hwnd,
+    const int x,
+    const int y,
+    const int wheelDelta)
+{
+    if (!isPointInHand3dViewport(hwnd, x, y))
+    {
+        return false;
+    }
+    const float wheelSteps = static_cast<float>(wheelDelta) / WHEEL_DELTA;
+    handle.hand3dView.halfExtent = std::clamp(
+        handle.hand3dView.halfExtent * std::pow(0.88F, wheelSteps),
+        0.04F,
+        0.30F);
+    handle.renderStage.updateHand3dView(handle.hand3dView);
+    return true;
+}
+
+bool resetHand3dView(
+    RyoikiHandle& handle,
+    const HWND hwnd,
+    const int x,
+    const int y)
+{
+    if (!isPointInHand3dViewport(hwnd, x, y))
+    {
+        return false;
+    }
+    handle.hand3dView = {};
+    handle.renderStage.updateHand3dView(handle.hand3dView);
+    return true;
 }
 
 void recordPresentation(
@@ -185,6 +359,16 @@ void recordPresentation(
     handle.lastDisplayAt = now;
     handle.metrics.frame_id = presentation.frameId;
     handle.metrics.capture_timestamp_us = presentation.captureTimestampUs;
+    handle.metrics.camera_upload_ms = presentation.cameraUploadMs;
+    if (presentation.usedGpuCameraSurface)
+    {
+        ++handle.metrics.gpu_rendered_frames;
+    }
+    handle.metrics.camera_draw_ms = presentation.cameraDrawMs;
+    handle.metrics.overlay_draw_ms = presentation.overlayDrawMs;
+    handle.metrics.hand_3d_draw_ms = presentation.hand3dDrawMs;
+    handle.metrics.end_draw_ms = presentation.endDrawMs;
+    handle.metrics.present_wait_ms = presentation.presentWaitMs;
     handle.metrics.overlay_render_ms = presentation.renderMs;
     if (renderTimestampUs >= static_cast<std::int64_t>(presentation.captureTimestampUs))
     {
@@ -241,13 +425,97 @@ std::filesystem::path getModelPath(const wchar_t* fileName)
         / L"models" / fileName;
 }
 
+std::uint64_t getCalibrationPalmIntervalFrames()
+{
+    std::array<wchar_t, 32> value{};
+    const DWORD length = GetEnvironmentVariableW(
+        L"RYOIKI_CALIBRATION_PALM_INTERVAL",
+        value.data(),
+        static_cast<DWORD>(value.size()));
+    if (length == 0 || length >= value.size())
+    {
+        return 0;
+    }
+
+    wchar_t* end = nullptr;
+    const unsigned long long parsed = std::wcstoull(value.data(), &end, 10);
+    if (end == value.data() || *end != L'\0' || parsed == 0)
+    {
+        return 0;
+    }
+    return static_cast<std::uint64_t>(parsed);
+}
+
+struct HandRuntimeConfiguration
+{
+    ryoiki::hand_perception::OrtSessionConfiguration session;
+    const wchar_t* palmModelFileName;
+    const wchar_t* handModelFileName;
+};
+
+std::optional<HandRuntimeConfiguration> getHandRuntimeConfiguration(std::string& error)
+{
+    std::array<wchar_t, 64> value{};
+    const DWORD length = GetEnvironmentVariableW(
+        L"RYOIKI_EXECUTION_PROVIDER",
+        value.data(),
+        static_cast<DWORD>(value.size()));
+    if (length == 0)
+    {
+        error.clear();
+        return HandRuntimeConfiguration{
+            ryoiki::hand_perception::OrtSessionConfiguration::cpu(),
+            L"palm_detection.onnx",
+            L"hand_landmark.onnx"};
+    }
+    if (length >= value.size())
+    {
+        error = "RYOIKI_EXECUTION_PROVIDER value is too long.";
+        return std::nullopt;
+    }
+
+    std::wstring provider{value.data(), length};
+    std::transform(provider.begin(), provider.end(), provider.begin(),
+        [](const wchar_t character)
+        {
+            return static_cast<wchar_t>(std::towlower(character));
+        });
+    if (provider == L"cpu")
+    {
+        error.clear();
+        return HandRuntimeConfiguration{
+            ryoiki::hand_perception::OrtSessionConfiguration::cpu(),
+            L"palm_detection.onnx",
+            L"hand_landmark.onnx"};
+    }
+    if (provider == L"qnn-htp")
+    {
+        error.clear();
+        return HandRuntimeConfiguration{
+            ryoiki::hand_perception::OrtSessionConfiguration::qnnHtp(),
+            L"palm_detection_qdq.onnx",
+            L"hand_landmark_qdq.onnx"};
+    }
+    if (provider == L"directml")
+    {
+        error.clear();
+        return HandRuntimeConfiguration{
+            ryoiki::hand_perception::OrtSessionConfiguration::directMl(),
+            L"palm_detection.onnx",
+            L"hand_landmark.onnx"};
+    }
+
+    error = "RYOIKI_EXECUTION_PROVIDER must be 'cpu', 'directml', or 'qnn-htp'.";
+    return std::nullopt;
+}
+
 void runCaptureLoop(RyoikiHandle& handle)
 {
     using clock = std::chrono::steady_clock;
     CameraCapture camera;
     ActiveCaptureRegistration registration{handle, camera};
     std::string error;
-    if (!camera.initialize(error))
+    if (!camera.initialize(handle.d3dDevice, error))
     {
         handle.setError(error);
         handle.running.store(false);
@@ -267,6 +535,9 @@ void runCaptureLoop(RyoikiHandle& handle)
         auto orientation = ryoiki::runtime::FrameRotation::None;
         double cameraWaitMs = 0.0;
         double frameCopyMs = 0.0;
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> gpuTexture;
+        std::uint32_t gpuTextureSubresource = 0;
+        Microsoft::WRL::ComPtr<IUnknown> gpuSampleOwner;
         error.clear();
         auto frame = handle.framePool.tryAcquire();
         auto& captureBuffer = frame != nullptr
@@ -279,6 +550,10 @@ void runCaptureLoop(RyoikiHandle& handle)
                 orientation,
                 cameraWaitMs,
                 frameCopyMs,
+                gpuTexture,
+                gpuTextureSubresource,
+                gpuSampleOwner,
+                false,
                 error))
         {
             if (handle.running.load())
@@ -298,16 +573,87 @@ void runCaptureLoop(RyoikiHandle& handle)
         lastCaptureAt = now;
         ++frameId;
 
-        if (frame != nullptr
-            && frame->prepare(
+        bool prepared = false;
+        if (frame != nullptr && gpuTexture != nullptr)
+        {
+            prepared = frame->prepareGpu(
                 width,
                 height,
                 frameId,
                 static_cast<std::uint64_t>(captureTimestamp),
-                orientation))
+                std::move(gpuTexture),
+                gpuTextureSubresource,
+                std::move(gpuSampleOwner),
+                orientation);
+        }
+        else if (frame != nullptr)
+        {
+            prepared = frame->prepare(
+                width,
+                height,
+                frameId,
+                static_cast<std::uint64_t>(captureTimestamp),
+                orientation);
+        }
+        if (prepared)
         {
             std::shared_ptr<const ryoiki::buffers::FrameBuffer> publishedFrame = frame;
-            handle.perceptionMailbox.publish(std::move(publishedFrame));
+            handle.perceptionMailbox.publish(publishedFrame);
+            if (handle.asynchronousGpuRendering)
+            {
+                auto renderFrame = handle.renderFramePool.tryAcquire();
+                if (renderFrame != nullptr && frame->gpuTexture() != nullptr)
+                {
+                    D3D11_TEXTURE2D_DESC sourceDescription{};
+                    frame->gpuTexture()->GetDesc(&sourceDescription);
+                    Microsoft::WRL::ComPtr<ID3D11Texture2D> renderTexture;
+                    if (renderFrame->gpuTexture() != nullptr)
+                    {
+                        renderTexture = renderFrame->gpuTexture();
+                        D3D11_TEXTURE2D_DESC renderDescription{};
+                        renderTexture->GetDesc(&renderDescription);
+                        if (renderDescription.Width != sourceDescription.Width
+                            || renderDescription.Height != sourceDescription.Height
+                            || renderDescription.Format != sourceDescription.Format)
+                        {
+                            renderTexture.Reset();
+                        }
+                    }
+                    const auto copyStarted = clock::now();
+                    HRESULT copyResult = S_OK;
+                    if (renderTexture == nullptr)
+                    {
+                        sourceDescription.Usage = D3D11_USAGE_DEFAULT;
+                        sourceDescription.CPUAccessFlags = 0;
+                        sourceDescription.BindFlags = D3D11_BIND_SHADER_RESOURCE
+                            | D3D11_BIND_RENDER_TARGET;
+                        sourceDescription.MiscFlags = 0;
+                        copyResult = handle.d3dDevice->device()->CreateTexture2D(
+                            &sourceDescription, nullptr, &renderTexture);
+                    }
+                    if (SUCCEEDED(copyResult))
+                    {
+                        std::lock_guard contextLock{
+                            handle.d3dDevice->immediateContextMutex()};
+                        handle.d3dDevice->immediateContext()->CopySubresourceRegion(
+                            renderTexture.Get(), 0, 0, 0, 0,
+                            frame->gpuTexture(), frame->gpuTextureSubresource(), nullptr);
+                    }
+                    frameCopyMs += std::chrono::duration<double, std::milli>(
+                        clock::now() - copyStarted).count();
+                    if (SUCCEEDED(copyResult)
+                        && renderFrame->prepareGpu(
+                            width, height, frameId,
+                            static_cast<std::uint64_t>(captureTimestamp),
+                            std::move(renderTexture), 0, {}, orientation))
+                    {
+                        std::shared_ptr<const ryoiki::buffers::FrameBuffer>
+                            publishedRenderFrame = renderFrame;
+                        handle.renderStage.publishFrame(
+                            std::move(publishedRenderFrame));
+                    }
+                }
+            }
         }
 
         const auto perceptionDrops = handle.perceptionMailbox.droppedFrames();
@@ -318,8 +664,23 @@ void runCaptureLoop(RyoikiHandle& handle)
             handle.metrics.camera_wait_ms = cameraWaitMs;
             handle.metrics.frame_copy_ms = frameCopyMs;
             handle.metrics.native_overhead_ms = 0.0;
-            handle.metrics.frame_pool_dropped_frames = handle.framePool.droppedAcquisitions();
+            handle.metrics.frame_pool_dropped_frames =
+                handle.framePool.droppedAcquisitions()
+                + handle.renderFramePool.droppedAcquisitions();
             handle.metrics.perception_dropped_frames = perceptionDrops;
+            if (gpuTexture != nullptr || frame != nullptr
+                && frame->gpuTexture() != nullptr)
+            {
+                ++handle.metrics.gpu_camera_frames;
+                ID3D11Texture2D* capturedTexture = gpuTexture != nullptr
+                    ? gpuTexture.Get() : frame->gpuTexture();
+                D3D11_TEXTURE2D_DESC description{};
+                capturedTexture->GetDesc(&description);
+                handle.metrics.gpu_camera_dxgi_format =
+                    static_cast<std::uint32_t>(description.Format);
+                handle.metrics.gpu_camera_subresource = frame != nullptr
+                    ? frame->gpuTextureSubresource() : gpuTextureSubresource;
+            }
 
         }
 
@@ -333,8 +694,39 @@ void runPerceptionLoop(RyoikiHandle& handle)
 {
     using clock = std::chrono::steady_clock;
     std::string error;
-    auto palmRunner = ryoiki::hand_perception::CpuPalmDetectionRunner::create(
-        getModelPath(L"palm_detection.onnx"),
+    auto runtimeConfiguration = getHandRuntimeConfiguration(error);
+    if (!runtimeConfiguration.has_value())
+    {
+        handle.setError(error);
+        handle.perceptionMailbox.stop();
+        return;
+    }
+#if defined(RYOIKI_ORT_DIRECTML)
+    std::shared_ptr<ryoiki::runtime::DirectMlRuntime> directMlRuntime;
+    wchar_t gpuTensorValue[2]{};
+    const bool useDirectMlGpuTensor = GetEnvironmentVariableW(
+        L"RYOIKI_DIRECTML_GPU_TENSOR", gpuTensorValue, 2) > 0;
+    if (runtimeConfiguration->session.executionProvider()
+        == ryoiki::hand_perception::ExecutionProvider::DirectMl)
+    {
+        directMlRuntime = ryoiki::runtime::DirectMlRuntime::create(handle.d3dDevice, error);
+        if (directMlRuntime == nullptr)
+        {
+            handle.setError(error);
+            handle.perceptionMailbox.stop();
+            return;
+        }
+        if (useDirectMlGpuTensor)
+        {
+            runtimeConfiguration->session =
+                ryoiki::hand_perception::OrtSessionConfiguration::directMl(directMlRuntime);
+        }
+    }
+#endif
+
+    auto palmRunner = ryoiki::hand_perception::OrtPalmDetectionRunner::create(
+        getModelPath(runtimeConfiguration->palmModelFileName),
+        runtimeConfiguration->session,
         error);
     if (palmRunner == nullptr)
     {
@@ -342,8 +734,10 @@ void runPerceptionLoop(RyoikiHandle& handle)
         handle.perceptionMailbox.stop();
         return;
     }
-    auto handRunner = ryoiki::hand_perception::CpuHandLandmarkRunner::create(
-        getModelPath(L"hand_landmark.onnx"),
+    auto handRunner = ryoiki::hand_perception::OrtHandLandmarkRunner::create(
+        getModelPath(runtimeConfiguration->handModelFileName),
+        ryoiki::hand_perception::HandLandmarkModelContract::openCvZoo2023(),
+        runtimeConfiguration->session,
         error);
     if (handRunner == nullptr)
     {
@@ -352,12 +746,45 @@ void runPerceptionLoop(RyoikiHandle& handle)
         return;
     }
 
+    std::unique_ptr<ryoiki::geometry::IGeometryProcessor> palmGeometry;
+    std::unique_ptr<ryoiki::geometry::IGeometryProcessor> handGeometry;
+#if defined(RYOIKI_ORT_DIRECTML)
+    if (useDirectMlGpuTensor)
+    {
+        palmGeometry = ryoiki::geometry::D3d12HandGeometryProcessor::create(
+            directMlRuntime, error);
+        handGeometry = ryoiki::geometry::D3d12HandGeometryProcessor::create(
+            directMlRuntime, error);
+    }
+    else
+#endif
+    {
+        palmGeometry = ryoiki::geometry::D3d11HandGeometryProcessor::create(
+            handle.d3dDevice, error);
+        handGeometry = ryoiki::geometry::D3d11HandGeometryProcessor::create(
+            handle.d3dDevice, error);
+    }
+    if (palmGeometry == nullptr || handGeometry == nullptr)
+    {
+        handle.setError(error.empty() ? "GPU preprocessing initialization failed." : error);
+        handle.perceptionMailbox.stop();
+        return;
+    }
     ryoiki::hand_perception::HandPerceptionGraph graph{
         std::move(palmRunner),
-        std::move(handRunner)};
+        std::move(handRunner),
+        std::move(palmGeometry),
+        std::move(handGeometry),
+        {getCalibrationPalmIntervalFrames()}};
     ryoiki::hand_perception::HandPerceptionResult perceptionResult;
     ryoiki::hand_perception::HandPerceptionGraphMetrics graphMetrics{};
     auto lastPerceptionAt = clock::time_point{};
+#if defined(RYOIKI_ORT_DIRECTML)
+    bool cameraShareProbeCompleted = false;
+    wchar_t cameraShareProbeValue[2]{};
+    const bool cameraShareProbeEnabled = GetEnvironmentVariableW(
+        L"RYOIKI_PROBE_D3D12_CAMERA_SHARE", cameraShareProbeValue, 2) > 0;
+#endif
     const std::string providerLog = "Hand perception runners selected: "
         + graph.providerSummary() + "\n";
     OutputDebugStringA(providerLog.c_str());
@@ -369,6 +796,56 @@ void runPerceptionLoop(RyoikiHandle& handle)
         {
             break;
         }
+#if defined(RYOIKI_ORT_DIRECTML)
+        if (cameraShareProbeEnabled && !cameraShareProbeCompleted
+            && directMlRuntime != nullptr)
+        {
+            cameraShareProbeCompleted = true;
+            std::string diagnostic;
+            const auto sharedCamera = directMlRuntime->tryOpenD3d11Texture(
+                frame->gpuTexture(), diagnostic);
+            if (sharedCamera == nullptr)
+            {
+                std::vector<double> copySamples;
+                copySamples.reserve(20);
+                std::string copyDiagnostic;
+                for (int sample = 0; sample < 20; ++sample)
+                {
+                    double copyMs = 0.0;
+                    const auto copiedCamera = directMlRuntime->copyCameraToSharedTexture(
+                        frame->gpuTexture(), static_cast<std::uint64_t>(sample + 1),
+                        copyMs, copyDiagnostic);
+                    if (copiedCamera == nullptr) break;
+                    copySamples.push_back(copyMs);
+                }
+                if (!copySamples.empty())
+                {
+                    std::sort(copySamples.begin(), copySamples.end());
+                    const auto percentile = [&copySamples](const double ratio)
+                    {
+                        const auto index = static_cast<std::size_t>(
+                            ratio * static_cast<double>(copySamples.size() - 1));
+                        return copySamples[index];
+                    };
+                    std::ostringstream summary;
+                    summary << " Full-frame GPU copy n=" << copySamples.size()
+                        << ", p50=" << std::fixed << std::setprecision(3)
+                        << percentile(0.50) << " ms, p95=" << percentile(0.95) << " ms.";
+                    diagnostic += summary.str();
+                }
+                else
+                {
+                    diagnostic += " " + copyDiagnostic;
+                }
+            }
+            OutputDebugStringA((diagnostic + "\n").c_str());
+            handle.setError(diagnostic);
+            handle.perceptionMailbox.stop();
+            handle.running.store(false);
+            handle.renderStage.requestRedraw();
+            break;
+        }
+#endif
 
         error.clear();
         if (!graph.process(*frame, perceptionResult, graphMetrics, error))
@@ -449,7 +926,14 @@ void runPerceptionLoop(RyoikiHandle& handle)
             }
         }
 
-        handle.renderStage.publish({frame, perceptionResult});
+        if (handle.asynchronousGpuRendering)
+        {
+            handle.renderStage.publishPerception(perceptionResult, frame->frameId());
+        }
+        else
+        {
+            handle.renderStage.publish({frame, perceptionResult, frame->frameId()});
+        }
     }
 }
 }
@@ -547,12 +1031,32 @@ RYOIKI_EXPORT std::int32_t ryoiki_start(RyoikiHandle* handle)
             handle->lastPresentedFrameId = 0;
         }
         handle->framePool.resetStatistics();
+        handle->renderFramePool.resetStatistics();
         handle->perceptionMailbox.reset();
 
         RECT childRect{};
         GetClientRect(handle->childHwnd, &childRect);
         std::string renderError;
+        wchar_t on12ProbeValue[2]{};
+        wchar_t gpuTensorValue[2]{};
+        const bool useD3d11On12 = GetEnvironmentVariableW(
+            L"RYOIKI_PROBE_D3D11ON12_CAPTURE", on12ProbeValue, 2) > 0
+            || GetEnvironmentVariableW(
+                L"RYOIKI_DIRECTML_GPU_TENSOR", gpuTensorValue, 2) > 0;
+        handle->asynchronousGpuRendering =
+            GetEnvironmentVariableW(
+                L"RYOIKI_DIRECTML_GPU_TENSOR", gpuTensorValue, 2) > 0;
+        handle->d3dDevice = useD3d11On12
+            ? ryoiki::runtime::D3d11Device::createOn12(renderError)
+            : ryoiki::runtime::D3d11Device::create(renderError);
+        if (handle->d3dDevice == nullptr)
+        {
+            handle->running.store(false);
+            handle->setError(renderError);
+            return kRyoikiStatusFailure;
+        }
         if (!handle->renderStage.start(
+                handle->d3dDevice,
                 handle->childHwnd,
                 static_cast<std::uint32_t>((std::max)(1L, childRect.right - childRect.left)),
                 static_cast<std::uint32_t>((std::max)(1L, childRect.bottom - childRect.top)),

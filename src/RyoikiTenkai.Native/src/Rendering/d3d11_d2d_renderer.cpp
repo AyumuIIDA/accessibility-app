@@ -1,6 +1,7 @@
 #include "Rendering/d3d11_d2d_renderer.h"
 
 #include "Rendering/frame_transforms.h"
+#include "Rendering/hand_3d_plot.h"
 
 #include <d2d1_1.h>
 #include <d2d1_1helper.h>
@@ -8,6 +9,7 @@
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <optional>
@@ -18,6 +20,14 @@ namespace ryoiki::rendering
 namespace
 {
 using Microsoft::WRL::ComPtr;
+
+constexpr std::array<std::array<int, 2>, 23> kHandConnections{{
+    {0, 1}, {1, 2}, {2, 3}, {3, 4},
+    {0, 5}, {5, 6}, {6, 7}, {7, 8},
+    {0, 9}, {9, 10}, {10, 11}, {11, 12},
+    {0, 13}, {13, 14}, {14, 15}, {15, 16},
+    {0, 17}, {17, 18}, {18, 19}, {19, 20},
+    {5, 9}, {9, 13}, {13, 17}}};
 
 std::string hresultMessage(const char* operation, const HRESULT result)
 {
@@ -51,11 +61,18 @@ class D3d11D2dRenderer::Impl final
 {
 public:
     bool initialize(
+        std::shared_ptr<runtime::D3d11Device> sharedDevice,
         const HWND hwnd,
         const std::uint32_t width,
         const std::uint32_t height,
         std::string& error)
     {
+        sharedDevice_ = std::move(sharedDevice);
+        if (sharedDevice_ == nullptr)
+        {
+            error = "A shared D3D11 device is required.";
+            return false;
+        }
         hwnd_ = hwnd;
         width_ = width;
         height_ = height;
@@ -114,43 +131,36 @@ public:
         return SUCCEEDED(result);
     }
 
+    void setHand3dView(const Hand3dView view) noexcept
+    {
+        hand3dView_ = view;
+    }
+
 private:
     bool createDeviceResources(std::string& error)
     {
         cameraBitmap_.Reset();
+        gpuCopyTexture_.Reset();
         palmBrush_.Reset();
         handBrush_.Reset();
+        plotGridBrush_.Reset();
+        plotXAxisBrush_.Reset();
+        plotYAxisBrush_.Reset();
+        plotZAxisBrush_.Reset();
+        palmDirectionBrush_.Reset();
         targetBitmap_.Reset();
         d2dContext_.Reset();
         d2dDevice_.Reset();
         d2dFactory_.Reset();
         swapChain_.Reset();
-        d3dContext_.Reset();
-        d3dDevice_.Reset();
         cameraWidth_ = 0;
         cameraHeight_ = 0;
+        cameraBitmapIsGpuSurface_ = false;
         uploadedFrameId_.reset();
 
-        constexpr std::array<D3D_FEATURE_LEVEL, 2> kFeatureLevels{
-            D3D_FEATURE_LEVEL_11_1,
-            D3D_FEATURE_LEVEL_11_0};
-        D3D_FEATURE_LEVEL selectedFeatureLevel{};
-        HRESULT result = D3D11CreateDevice(
-            nullptr,
-            D3D_DRIVER_TYPE_HARDWARE,
-            nullptr,
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-            kFeatureLevels.data(),
-            static_cast<UINT>(kFeatureLevels.size()),
-            D3D11_SDK_VERSION,
-            &d3dDevice_,
-            &selectedFeatureLevel,
-            &d3dContext_);
-        if (FAILED(result))
-        {
-            error = hresultMessage("D3D11CreateDevice", result);
-            return false;
-        }
+        d3dDevice_ = sharedDevice_->device();
+        d3dContext_ = sharedDevice_->immediateContext();
+        HRESULT result = S_OK;
 
         ComPtr<IDXGIDevice> dxgiDevice;
         result = d3dDevice_.As(&dxgiDevice);
@@ -249,6 +259,41 @@ private:
             error = hresultMessage("Create hand brush", result);
             return false;
         }
+        result = d2dContext_->CreateSolidColorBrush(
+            D2D1::ColorF(0.30F, 0.34F, 0.42F), &plotGridBrush_);
+        if (FAILED(result))
+        {
+            error = hresultMessage("Create 3D plot grid brush", result);
+            return false;
+        }
+        result = d2dContext_->CreateSolidColorBrush(
+            D2D1::ColorF(0.95F, 0.30F, 0.30F), &plotXAxisBrush_);
+        if (FAILED(result))
+        {
+            error = hresultMessage("Create 3D plot X axis brush", result);
+            return false;
+        }
+        result = d2dContext_->CreateSolidColorBrush(
+            D2D1::ColorF(0.30F, 0.90F, 0.45F), &plotYAxisBrush_);
+        if (FAILED(result))
+        {
+            error = hresultMessage("Create 3D plot Y axis brush", result);
+            return false;
+        }
+        result = d2dContext_->CreateSolidColorBrush(
+            D2D1::ColorF(0.30F, 0.55F, 1.0F), &plotZAxisBrush_);
+        if (FAILED(result))
+        {
+            error = hresultMessage("Create 3D plot Z axis brush", result);
+            return false;
+        }
+        result = d2dContext_->CreateSolidColorBrush(
+            D2D1::ColorF(0.10F, 0.95F, 1.0F), &palmDirectionBrush_);
+        if (FAILED(result))
+        {
+            error = hresultMessage("Create palm direction brush", result);
+            return false;
+        }
         return true;
     }
 
@@ -285,7 +330,8 @@ private:
         const std::uint32_t height,
         std::string& error)
     {
-        if (cameraBitmap_ != nullptr && cameraWidth_ == width && cameraHeight_ == height)
+        if (cameraBitmap_ != nullptr && !cameraBitmapIsGpuSurface_
+            && cameraWidth_ == width && cameraHeight_ == height)
         {
             return true;
         }
@@ -311,6 +357,111 @@ private:
         }
         cameraWidth_ = width;
         cameraHeight_ = height;
+        cameraBitmapIsGpuSurface_ = false;
+        return true;
+    }
+
+    bool tryUseGpuCameraBitmap(
+        const buffers::FrameBuffer& frame,
+        bool& usedGpuSurface,
+        std::string& error)
+    {
+        usedGpuSurface = false;
+        if (frame.gpuTexture() == nullptr)
+        {
+            return true;
+        }
+        if (uploadedFrameId_.has_value() && *uploadedFrameId_ == frame.frameId()
+            && cameraBitmap_ != nullptr)
+        {
+            usedGpuSurface = true;
+            return true;
+        }
+
+        D3D11_TEXTURE2D_DESC description{};
+        frame.gpuTexture()->GetDesc(&description);
+        if (description.Format != DXGI_FORMAT_B8G8R8A8_UNORM)
+        {
+            return true;
+        }
+        const auto properties = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_NONE,
+            D2D1::PixelFormat(
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                D2D1_ALPHA_MODE_IGNORE),
+            96.0F,
+            96.0F);
+        if (frame.gpuTextureSubresource() == 0)
+        {
+            ComPtr<IDXGISurface> cameraSurface;
+            if (SUCCEEDED(frame.gpuTexture()->QueryInterface(IID_PPV_ARGS(&cameraSurface))))
+            {
+                ComPtr<ID2D1Bitmap1> directBitmap;
+                const HRESULT directResult = d2dContext_->CreateBitmapFromDxgiSurface(
+                    cameraSurface.Get(), &properties, &directBitmap);
+                if (SUCCEEDED(directResult))
+                {
+                    cameraBitmap_ = std::move(directBitmap);
+                    cameraWidth_ = frame.width();
+                    cameraHeight_ = frame.height();
+                    cameraBitmapIsGpuSurface_ = true;
+                    uploadedFrameId_ = frame.frameId();
+                    usedGpuSurface = true;
+                    return true;
+                }
+            }
+        }
+
+        HRESULT result = S_OK;
+        const bool recreateCopyTexture = gpuCopyTexture_ == nullptr
+            || cameraWidth_ != frame.width() || cameraHeight_ != frame.height()
+            || !cameraBitmapIsGpuSurface_;
+        if (recreateCopyTexture)
+        {
+            D3D11_TEXTURE2D_DESC copyDescription{};
+            copyDescription.Width = description.Width;
+            copyDescription.Height = description.Height;
+            copyDescription.MipLevels = 1;
+            copyDescription.ArraySize = 1;
+            copyDescription.Format = description.Format;
+            copyDescription.SampleDesc.Count = 1;
+            copyDescription.Usage = D3D11_USAGE_DEFAULT;
+            copyDescription.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+            gpuCopyTexture_.Reset();
+            result = d3dDevice_->CreateTexture2D(
+                &copyDescription, nullptr, &gpuCopyTexture_);
+            if (FAILED(result))
+            {
+                error = hresultMessage("Create drawable camera texture", result);
+                return false;
+            }
+            ComPtr<IDXGISurface> surface;
+            result = gpuCopyTexture_.As(&surface);
+            if (FAILED(result))
+            {
+                error = hresultMessage("Query drawable camera DXGI surface", result);
+                return false;
+            }
+            ComPtr<ID2D1Bitmap1> gpuBitmap;
+            result = d2dContext_->CreateBitmapFromDxgiSurface(surface.Get(), &properties, &gpuBitmap);
+            if (FAILED(result))
+            {
+                error = hresultMessage("Wrap drawable camera DXGI surface", result);
+                return false;
+            }
+            cameraBitmap_ = std::move(gpuBitmap);
+        }
+        {
+            std::lock_guard lock{sharedDevice_->immediateContextMutex()};
+            d3dContext_->CopySubresourceRegion(
+                gpuCopyTexture_.Get(), 0, 0, 0, 0,
+                frame.gpuTexture(), frame.gpuTextureSubresource(), nullptr);
+        }
+        cameraWidth_ = frame.width();
+        cameraHeight_ = frame.height();
+        cameraBitmapIsGpuSurface_ = true;
+        uploadedFrameId_ = frame.frameId();
+        usedGpuSurface = true;
         return true;
     }
 
@@ -321,39 +472,56 @@ private:
     {
         using clock = std::chrono::steady_clock;
         const auto started = clock::now();
-        if (packet.frame == nullptr || packet.frame->pixels().empty()
+        if (packet.frame == nullptr
+            || (packet.frame->pixels().empty() && packet.frame->gpuTexture() == nullptr)
             || width_ == 0 || height_ == 0)
         {
             error = "The render packet does not contain a drawable frame.";
             return E_INVALIDARG;
         }
         const auto& frame = *packet.frame;
-        if (!ensureCameraBitmap(frame.width(), frame.height(), error))
+        HRESULT result = S_OK;
+        const auto uploadStarted = clock::now();
+        bool usedGpuSurface = false;
+        if (!tryUseGpuCameraBitmap(frame, usedGpuSurface, error))
         {
             return E_FAIL;
         }
-        HRESULT result = S_OK;
-        if (!uploadedFrameId_.has_value() || *uploadedFrameId_ != frame.frameId())
+        if (!usedGpuSurface)
         {
-            result = cameraBitmap_->CopyFromMemory(
-                nullptr,
-                frame.pixels().data(),
-                frame.stride());
-            if (FAILED(result))
+            if (frame.pixels().empty())
             {
-                error = hresultMessage("ID2D1Bitmap1::CopyFromMemory", result);
-                return result;
+                error = "The GPU camera surface cannot be drawn and has no CPU fallback.";
+                return E_INVALIDARG;
             }
-            uploadedFrameId_ = frame.frameId();
+            if (!ensureCameraBitmap(frame.width(), frame.height(), error))
+            {
+                return E_FAIL;
+            }
+            if (!uploadedFrameId_.has_value() || *uploadedFrameId_ != frame.frameId())
+            {
+                result = cameraBitmap_->CopyFromMemory(
+                    nullptr,
+                    frame.pixels().data(),
+                    frame.stride());
+                if (FAILED(result))
+                {
+                    error = hresultMessage("ID2D1Bitmap1::CopyFromMemory", result);
+                    return result;
+                }
+                uploadedFrameId_ = frame.frameId();
+            }
         }
+        const auto uploadCompleted = clock::now();
 
+        const auto cameraViewport = createCameraViewport();
+        const auto plotViewport = createPlotViewport(cameraViewport);
         FrameTransforms transforms{};
         if (!createFrameTransforms(
                 frame.width(),
                 frame.height(),
                 frame.orientation(),
-                width_,
-                height_,
+                cameraViewport,
                 true,
                 transforms))
         {
@@ -361,6 +529,7 @@ private:
             return E_INVALIDARG;
         }
 
+        const auto cameraDrawStarted = clock::now();
         d2dContext_->BeginDraw();
         d2dContext_->SetTransform(D2D1::Matrix3x2F::Identity());
         d2dContext_->Clear(D2D1::ColorF(0.02F, 0.024F, 0.031F));
@@ -375,28 +544,50 @@ private:
             1.0F,
             D2D1_INTERPOLATION_MODE_LINEAR,
             nullptr);
+        const auto cameraDrawCompleted = clock::now();
 
+        const auto overlayDrawStarted = clock::now();
         d2dContext_->SetTransform(D2D1::Matrix3x2F::Identity());
         drawPalmOverlay(packet, transforms);
         drawHandOverlay(packet, transforms);
+        const auto overlayDrawCompleted = clock::now();
+        const auto hand3dDrawStarted = clock::now();
+        drawHand3dPlot(packet, plotViewport);
+        const auto hand3dDrawCompleted = clock::now();
+        const auto endDrawStarted = clock::now();
         result = d2dContext_->EndDraw();
+        const auto endDrawCompleted = clock::now();
         if (FAILED(result))
         {
             error = hresultMessage("ID2D1DeviceContext::EndDraw", result);
             return result;
         }
+        const auto presentStarted = clock::now();
         result = swapChain_->Present(1, 0);
+        const auto presentCompleted = clock::now();
         if (FAILED(result))
         {
             error = hresultMessage("IDXGISwapChain::Present", result);
             return result;
         }
 
-        const auto completed = clock::now();
         presentation.frameId = frame.frameId();
         presentation.captureTimestampUs = frame.captureTimestampUs();
+        presentation.cameraUploadMs = std::chrono::duration<double, std::milli>(
+            uploadCompleted - uploadStarted).count();
+        presentation.cameraDrawMs = std::chrono::duration<double, std::milli>(
+            cameraDrawCompleted - cameraDrawStarted).count();
+        presentation.overlayDrawMs = std::chrono::duration<double, std::milli>(
+            overlayDrawCompleted - overlayDrawStarted).count();
+        presentation.hand3dDrawMs = std::chrono::duration<double, std::milli>(
+            hand3dDrawCompleted - hand3dDrawStarted).count();
+        presentation.endDrawMs = std::chrono::duration<double, std::milli>(
+            endDrawCompleted - endDrawStarted).count();
+        presentation.presentWaitMs = std::chrono::duration<double, std::milli>(
+            presentCompleted - presentStarted).count();
         presentation.renderMs = std::chrono::duration<double, std::milli>(
-            completed - started).count();
+            presentCompleted - started).count();
+        presentation.usedGpuCameraSurface = usedGpuSurface;
         return S_OK;
     }
 
@@ -435,20 +626,12 @@ private:
         {
             return;
         }
-        constexpr std::array<std::array<int, 2>, 23> kConnections{{
-            {0, 1}, {1, 2}, {2, 3}, {3, 4},
-            {0, 5}, {5, 6}, {6, 7}, {7, 8},
-            {0, 9}, {9, 10}, {10, 11}, {11, 12},
-            {0, 13}, {13, 14}, {14, 15}, {15, 16},
-            {0, 17}, {17, 18}, {18, 19}, {19, 20},
-            {5, 9}, {9, 13}, {13, 17}}};
-
         const auto mapLandmark = [&hand, &transforms](const int index)
         {
             return transforms.uprightToViewport.transform(
                 {hand.landmarks[index].x, hand.landmarks[index].y});
         };
-        for (const auto& connection : kConnections)
+        for (const auto& connection : kHandConnections)
         {
             d2dContext_->DrawLine(
                 toD2dPoint(mapLandmark(connection[0])),
@@ -477,34 +660,188 @@ private:
             1.5F);
     }
 
+    [[nodiscard]] ViewportRect createCameraViewport() const noexcept
+    {
+        constexpr std::uint32_t kMinimumSplitWidth = 480;
+        if (width_ < kMinimumSplitWidth)
+        {
+            return {0, 0, width_, height_};
+        }
+        const auto cameraWidth = static_cast<std::uint32_t>(
+            static_cast<double>(width_) * 0.70);
+        return {0, 0, (std::max)(cameraWidth, 1U), height_};
+    }
+
+    [[nodiscard]] PlotViewport createPlotViewport(
+        const ViewportRect cameraViewport) const noexcept
+    {
+        if (cameraViewport.width >= width_)
+        {
+            return {};
+        }
+        constexpr float kPadding = 12.0F;
+        return {
+            static_cast<float>(cameraViewport.width) + kPadding,
+            kPadding,
+            static_cast<float>(width_) - kPadding,
+            static_cast<float>(height_) - kPadding};
+    }
+
+    void drawHand3dPlot(const RenderPacket& packet, const PlotViewport& viewport)
+    {
+        if (viewport.width() <= 0.0F || viewport.height() <= 0.0F)
+        {
+            return;
+        }
+
+        d2dContext_->DrawRectangle(
+            D2D1::RectF(viewport.left, viewport.top, viewport.right, viewport.bottom),
+            plotGridBrush_.Get(),
+            1.0F);
+
+        constexpr int kGridHalfSteps = 3;
+        const float gridStep = hand3dView_.halfExtent / static_cast<float>(kGridHalfSteps);
+        for (int step = -kGridHalfSteps; step <= kGridHalfSteps; ++step)
+        {
+            const float offset = static_cast<float>(step) * gridStep;
+            const auto horizontalStart = projectHand3dPoint(
+                {-hand3dView_.halfExtent, offset, 0.0F}, viewport, hand3dView_);
+            const auto horizontalEnd = projectHand3dPoint(
+                {hand3dView_.halfExtent, offset, 0.0F}, viewport, hand3dView_);
+            const auto verticalStart = projectHand3dPoint(
+                {offset, -hand3dView_.halfExtent, 0.0F}, viewport, hand3dView_);
+            const auto verticalEnd = projectHand3dPoint(
+                {offset, hand3dView_.halfExtent, 0.0F}, viewport, hand3dView_);
+            d2dContext_->DrawLine(
+                toD2dPoint(horizontalStart.position),
+                toD2dPoint(horizontalEnd.position),
+                plotGridBrush_.Get(),
+                0.7F);
+            d2dContext_->DrawLine(
+                toD2dPoint(verticalStart.position),
+                toD2dPoint(verticalEnd.position),
+                plotGridBrush_.Get(),
+                0.7F);
+        }
+
+        const auto axisOrigin = projectHand3dPoint({}, viewport, hand3dView_);
+        const auto axisX = projectHand3dPoint({0.07F, 0.0F, 0.0F}, viewport, hand3dView_);
+        const auto axisY = projectHand3dPoint({0.0F, 0.07F, 0.0F}, viewport, hand3dView_);
+        const auto axisZ = projectHand3dPoint({0.0F, 0.0F, 0.07F}, viewport, hand3dView_);
+        d2dContext_->DrawLine(toD2dPoint(axisOrigin.position), toD2dPoint(axisX.position),
+            plotXAxisBrush_.Get(), 2.0F);
+        d2dContext_->DrawLine(toD2dPoint(axisOrigin.position), toD2dPoint(axisY.position),
+            plotYAxisBrush_.Get(), 2.0F);
+        d2dContext_->DrawLine(toD2dPoint(axisOrigin.position), toD2dPoint(axisZ.position),
+            plotZAxisBrush_.Get(), 2.0F);
+
+        const auto projection = projectHand3d(packet.perception.hand, viewport, hand3dView_);
+        if (!projection.valid)
+        {
+            return;
+        }
+
+        struct ProjectedBone
+        {
+            int start{0};
+            int end{0};
+            float depth{0.0F};
+        };
+        std::array<ProjectedBone, kHandConnections.size()> bones{};
+        for (std::size_t index = 0; index < kHandConnections.size(); ++index)
+        {
+            const auto connection = kHandConnections[index];
+            bones[index] = {connection[0], connection[1],
+                (projection.points[connection[0]].depth
+                    + projection.points[connection[1]].depth) * 0.5F};
+        }
+        std::sort(bones.begin(), bones.end(), [](const auto& left, const auto& right)
+        {
+            return left.depth < right.depth;
+        });
+        for (const auto& bone : bones)
+        {
+            d2dContext_->DrawLine(
+                toD2dPoint(projection.points[bone.start].position),
+                toD2dPoint(projection.points[bone.end].position),
+                handBrush_.Get(),
+                2.0F);
+        }
+
+        if (projection.hasPalmDirection)
+        {
+            d2dContext_->DrawLine(
+                toD2dPoint(projection.palmCenter.position),
+                toD2dPoint(projection.palmDirectionTip.position),
+                palmDirectionBrush_.Get(),
+                3.0F);
+            d2dContext_->DrawEllipse(
+                D2D1::Ellipse(toD2dPoint(projection.palmCenter.position), 5.0F, 5.0F),
+                palmDirectionBrush_.Get(),
+                2.0F);
+            d2dContext_->FillEllipse(
+                D2D1::Ellipse(
+                    toD2dPoint(projection.palmDirectionTip.position), 5.0F, 5.0F),
+                palmDirectionBrush_.Get());
+        }
+
+        std::array<int, 21> pointOrder{};
+        for (int index = 0; index < static_cast<int>(pointOrder.size()); ++index)
+        {
+            pointOrder[static_cast<std::size_t>(index)] = index;
+        }
+        std::sort(pointOrder.begin(), pointOrder.end(), [&projection](const int left, const int right)
+        {
+            return projection.points[left].depth < projection.points[right].depth;
+        });
+        for (const int index : pointOrder)
+        {
+            const auto& point = projection.points[index];
+            const float radius = std::clamp(4.2F - point.depth * 10.0F, 3.0F, 5.5F);
+            d2dContext_->FillEllipse(
+                D2D1::Ellipse(toD2dPoint(point.position), radius, radius),
+                handBrush_.Get());
+        }
+    }
+
     HWND hwnd_{nullptr};
     std::uint32_t width_{0};
     std::uint32_t height_{0};
     std::uint32_t cameraWidth_{0};
     std::uint32_t cameraHeight_{0};
+    bool cameraBitmapIsGpuSurface_{false};
     std::optional<std::uint64_t> uploadedFrameId_;
+    Hand3dView hand3dView_{};
     ComPtr<ID3D11Device> d3dDevice_;
     ComPtr<ID3D11DeviceContext> d3dContext_;
+    std::shared_ptr<runtime::D3d11Device> sharedDevice_;
     ComPtr<IDXGISwapChain1> swapChain_;
     ComPtr<ID2D1Factory1> d2dFactory_;
     ComPtr<ID2D1Device> d2dDevice_;
     ComPtr<ID2D1DeviceContext> d2dContext_;
     ComPtr<ID2D1Bitmap1> targetBitmap_;
     ComPtr<ID2D1Bitmap1> cameraBitmap_;
+    ComPtr<ID3D11Texture2D> gpuCopyTexture_;
     ComPtr<ID2D1SolidColorBrush> palmBrush_;
     ComPtr<ID2D1SolidColorBrush> handBrush_;
+    ComPtr<ID2D1SolidColorBrush> plotGridBrush_;
+    ComPtr<ID2D1SolidColorBrush> plotXAxisBrush_;
+    ComPtr<ID2D1SolidColorBrush> plotYAxisBrush_;
+    ComPtr<ID2D1SolidColorBrush> plotZAxisBrush_;
+    ComPtr<ID2D1SolidColorBrush> palmDirectionBrush_;
 };
 
 D3d11D2dRenderer::D3d11D2dRenderer() : impl_{std::make_unique<Impl>()} {}
 D3d11D2dRenderer::~D3d11D2dRenderer() = default;
 
 bool D3d11D2dRenderer::initialize(
+    std::shared_ptr<runtime::D3d11Device> d3dDevice,
     const HWND hwnd,
     const std::uint32_t width,
     const std::uint32_t height,
     std::string& error)
 {
-    return impl_->initialize(hwnd, width, height, error);
+    return impl_->initialize(std::move(d3dDevice), hwnd, width, height, error);
 }
 
 bool D3d11D2dRenderer::resize(
@@ -515,11 +852,22 @@ bool D3d11D2dRenderer::resize(
     return impl_->resize(width, height, error);
 }
 
+void D3d11D2dRenderer::setHand3dView(const Hand3dView view) noexcept
+{
+    impl_->setHand3dView(view);
+}
+
 bool D3d11D2dRenderer::render(
     const RenderPacket& packet,
     RenderPresentation& presentation,
     std::string& error)
 {
+    if (packet.frame == nullptr)
+    {
+        error = "Render packet has no frame.";
+        return false;
+    }
+    std::lock_guard gpuAccessLock{packet.frame->gpuAccessMutex()};
     return impl_->render(packet, presentation, error);
 }
 }

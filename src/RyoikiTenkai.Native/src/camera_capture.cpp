@@ -6,6 +6,7 @@
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
+#include <mfobjects.h>
 #include <wrl/client.h>
 
 #include <chrono>
@@ -95,6 +96,9 @@ struct CameraCapture::Impl
     bool mediaFoundationStarted{false};
     ComPtr<IMFMediaSource> mediaSource;
     ComPtr<IMFSourceReader> sourceReader;
+    ComPtr<IMFDXGIDeviceManager> dxgiDeviceManager;
+    std::shared_ptr<ryoiki::runtime::D3d11Device> d3dDevice;
+    UINT dxgiResetToken{0};
     std::uint32_t width{0};
     std::uint32_t height{0};
     LONG defaultStride{0};
@@ -127,7 +131,9 @@ CameraCapture::CameraCapture() : impl_{std::make_unique<Impl>()}
 
 CameraCapture::~CameraCapture() = default;
 
-bool CameraCapture::initialize(std::string& error)
+bool CameraCapture::initialize(
+    std::shared_ptr<ryoiki::runtime::D3d11Device> d3dDevice,
+    std::string& error)
 {
     const HRESULT comResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (failed(comResult, "CoInitializeEx", error))
@@ -142,6 +148,7 @@ bool CameraCapture::initialize(std::string& error)
         return false;
     }
     impl_->mediaFoundationStarted = true;
+    impl_->d3dDevice = std::move(d3dDevice);
 
     ComPtr<IMFAttributes> deviceAttributes;
     HRESULT result = MFCreateAttributes(&deviceAttributes, 1);
@@ -200,16 +207,48 @@ bool CameraCapture::initialize(std::string& error)
     }
 
     ComPtr<IMFAttributes> readerAttributes;
-    result = MFCreateAttributes(&readerAttributes, 1);
+    result = MFCreateAttributes(&readerAttributes, 4);
     if (failed(result, "Create source reader attributes", error))
     {
         return false;
     }
 
-    result = readerAttributes->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
-    if (failed(result, "Enable source reader video processing", error))
+    if (impl_->d3dDevice != nullptr)
     {
-        return false;
+        result = MFCreateDXGIDeviceManager(
+            &impl_->dxgiResetToken, &impl_->dxgiDeviceManager);
+        if (failed(result, "MFCreateDXGIDeviceManager", error))
+        {
+            return false;
+        }
+        result = impl_->dxgiDeviceManager->ResetDevice(
+            impl_->d3dDevice->device(), impl_->dxgiResetToken);
+        if (failed(result, "IMFDXGIDeviceManager::ResetDevice", error))
+        {
+            return false;
+        }
+        result = readerAttributes->SetUnknown(
+            MF_SOURCE_READER_D3D_MANAGER, impl_->dxgiDeviceManager.Get());
+        if (failed(result, "Set source reader D3D manager", error))
+        {
+            return false;
+        }
+        result = readerAttributes->SetUINT32(
+            MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, TRUE);
+        if (failed(result, "Enable advanced video processing", error))
+        {
+            return false;
+        }
+        readerAttributes->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
+    }
+    else
+    {
+        result = readerAttributes->SetUINT32(
+            MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
+        if (failed(result, "Enable source reader video processing", error))
+        {
+            return false;
+        }
     }
 
     result = MFCreateSourceReaderFromMediaSource(
@@ -236,7 +275,7 @@ bool CameraCapture::initialize(std::string& error)
     }
 
     if (failed(outputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video), "Set video major type", error)
-        || failed(outputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32), "Set RGB32 subtype", error))
+        || failed(outputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_ARGB32), "Set ARGB32 subtype", error))
     {
         return false;
     }
@@ -245,7 +284,7 @@ bool CameraCapture::initialize(std::string& error)
         kVideoStream,
         nullptr,
         outputType.Get());
-    if (failed(result, "Set source reader RGB32 output", error))
+    if (failed(result, "Set source reader ARGB32 output", error))
     {
         return false;
     }
@@ -320,6 +359,10 @@ bool CameraCapture::readFrame(
     ryoiki::runtime::FrameRotation& orientation,
     double& cameraWaitMs,
     double& frameCopyMs,
+    ComPtr<ID3D11Texture2D>& gpuTexture,
+    std::uint32_t& gpuTextureSubresource,
+    ComPtr<IUnknown>& gpuSampleOwner,
+    const bool copyToCpu,
     std::string& error)
 {
     using clock = std::chrono::steady_clock;
@@ -366,11 +409,40 @@ bool CameraCapture::readFrame(
     const auto waitCompleted = clock::now();
     cameraWaitMs = std::chrono::duration<double, std::milli>(waitCompleted - waitStarted).count();
 
+    gpuTexture.Reset();
+    gpuSampleOwner.Reset();
+    gpuTextureSubresource = 0;
+
     ComPtr<IMFMediaBuffer> buffer;
     HRESULT result = sample->ConvertToContiguousBuffer(&buffer);
     if (failed(result, "Convert camera sample buffer", error))
     {
         return false;
+    }
+
+    ComPtr<IMFDXGIBuffer> dxgiBuffer;
+    if (SUCCEEDED(buffer.As(&dxgiBuffer)))
+    {
+        UINT subresource = 0;
+        if (SUCCEEDED(dxgiBuffer->GetResource(IID_PPV_ARGS(&gpuTexture)))
+            && SUCCEEDED(dxgiBuffer->GetSubresourceIndex(&subresource)))
+        {
+            gpuTextureSubresource = subresource;
+            gpuSampleOwner = sample;
+        }
+        else
+        {
+            gpuTexture.Reset();
+        }
+    }
+
+    if (gpuTexture != nullptr && !copyToCpu)
+    {
+        width = impl_->width;
+        height = impl_->height;
+        orientation = impl_->rotation;
+        frameCopyMs = 0.0;
+        return true;
     }
 
     const auto requiredBytes64 = static_cast<std::uint64_t>(impl_->width)

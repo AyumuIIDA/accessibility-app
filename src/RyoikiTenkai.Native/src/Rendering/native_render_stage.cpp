@@ -10,6 +10,7 @@ NativeRenderStage::~NativeRenderStage()
 }
 
 bool NativeRenderStage::start(
+    std::shared_ptr<runtime::D3d11Device> d3dDevice,
     const HWND hwnd,
     const std::uint32_t width,
     const std::uint32_t height,
@@ -25,12 +26,17 @@ bool NativeRenderStage::start(
         initializationError_.clear();
         latestPacket_.reset();
         lastPresentedPacket_.reset();
+        latestFrame_.reset();
+        latestPerception_ = {};
+        latestPerceptionFrameId_ = 0;
         pendingResize_.reset();
+        pendingHand3dView_.reset();
         redrawRequested_ = false;
         presentationCallback_ = std::move(presentationCallback);
         errorCallback_ = std::move(errorCallback);
     }
-    worker_ = std::thread{&NativeRenderStage::run, this, hwnd, width, height};
+    worker_ = std::thread{
+        &NativeRenderStage::run, this, std::move(d3dDevice), hwnd, width, height};
 
     std::unique_lock lock{mutex_};
     condition_.wait(lock, [this]
@@ -61,7 +67,11 @@ void NativeRenderStage::stop()
     std::lock_guard lock{mutex_};
     latestPacket_.reset();
     lastPresentedPacket_.reset();
+    latestFrame_.reset();
+    latestPerception_ = {};
+    latestPerceptionFrameId_ = 0;
     pendingResize_.reset();
+    pendingHand3dView_.reset();
     presentationCallback_ = {};
     errorCallback_ = {};
     initialized_ = false;
@@ -75,7 +85,47 @@ void NativeRenderStage::publish(RenderPacket packet)
         {
             return;
         }
+        latestFrame_ = packet.frame;
+        latestPerception_ = packet.perception;
+        latestPerceptionFrameId_ = packet.perceptionFrameId;
         latestPacket_ = std::move(packet);
+    }
+    condition_.notify_one();
+}
+
+void NativeRenderStage::publishFrame(
+    std::shared_ptr<const buffers::FrameBuffer> frame)
+{
+    {
+        std::lock_guard lock{mutex_};
+        if (stopping_ || !initialized_ || frame == nullptr)
+        {
+            return;
+        }
+        latestFrame_ = std::move(frame);
+        latestPacket_ = RenderPacket{
+            latestFrame_, latestPerception_, latestPerceptionFrameId_};
+    }
+    condition_.notify_one();
+}
+
+void NativeRenderStage::publishPerception(
+    hand_perception::HandPerceptionResult perception,
+    const std::uint64_t sourceFrameId)
+{
+    {
+        std::lock_guard lock{mutex_};
+        if (stopping_ || !initialized_)
+        {
+            return;
+        }
+        latestPerception_ = std::move(perception);
+        latestPerceptionFrameId_ = sourceFrameId;
+        if (latestFrame_ != nullptr)
+        {
+            latestPacket_ = RenderPacket{
+                latestFrame_, latestPerception_, latestPerceptionFrameId_};
+        }
     }
     condition_.notify_one();
 }
@@ -107,14 +157,29 @@ void NativeRenderStage::requestRedraw()
     condition_.notify_one();
 }
 
+void NativeRenderStage::updateHand3dView(const Hand3dView view)
+{
+    {
+        std::lock_guard lock{mutex_};
+        if (stopping_ || !initialized_)
+        {
+            return;
+        }
+        pendingHand3dView_ = view;
+        redrawRequested_ = true;
+    }
+    condition_.notify_one();
+}
+
 void NativeRenderStage::run(
+    std::shared_ptr<runtime::D3d11Device> d3dDevice,
     const HWND hwnd,
     const std::uint32_t width,
     const std::uint32_t height)
 {
     D3d11D2dRenderer renderer;
     std::string error;
-    if (!renderer.initialize(hwnd, width, height, error))
+    if (!renderer.initialize(std::move(d3dDevice), hwnd, width, height, error))
     {
         std::lock_guard lock{mutex_};
         initializationError_ = error.empty()
@@ -133,6 +198,7 @@ void NativeRenderStage::run(
     {
         std::optional<RenderPacket> packet;
         std::optional<PixelSize> resizeCommand;
+        std::optional<Hand3dView> hand3dViewCommand;
         PresentationCallback presentationCallback;
         ErrorCallback errorCallback;
         {
@@ -140,7 +206,8 @@ void NativeRenderStage::run(
             condition_.wait(lock, [this]
             {
                 return stopping_ || latestPacket_.has_value()
-                    || pendingResize_.has_value() || redrawRequested_;
+                    || pendingResize_.has_value() || pendingHand3dView_.has_value()
+                    || redrawRequested_;
             });
             if (stopping_)
             {
@@ -149,6 +216,8 @@ void NativeRenderStage::run(
 
             resizeCommand = pendingResize_;
             pendingResize_.reset();
+            hand3dViewCommand = pendingHand3dView_;
+            pendingHand3dView_.reset();
             if (latestPacket_.has_value())
             {
                 lastPresentedPacket_ = std::move(latestPacket_);
@@ -166,6 +235,10 @@ void NativeRenderStage::run(
         }
 
         error.clear();
+        if (hand3dViewCommand.has_value())
+        {
+            renderer.setHand3dView(*hand3dViewCommand);
+        }
         if (resizeCommand.has_value())
         {
             suspended = resizeCommand->width == 0 || resizeCommand->height == 0;

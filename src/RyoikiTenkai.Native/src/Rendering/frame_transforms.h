@@ -20,12 +20,28 @@ struct FrameTransforms
     float contentHeight{0.0F};
 };
 
+struct ViewportRect
+{
+    std::uint32_t left{0};
+    std::uint32_t top{0};
+    std::uint32_t width{0};
+    std::uint32_t height{0};
+};
+
 [[nodiscard]] bool createFrameTransforms(
     std::uint32_t storageWidth,
     std::uint32_t storageHeight,
     runtime::FrameRotation rotation,
     std::uint32_t viewportWidth,
     std::uint32_t viewportHeight,
+    bool mirrorHorizontally,
+    FrameTransforms& result) noexcept;
+
+[[nodiscard]] bool createFrameTransforms(
+    std::uint32_t storageWidth,
+    std::uint32_t storageHeight,
+    runtime::FrameRotation rotation,
+    ViewportRect viewport,
     bool mirrorHorizontally,
     FrameTransforms& result) noexcept;
 }

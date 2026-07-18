@@ -1,6 +1,11 @@
-#include "HandPerception/ModelRunners/cpu_hand_landmark_runner.h"
+#include "HandPerception/ModelRunners/ort_hand_landmark_runner.h"
+#include "HandPerception/ModelRunners/calibration_tensor_capture.h"
 
 #include <onnxruntime_cxx_api.h>
+#if defined(RYOIKI_ORT_DIRECTML)
+#include <dml_provider_factory.h>
+#include "Runtime/directml_runtime.h"
+#endif
 
 #include <array>
 #include <chrono>
@@ -18,12 +23,16 @@ constexpr std::array<std::int64_t, 2> kLandmarkShape{1, 63};
 constexpr std::array<std::int64_t, 2> kScalarShape{1, 1};
 }
 
-struct CpuHandLandmarkRunner::Impl
+struct OrtHandLandmarkRunner::Impl
 {
     Impl(
         const std::filesystem::path& modelPath,
-        const HandLandmarkModelContract& contract)
-        : environment{ORT_LOGGING_LEVEL_WARNING, "RyoikiTenkai"}
+        const HandLandmarkModelContract& contract,
+        const OrtSessionConfiguration& configuration)
+        : environment{ORT_LOGGING_LEVEL_WARNING, "RyoikiTenkai"},
+          executionProvider{configuration.executionProvider()},
+          providerName{configuration.providerName()},
+          directMlRuntime{configuration.directMlRuntime()}
     {
         if (!std::filesystem::is_regular_file(modelPath))
         {
@@ -32,6 +41,7 @@ struct CpuHandLandmarkRunner::Impl
 
         sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
         sessionOptions.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+        configuration.apply(sessionOptions);
         session = std::make_unique<Ort::Session>(environment, modelPath.c_str(), sessionOptions);
 
         const auto requiredInputShape = std::vector<std::int64_t>{
@@ -101,25 +111,39 @@ struct CpuHandLandmarkRunner::Impl
     std::unique_ptr<Ort::Session> session;
     std::string inputNameStorage;
     std::array<std::string, 4> outputNames{};
+    ExecutionProvider executionProvider{ExecutionProvider::Cpu};
+    std::string providerName;
+    CalibrationTensorCapture calibrationCapture{"hand", kInputShape};
+    std::shared_ptr<runtime::DirectMlRuntime> directMlRuntime;
 };
 
-std::unique_ptr<CpuHandLandmarkRunner> CpuHandLandmarkRunner::create(
+std::unique_ptr<OrtHandLandmarkRunner> OrtHandLandmarkRunner::create(
     const std::filesystem::path& modelPath,
     std::string& error)
 {
     return create(modelPath, HandLandmarkModelContract::openCvZoo2023(), error);
 }
 
-std::unique_ptr<CpuHandLandmarkRunner> CpuHandLandmarkRunner::create(
+std::unique_ptr<OrtHandLandmarkRunner> OrtHandLandmarkRunner::create(
     const std::filesystem::path& modelPath,
     const HandLandmarkModelContract& contract,
+    std::string& error)
+{
+    return create(modelPath, contract, OrtSessionConfiguration::cpu(), error);
+}
+
+std::unique_ptr<OrtHandLandmarkRunner> OrtHandLandmarkRunner::create(
+    const std::filesystem::path& modelPath,
+    const HandLandmarkModelContract& contract,
+    const OrtSessionConfiguration& configuration,
     std::string& error)
 {
     try
     {
         error.clear();
-        return std::unique_ptr<CpuHandLandmarkRunner>{
-            new CpuHandLandmarkRunner{std::make_unique<Impl>(modelPath, contract)}};
+        return std::unique_ptr<OrtHandLandmarkRunner>{
+            new OrtHandLandmarkRunner{
+                std::make_unique<Impl>(modelPath, contract, configuration)}};
     }
     catch (const Ort::Exception& exception)
     {
@@ -133,24 +157,24 @@ std::unique_ptr<CpuHandLandmarkRunner> CpuHandLandmarkRunner::create(
     }
 }
 
-CpuHandLandmarkRunner::CpuHandLandmarkRunner(std::unique_ptr<Impl> impl)
+OrtHandLandmarkRunner::OrtHandLandmarkRunner(std::unique_ptr<Impl> impl)
     : impl_{std::move(impl)}
 {
 }
 
-CpuHandLandmarkRunner::~CpuHandLandmarkRunner() = default;
+OrtHandLandmarkRunner::~OrtHandLandmarkRunner() = default;
 
-ExecutionProvider CpuHandLandmarkRunner::executionProvider() const noexcept
+ExecutionProvider OrtHandLandmarkRunner::executionProvider() const noexcept
 {
-    return ExecutionProvider::Cpu;
+    return impl_->executionProvider;
 }
 
-std::string_view CpuHandLandmarkRunner::providerName() const noexcept
+std::string_view OrtHandLandmarkRunner::providerName() const noexcept
 {
-    return "CPUExecutionProvider";
+    return impl_->providerName;
 }
 
-bool CpuHandLandmarkRunner::run(
+bool OrtHandLandmarkRunner::run(
     const buffers::FloatTensorBuffer& input,
     HandLandmarkRawOutput& output,
     ModelRunResult& result,
@@ -165,14 +189,32 @@ bool CpuHandLandmarkRunner::run(
 
     try
     {
+        if (input.gpuResource() == nullptr) impl_->calibrationCapture.capture(input);
         const auto started = clock::now();
         auto memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-        auto inputValue = Ort::Value::CreateTensor<float>(
-            memoryInfo,
-            const_cast<float*>(input.data()),
-            input.elementCount(),
-            kInputShape.data(),
-            kInputShape.size());
+        void* dmlAllocation = nullptr;
+        Ort::Value inputValue{nullptr};
+        if (input.gpuResource() != nullptr && impl_->directMlRuntime != nullptr)
+        {
+#if defined(RYOIKI_ORT_DIRECTML)
+            impl_->directMlRuntime->waitForPreprocess(input.readyFenceValue());
+            const OrtDmlApi* dmlApi = nullptr;
+            Ort::ThrowOnError(Ort::GetApi().GetExecutionProviderApi(
+                "DML", ORT_API_VERSION, reinterpret_cast<const void**>(&dmlApi)));
+            Ort::ThrowOnError(dmlApi->CreateGPUAllocationFromD3DResource(
+                input.gpuResource(), &dmlAllocation));
+            Ort::MemoryInfo dmlMemory{"DML", OrtDeviceAllocator, 0, OrtMemTypeDefault};
+            inputValue = Ort::Value::CreateTensor(
+                dmlMemory, dmlAllocation, input.elementCount() * sizeof(float),
+                kInputShape.data(), kInputShape.size(), ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
+#endif
+        }
+        else
+        {
+            inputValue = Ort::Value::CreateTensor<float>(
+                memoryInfo, const_cast<float*>(input.data()), input.elementCount(),
+                kInputShape.data(), kInputShape.size());
+        }
 
         float presence = 0.0F;
         float handedness = 0.0F;
@@ -192,6 +234,15 @@ bool CpuHandLandmarkRunner::run(
         impl_->session->Run(
             Ort::RunOptions{nullptr}, inputNames, &inputValue, 1,
             outputNames.data(), outputValues.data(), outputValues.size());
+#if defined(RYOIKI_ORT_DIRECTML)
+        if (dmlAllocation != nullptr)
+        {
+            const OrtDmlApi* dmlApi = nullptr;
+            Ort::ThrowOnError(Ort::GetApi().GetExecutionProviderApi(
+                "DML", ORT_API_VERSION, reinterpret_cast<const void**>(&dmlApi)));
+            dmlApi->FreeGPUAllocation(dmlAllocation);
+        }
+#endif
         output.presence = presence;
         output.handedness = handedness;
         result.inferenceMs = std::chrono::duration<double, std::milli>(

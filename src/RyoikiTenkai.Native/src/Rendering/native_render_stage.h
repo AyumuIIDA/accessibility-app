@@ -2,6 +2,7 @@
 
 #include "Rendering/d3d11_d2d_renderer.h"
 #include "Rendering/render_packet.h"
+#include "Runtime/d3d11_device.h"
 
 #include <Windows.h>
 
@@ -27,6 +28,7 @@ public:
     NativeRenderStage& operator=(const NativeRenderStage&) = delete;
 
     [[nodiscard]] bool start(
+        std::shared_ptr<runtime::D3d11Device> d3dDevice,
         HWND hwnd,
         std::uint32_t width,
         std::uint32_t height,
@@ -35,7 +37,12 @@ public:
         std::string& error);
     void stop();
     void publish(RenderPacket packet);
+    void publishFrame(std::shared_ptr<const buffers::FrameBuffer> frame);
+    void publishPerception(
+        hand_perception::HandPerceptionResult perception,
+        std::uint64_t sourceFrameId);
     void resize(std::uint32_t width, std::uint32_t height);
+    void updateHand3dView(Hand3dView view);
     void requestRedraw();
 
 private:
@@ -45,13 +52,21 @@ private:
         std::uint32_t height{0};
     };
 
-    void run(HWND hwnd, std::uint32_t width, std::uint32_t height);
+    void run(
+        std::shared_ptr<runtime::D3d11Device> d3dDevice,
+        HWND hwnd,
+        std::uint32_t width,
+        std::uint32_t height);
 
     std::mutex mutex_;
     std::condition_variable condition_;
     std::optional<RenderPacket> latestPacket_;
     std::optional<RenderPacket> lastPresentedPacket_;
+    std::shared_ptr<const buffers::FrameBuffer> latestFrame_;
+    hand_perception::HandPerceptionResult latestPerception_{};
+    std::uint64_t latestPerceptionFrameId_{0};
     std::optional<PixelSize> pendingResize_;
+    std::optional<Hand3dView> pendingHand3dView_;
     PresentationCallback presentationCallback_;
     ErrorCallback errorCallback_;
     std::thread worker_;

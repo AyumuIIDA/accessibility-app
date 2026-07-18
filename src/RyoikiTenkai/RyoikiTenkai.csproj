@@ -13,8 +13,16 @@
     </Content>
   </ItemGroup>
 
-  <ItemGroup>
-    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.27.0" />
+  <PropertyGroup>
+    <NativeInferenceBackend Condition="'$(NativeInferenceBackend)' == ''">qnn</NativeInferenceBackend>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(NativeInferenceBackend)' == 'qnn'">
+    <PackageReference Include="Microsoft.ML.OnnxRuntime.QNN" Version="1.24.4" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(NativeInferenceBackend)' == 'directml'">
+    <PackageReference Include="Microsoft.ML.OnnxRuntime.DirectML" Version="1.24.4" />
   </ItemGroup>
 
 </Project>

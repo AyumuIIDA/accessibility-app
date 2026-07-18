@@ -10,7 +10,18 @@ project(RyoikiTenkaiNative LANGUAGES CXX)
 
 find_package(OpenCV CONFIG REQUIRED COMPONENTS core imgproc)
 
-set(ONNXRUNTIME_VERSION "1.27.0" CACHE STRING "ONNX Runtime NuGet package version")
+set(RYOIKI_ORT_BACKEND "qnn" CACHE STRING "ONNX Runtime distribution: qnn or directml")
+set_property(CACHE RYOIKI_ORT_BACKEND PROPERTY STRINGS qnn directml)
+if(RYOIKI_ORT_BACKEND STREQUAL "directml")
+    set(_default_onnxruntime_package "microsoft.ml.onnxruntime.directml")
+elseif(RYOIKI_ORT_BACKEND STREQUAL "qnn")
+    set(_default_onnxruntime_package "microsoft.ml.onnxruntime.qnn")
+else()
+    message(FATAL_ERROR "RYOIKI_ORT_BACKEND must be 'qnn' or 'directml'.")
+endif()
+set(ONNXRUNTIME_PACKAGE_NAME "${_default_onnxruntime_package}" CACHE STRING
+    "ONNX Runtime NuGet package name" FORCE)
+set(ONNXRUNTIME_VERSION "1.24.4" CACHE STRING "ONNX Runtime NuGet package version")
 if(NOT DEFINED ONNXRUNTIME_ROOT)
     if(DEFINED ENV{NUGET_PACKAGES})
         set(_nuget_packages "$ENV{NUGET_PACKAGES}")
@@ -19,10 +30,11 @@ if(NOT DEFINED ONNXRUNTIME_ROOT)
     endif()
     if(DEFINED _nuget_packages)
         set(ONNXRUNTIME_ROOT
-            "${_nuget_packages}/microsoft.ml.onnxruntime/${ONNXRUNTIME_VERSION}"
+            "${_nuget_packages}/${ONNXRUNTIME_PACKAGE_NAME}/${ONNXRUNTIME_VERSION}"
             CACHE PATH "ONNX Runtime NuGet package root")
     endif()
 endif()
+cmake_path(CONVERT "${ONNXRUNTIME_ROOT}" TO_CMAKE_PATH_LIST ONNXRUNTIME_ROOT NORMALIZE)
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64)$")
     set(_onnxruntime_rid "win-arm64")
@@ -30,14 +42,18 @@ else()
     set(_onnxruntime_rid "win-x64")
 endif()
 
-find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
-    PATHS "${ONNXRUNTIME_ROOT}/build/native/include"
-    NO_DEFAULT_PATH
-    REQUIRED)
-find_library(ONNXRUNTIME_LIBRARY onnxruntime
-    PATHS "${ONNXRUNTIME_ROOT}/runtimes/${_onnxruntime_rid}/native"
-    NO_DEFAULT_PATH
-    REQUIRED)
+set(ONNXRUNTIME_INCLUDE_DIR "${ONNXRUNTIME_ROOT}/build/native/include")
+set(ONNXRUNTIME_LIBRARY
+    "${ONNXRUNTIME_ROOT}/runtimes/${_onnxruntime_rid}/native/onnxruntime.lib")
+if(NOT EXISTS "${ONNXRUNTIME_INCLUDE_DIR}/onnxruntime_cxx_api.h")
+    message(FATAL_ERROR
+        "ONNX Runtime headers were not found below ONNXRUNTIME_ROOT='${ONNXRUNTIME_ROOT}'.")
+endif()
+if(NOT EXISTS "${ONNXRUNTIME_LIBRARY}")
+    message(FATAL_ERROR
+        "ONNX Runtime import library was not found for ${_onnxruntime_rid} below "
+        "ONNXRUNTIME_ROOT='${ONNXRUNTIME_ROOT}'.")
+endif()
 
 add_library(onnxruntime SHARED IMPORTED GLOBAL)
 set_target_properties(onnxruntime PROPERTIES
@@ -46,11 +62,25 @@ set_target_properties(onnxruntime PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${ONNXRUNTIME_INCLUDE_DIR}"
 )
 
+file(GLOB _onnxruntime_runtime_files CONFIGURE_DEPENDS
+    "${ONNXRUNTIME_ROOT}/runtimes/${_onnxruntime_rid}/native/*.dll"
+    "${ONNXRUNTIME_ROOT}/runtimes/${_onnxruntime_rid}/native/*.so"
+    "${ONNXRUNTIME_ROOT}/runtimes/${_onnxruntime_rid}/native/*.cat")
+
+function(copy_onnxruntime_runtime target_name)
+    add_custom_command(TARGET ${target_name} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${_onnxruntime_runtime_files}
+            "$<TARGET_FILE_DIR:${target_name}>"
+        COMMAND_EXPAND_LISTS)
+endfunction()
+
 add_library(RyoikiTenkai.VisionCore STATIC
     src/Buffers/frame_buffer.cpp
     src/Buffers/frame_pool.cpp
     src/Buffers/tensor_buffer.cpp
     src/Geometry/geometry_types.cpp
+    src/Geometry/d3d11_hand_geometry_processor.cpp
     src/Geometry/hand_geometry_processor.cpp
     src/HandPerception/MediaPipeGraph/hand_landmark_graph.cpp
     src/HandPerception/MediaPipeGraph/hand_landmarks_to_roi.cpp
@@ -58,16 +88,20 @@ add_library(RyoikiTenkai.VisionCore STATIC
     src/HandPerception/MediaPipeGraph/palm_detection_graph.cpp
     src/HandPerception/MediaPipeGraph/palm_detection_postprocessor.cpp
     src/HandPerception/MediaPipeGraph/palm_detection_to_roi.cpp
-    src/HandPerception/ModelRunners/cpu_hand_landmark_runner.cpp
-    src/HandPerception/ModelRunners/cpu_palm_detection_runner.cpp
+    src/HandPerception/ModelRunners/ort_hand_landmark_runner.cpp
+    src/HandPerception/ModelRunners/ort_palm_detection_runner.cpp
+    src/HandPerception/ModelRunners/ort_session_configuration.cpp
+    src/HandPerception/ModelRunners/calibration_tensor_capture.cpp
     src/HandPerception/ModelRunners/hand_landmark_runner.h
     src/HandPerception/ModelRunners/hand_landmark_model_contract.cpp
     src/HandPerception/ModelRunners/palm_detection_runner.cpp
     src/Pipeline/latest_frame_slot.cpp
     src/Pipeline/perception_mailbox.cpp
     src/Rendering/frame_transforms.cpp
+    src/Rendering/hand_3d_plot.cpp
     src/Rendering/latest_render_packet_slot.cpp
     src/Runtime/camera_device_selection.cpp
+    src/Runtime/d3d11_device.cpp
     src/Runtime/frame_orientation.cpp
 )
 
@@ -77,10 +111,28 @@ target_include_directories(RyoikiTenkai.VisionCore PUBLIC
 
 target_compile_features(RyoikiTenkai.VisionCore PUBLIC cxx_std_20)
 
+if(RYOIKI_ORT_BACKEND STREQUAL "directml")
+    target_sources(RyoikiTenkai.VisionCore PRIVATE
+        src/Runtime/directml_runtime.cpp
+        src/Geometry/d3d12_hand_geometry_processor.cpp)
+    target_compile_definitions(RyoikiTenkai.VisionCore PUBLIC RYOIKI_ORT_DIRECTML=1)
+    set(DIRECTML_PACKAGE_ROOT "$ENV{USERPROFILE}/.nuget/packages/microsoft.ai.directml/1.15.4")
+    target_include_directories(RyoikiTenkai.VisionCore PUBLIC
+        "${DIRECTML_PACKAGE_ROOT}/include")
+    target_link_libraries(RyoikiTenkai.VisionCore PUBLIC
+        "${DIRECTML_PACKAGE_ROOT}/bin/arm64-win/DirectML.lib"
+        d3d12 dxgi)
+else()
+    target_compile_definitions(RyoikiTenkai.VisionCore PUBLIC RYOIKI_ORT_QNN=1)
+endif()
+
 target_link_libraries(RyoikiTenkai.VisionCore PUBLIC
     opencv_core
     opencv_imgproc
     onnxruntime
+    d3d11
+    d3dcompiler
+    d3d12
 )
 
 add_library(RyoikiTenkai.Native SHARED
@@ -121,6 +173,7 @@ endif()
 set_target_properties(RyoikiTenkai.Native PROPERTIES
     OUTPUT_NAME "RyoikiTenkai.Native"
 )
+copy_onnxruntime_runtime(RyoikiTenkai.Native)
 
 include(CTest)
 if (BUILD_TESTING)
@@ -134,11 +187,7 @@ if (BUILD_TESTING)
         target_compile_options(RyoikiTenkai.VisionCore.Tests PRIVATE /W4 /permissive- /EHsc)
     endif()
     add_test(NAME RyoikiTenkai.VisionCore.Tests COMMAND RyoikiTenkai.VisionCore.Tests)
-    add_custom_command(TARGET RyoikiTenkai.VisionCore.Tests POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "$<TARGET_FILE:onnxruntime>"
-            "$<TARGET_FILE_DIR:RyoikiTenkai.VisionCore.Tests>"
-    )
+    copy_onnxruntime_runtime(RyoikiTenkai.VisionCore.Tests)
 
     add_executable(RyoikiTenkai.HandPerception.Tests
         tests/hand_perception_tests.cpp
@@ -154,9 +203,5 @@ if (BUILD_TESTING)
         target_compile_options(RyoikiTenkai.HandPerception.Tests PRIVATE /W4 /permissive- /EHsc)
     endif()
     add_test(NAME RyoikiTenkai.HandPerception.Tests COMMAND RyoikiTenkai.HandPerception.Tests)
-    add_custom_command(TARGET RyoikiTenkai.HandPerception.Tests POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "$<TARGET_FILE:onnxruntime>"
-            "$<TARGET_FILE_DIR:RyoikiTenkai.HandPerception.Tests>"
-    )
+    copy_onnxruntime_runtime(RyoikiTenkai.HandPerception.Tests)
 endif()

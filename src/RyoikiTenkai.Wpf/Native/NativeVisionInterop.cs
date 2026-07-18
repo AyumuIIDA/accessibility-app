@@ -6,7 +6,7 @@ namespace RyoikiTenkai.Wpf.Native;
 internal static partial class NativeVisionInterop
 {
     public const string LibraryName = "RyoikiTenkai.Native";
-    public const uint AbiVersion = 4;
+    public const uint AbiVersion = 7;
 
     [LibraryImport(LibraryName, EntryPoint = "ryoiki_get_abi_version")]
     public static partial uint GetAbiVersion();
@@ -78,11 +78,21 @@ internal struct NativeVisionMetrics
     public double HandInferenceMs;
     public double LandmarkPostprocessMs;
     public double TrackingUpdateMs;
+    public double CameraUploadMs;
+    public double CameraDrawMs;
+    public double OverlayDrawMs;
+    public double Hand3dDrawMs;
+    public double EndDrawMs;
+    public double PresentWaitMs;
     public double OverlayRenderMs;
     public double EndToEndLatencyMs;
     public double NativeOverheadMs;
     public ulong FramePoolDroppedFrames;
     public ulong PerceptionDroppedFrames;
+    public ulong GpuCameraFrames;
+    public ulong GpuRenderedFrames;
+    public uint GpuCameraDxgiFormat;
+    public uint GpuCameraSubresource;
 }
 
 [StructLayout(LayoutKind.Sequential)]

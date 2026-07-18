@@ -1,6 +1,10 @@
 #pragma once
 
 #include "Runtime/frame_orientation.h"
+#include "Runtime/d3d11_device.h"
+
+#include <d3d11.h>
+#include <wrl/client.h>
 
 #include <cstdint>
 #include <memory>
@@ -18,7 +22,7 @@ public:
     CameraCapture(CameraCapture&&) = delete;
     CameraCapture& operator=(CameraCapture&&) = delete;
 
-    bool initialize(std::string& error);
+    bool initialize(std::shared_ptr<ryoiki::runtime::D3d11Device> d3dDevice, std::string& error);
     void requestStop() noexcept;
     bool readFrame(
         std::vector<std::uint8_t>& bgra,
@@ -27,6 +31,10 @@ public:
         ryoiki::runtime::FrameRotation& orientation,
         double& cameraWaitMs,
         double& frameCopyMs,
+        Microsoft::WRL::ComPtr<ID3D11Texture2D>& gpuTexture,
+        std::uint32_t& gpuTextureSubresource,
+        Microsoft::WRL::ComPtr<IUnknown>& gpuSampleOwner,
+        bool copyToCpu,
         std::string& error);
 
 private:

@@ -43,7 +43,16 @@
   <Target Name="CopyNativeRuntime"
           AfterTargets="Build"
           Condition="Exists('$(NativeRuntimeBuildDir)\RyoikiTenkai.Native.dll')">
+    <ItemGroup>
+      <NativeRuntimeDependency Include="$(NativeRuntimeBuildDir)\*.dll"
+                               Exclude="$(NativeRuntimeBuildDir)\RyoikiTenkai.Native.dll" />
+      <NativeRuntimeDependency Include="$(NativeRuntimeBuildDir)\*.so" />
+      <NativeRuntimeDependency Include="$(NativeRuntimeBuildDir)\*.cat" />
+    </ItemGroup>
     <Copy SourceFiles="$(NativeRuntimeBuildDir)\RyoikiTenkai.Native.dll"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(NativeRuntimeDependency)"
           DestinationFolder="$(OutDir)"
           SkipUnchangedFiles="true" />
   </Target>

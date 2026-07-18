@@ -10,7 +10,7 @@
 
 struct RyoikiHandle;
 
-inline constexpr std::uint32_t kRyoikiAbiVersion = 4;
+inline constexpr std::uint32_t kRyoikiAbiVersion = 7;
 inline constexpr std::int32_t kRyoikiStatusFailure = 0;
 inline constexpr std::int32_t kRyoikiStatusSuccess = 1;
 
@@ -33,11 +33,21 @@ struct RyoikiMetrics
     double hand_inference_ms;
     double landmark_postprocess_ms;
     double tracking_update_ms;
+    double camera_upload_ms;
+    double camera_draw_ms;
+    double overlay_draw_ms;
+    double hand_3d_draw_ms;
+    double end_draw_ms;
+    double present_wait_ms;
     double overlay_render_ms;
     double end_to_end_latency_ms;
     double native_overhead_ms;
     std::uint64_t frame_pool_dropped_frames;
     std::uint64_t perception_dropped_frames;
+    std::uint64_t gpu_camera_frames;
+    std::uint64_t gpu_rendered_frames;
+    std::uint32_t gpu_camera_dxgi_format;
+    std::uint32_t gpu_camera_subresource;
 };
 
 struct RyoikiHandResult

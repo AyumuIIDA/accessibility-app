@@ -1,5 +1,8 @@
 .dotnet/
 .nuget/
+.venv*/
+__pycache__/
+*.pyc
 .vs/
 build/
 bin/
@@ -8,3 +11,7 @@ obj/
 **/obj/
 **/out/
 **/vcpkg_installed/
+tmp/qnn-*/
+tmp/*-inference-metrics.csv
+src/RyoikiTenkai/models/*_qdq.onnx
+.tmp-*

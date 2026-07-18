@@ -1,12 +1,18 @@
 #include "Buffers/frame_pool.h"
 #include "Buffers/tensor_buffer.h"
 #include "Geometry/hand_geometry_processor.h"
+#include "Geometry/d3d11_hand_geometry_processor.h"
 #include "Pipeline/latest_frame_slot.h"
 #include "Pipeline/perception_mailbox.h"
 #include "Rendering/latest_render_packet_slot.h"
 #include "Rendering/frame_transforms.h"
+#include "Rendering/hand_3d_plot.h"
 #include "Runtime/camera_device_selection.h"
 #include "Runtime/frame_orientation.h"
+#include "Runtime/d3d11_device.h"
+
+#include <d3d11.h>
+#include <wrl/client.h>
 
 #include <array>
 #include <chrono>
@@ -14,6 +20,7 @@
 #include <cstdint>
 #include <future>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <vector>
@@ -179,6 +186,88 @@ void testPalmLetterboxAndRgbPacking()
     requireRgb(tensor, 0, 96, 192, 0.0F, 0.0F, 0.0F, "Tall-image left padding is not zero.");
     requireNear(result.transform.padLeft, 48.0F, 0.0001F, "Tall-image horizontal padding is incorrect.");
     requireNear(result.transform.padTop, 0.0F, 0.0001F, "Tall-image vertical padding is incorrect.");
+}
+
+void testGpuPreprocessMatchesCpuReference()
+{
+    std::string error;
+    auto device = ryoiki::runtime::D3d11Device::create(error);
+    require(device != nullptr, "D3D11 test device creation failed.");
+    auto gpuProcessor = ryoiki::geometry::D3d11HandGeometryProcessor::create(device, error);
+    require(gpuProcessor != nullptr, "GPU geometry processor creation failed.");
+
+    auto frame = createFrame(40, 64, 48, 0, 0, 0);
+    auto& pixels = frame->writablePixels();
+    for (std::uint32_t y = 0; y < frame->height(); ++y)
+    {
+        for (std::uint32_t x = 0; x < frame->width(); ++x)
+        {
+            const auto offset = static_cast<std::size_t>((y * frame->width() + x) * 4U);
+            pixels[offset] = static_cast<std::uint8_t>((x * 3U + y) & 0xffU);
+            pixels[offset + 1] = static_cast<std::uint8_t>((x + y * 5U) & 0xffU);
+            pixels[offset + 2] = static_cast<std::uint8_t>((x * 2U + y * 3U) & 0xffU);
+            pixels[offset + 3] = 255;
+        }
+    }
+    D3D11_TEXTURE2D_DESC description{};
+    description.Width = frame->width();
+    description.Height = frame->height();
+    description.MipLevels = 1;
+    description.ArraySize = 1;
+    description.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    description.SampleDesc.Count = 1;
+    description.Usage = D3D11_USAGE_DEFAULT;
+    description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA initialData{};
+    initialData.pSysMem = pixels.data();
+    initialData.SysMemPitch = frame->stride();
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+    require(SUCCEEDED(device->device()->CreateTexture2D(
+        &description, &initialData, &texture)), "GPU test texture creation failed.");
+    require(frame->attachGpuResource(texture, 0, {}), "GPU test texture attachment failed.");
+
+    ryoiki::geometry::HandGeometryProcessor cpuProcessor;
+    ryoiki::buffers::FloatTensorBuffer cpuPalm{{1, 192, 192, 3}};
+    ryoiki::buffers::FloatTensorBuffer gpuPalm{{1, 192, 192, 3}};
+    ryoiki::geometry::PalmPreprocessResult cpuPalmResult{};
+    ryoiki::geometry::PalmPreprocessResult gpuPalmResult{};
+    require(cpuProcessor.preprocessPalm(*frame, cpuPalm, cpuPalmResult),
+        "CPU palm reference preprocessing failed.");
+    require(gpuProcessor->preprocessPalm(*frame, gpuPalm, gpuPalmResult),
+        "GPU palm preprocessing failed.");
+
+    float maximumDifference = 0.0F;
+    double totalDifference = 0.0;
+    for (std::size_t index = 0; index < cpuPalm.elementCount(); ++index)
+    {
+        const float difference = std::abs(cpuPalm.data()[index] - gpuPalm.data()[index]);
+        maximumDifference = (std::max)(maximumDifference, difference);
+        totalDifference += difference;
+    }
+    const double meanDifference = totalDifference / cpuPalm.elementCount();
+    require(maximumDifference < 0.025F, "GPU palm tensor maximum error is too large.");
+    require(meanDifference < 0.001F, "GPU palm tensor mean error is too large.");
+
+    const ryoiki::geometry::RotatedRegion region{{31.5F, 23.5F}, 38.0F, 30.0F, 0.27F};
+    ryoiki::buffers::FloatTensorBuffer cpuHand{{1, 224, 224, 3}};
+    ryoiki::buffers::FloatTensorBuffer gpuHand{{1, 224, 224, 3}};
+    ryoiki::geometry::HandPreprocessResult cpuHandResult{};
+    ryoiki::geometry::HandPreprocessResult gpuHandResult{};
+    require(cpuProcessor.preprocessHand(*frame, region, cpuHand, cpuHandResult),
+        "CPU hand reference preprocessing failed.");
+    require(gpuProcessor->preprocessHand(*frame, region, gpuHand, gpuHandResult),
+        "GPU hand preprocessing failed.");
+    maximumDifference = 0.0F;
+    totalDifference = 0.0;
+    for (std::size_t index = 0; index < cpuHand.elementCount(); ++index)
+    {
+        const float difference = std::abs(cpuHand.data()[index] - gpuHand.data()[index]);
+        maximumDifference = (std::max)(maximumDifference, difference);
+        totalDifference += difference;
+    }
+    require(maximumDifference < 0.025F, "GPU hand tensor maximum error is too large.");
+    require(totalDifference / cpuHand.elementCount() < 0.001F,
+        "GPU hand tensor mean error is too large.");
 }
 
 void testPalmSamplingUsesSharedPixelCenterOrientation()
@@ -537,6 +626,71 @@ void testFrameTransformsShareOneViewportContract()
     requireNear(storageRoundTrip.y, nonSymmetric.y, 0.0001F,
         "Orientation inverse did not restore odd-dimension Y.");
 }
+
+void testSplitViewportAndHand3dProjection()
+{
+    using ryoiki::rendering::FrameTransforms;
+    using ryoiki::rendering::Hand3dView;
+    using ryoiki::rendering::PlotViewport;
+    using ryoiki::rendering::ViewportRect;
+    using ryoiki::runtime::FrameRotation;
+
+    FrameTransforms transforms{};
+    require(ryoiki::rendering::createFrameTransforms(
+            640, 480, FrameRotation::None, ViewportRect{20, 10, 700, 500},
+            false, transforms),
+        "Split camera viewport transform creation failed.");
+    requireNear(transforms.contentLeft, 36.6667F, 0.001F,
+        "Camera letterbox did not include the split viewport X offset.");
+    requireNear(transforms.contentTop, 10.0F, 0.0001F,
+        "Camera letterbox did not include the split viewport Y offset.");
+
+    ryoiki::hand_perception::HandLandmarkResult hand{};
+    hand.detected = true;
+    hand.worldLandmarks[0] = {1.0F, 2.0F, 3.0F};
+    for (std::size_t index = 1; index < hand.worldLandmarks.size(); ++index)
+    {
+        hand.worldLandmarks[index] = hand.worldLandmarks[0];
+    }
+    hand.worldLandmarks[8].x += 0.06F;
+
+    const PlotViewport plot{720.0F, 10.0F, 1000.0F, 510.0F};
+    const Hand3dView frontView{0.0F, 0.0F, 0.12F, true};
+    const auto projection = ryoiki::rendering::projectHand3d(hand, plot, frontView);
+    require(projection.valid, "Valid world landmarks did not produce a 3D projection.");
+    requireNear(projection.points[0].position.x, 860.0F, 0.0001F,
+        "The wrist was not centered in the 3D viewport.");
+    requireNear(projection.points[0].position.y, 260.0F, 0.0001F,
+        "The wrist was not vertically centered in the 3D viewport.");
+    require(projection.points[8].position.x < projection.points[0].position.x,
+        "Front-camera mirroring was not applied to positive hand X.");
+
+    hand.worldLandmarks[8] = hand.worldLandmarks[0];
+    hand.worldLandmarks[8].y += 0.06F;
+    const auto downwardProjection = ryoiki::rendering::projectHand3d(hand, plot, frontView);
+    require(downwardProjection.points[8].position.y > downwardProjection.points[0].position.y,
+        "Image-space positive Y did not remain visually downward in the 3D plot.");
+
+    ryoiki::hand_perception::HandLandmarkResult orientedHand{};
+    orientedHand.detected = true;
+    orientedHand.worldLandmarks[0] = {0.0F, 0.0F, 0.0F};
+    orientedHand.worldLandmarks[5] = {0.04F, -0.05F, 0.0F};
+    orientedHand.worldLandmarks[9] = {0.0F, -0.07F, 0.0F};
+    orientedHand.worldLandmarks[13] = {-0.02F, -0.06F, 0.0F};
+    orientedHand.worldLandmarks[17] = {-0.04F, -0.05F, 0.0F};
+    const Hand3dView sideView{1.5707963F, 0.0F, 0.12F, true};
+    const auto orientedProjection = ryoiki::rendering::projectHand3d(
+        orientedHand, plot, sideView);
+    require(orientedProjection.hasPalmDirection,
+        "A valid palm basis did not produce a fixed direction vector.");
+    require(std::abs(orientedProjection.palmDirectionTip.position.x
+            - orientedProjection.palmCenter.position.x) > 20.0F,
+        "The palm direction vector did not rotate with the 3D view.");
+
+    hand.worldLandmarks[8].x = std::numeric_limits<float>::quiet_NaN();
+    require(!ryoiki::rendering::projectHand3d(hand, plot, frontView).valid,
+        "A non-finite world landmark produced a valid 3D projection.");
+}
 }
 
 int main()
@@ -547,6 +701,7 @@ int main()
         testLatestFrameDelivery();
         testMailboxProducerConsumer();
         testPalmLetterboxAndRgbPacking();
+        testGpuPreprocessMatchesCpuReference();
         testPalmSamplingUsesSharedPixelCenterOrientation();
         testRotatedHandRegions();
         testInvalidGeometryInputs();
@@ -555,6 +710,7 @@ int main()
         testFrameOrientationNormalization();
         testFrameOrientationRemainsMetadataUntilSampling();
         testFrameTransformsShareOneViewportContract();
+        testSplitViewportAndHand3dProjection();
         std::cout << "VisionCore tests passed.\n";
         return 0;
     }

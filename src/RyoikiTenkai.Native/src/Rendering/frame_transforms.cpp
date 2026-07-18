@@ -13,8 +13,25 @@ bool createFrameTransforms(
     const bool mirrorHorizontally,
     FrameTransforms& result) noexcept
 {
+    return createFrameTransforms(
+        storageWidth,
+        storageHeight,
+        rotation,
+        {0, 0, viewportWidth, viewportHeight},
+        mirrorHorizontally,
+        result);
+}
+
+bool createFrameTransforms(
+    const std::uint32_t storageWidth,
+    const std::uint32_t storageHeight,
+    const runtime::FrameRotation rotation,
+    const ViewportRect viewport,
+    const bool mirrorHorizontally,
+    FrameTransforms& result) noexcept
+{
     if (storageWidth == 0 || storageHeight == 0
-        || viewportWidth == 0 || viewportHeight == 0)
+        || viewport.width == 0 || viewport.height == 0)
     {
         return false;
     }
@@ -26,12 +43,14 @@ bool createFrameTransforms(
     const float uprightWidth = static_cast<float>(uprightSize.width);
     const float uprightHeight = static_cast<float>(uprightSize.height);
     const float scale = (std::min)(
-        static_cast<float>(viewportWidth) / uprightWidth,
-        static_cast<float>(viewportHeight) / uprightHeight);
+        static_cast<float>(viewport.width) / uprightWidth,
+        static_cast<float>(viewport.height) / uprightHeight);
     result.contentWidth = uprightWidth * scale;
     result.contentHeight = uprightHeight * scale;
-    result.contentLeft = (static_cast<float>(viewportWidth) - result.contentWidth) * 0.5F;
-    result.contentTop = (static_cast<float>(viewportHeight) - result.contentHeight) * 0.5F;
+    result.contentLeft = static_cast<float>(viewport.left)
+        + (static_cast<float>(viewport.width) - result.contentWidth) * 0.5F;
+    result.contentTop = static_cast<float>(viewport.top)
+        + (static_cast<float>(viewport.height) - result.contentHeight) * 0.5F;
 
     result.uprightToViewport = mirrorHorizontally
         ? geometry::AffineTransform{{-scale, 0.0F,

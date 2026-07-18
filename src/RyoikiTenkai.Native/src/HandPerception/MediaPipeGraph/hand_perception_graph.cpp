@@ -7,8 +7,9 @@ namespace ryoiki::hand_perception
 {
 HandPerceptionGraph::HandPerceptionGraph(
     std::unique_ptr<IPalmDetectionRunner> palmRunner,
-    std::unique_ptr<IHandLandmarkRunner> handRunner)
-    : palmGraph_{std::move(palmRunner)}, handGraph_{std::move(handRunner)}
+    std::unique_ptr<IHandLandmarkRunner> handRunner,
+    const HandPerceptionGraphOptions options)
+    : palmGraph_{std::move(palmRunner)}, handGraph_{std::move(handRunner)}, options_{options}
 {
 }
 
@@ -16,9 +17,11 @@ HandPerceptionGraph::HandPerceptionGraph(
     std::unique_ptr<IPalmDetectionRunner> palmRunner,
     std::unique_ptr<IHandLandmarkRunner> handRunner,
     std::unique_ptr<geometry::IGeometryProcessor> palmGeometryProcessor,
-    std::unique_ptr<geometry::IGeometryProcessor> handGeometryProcessor)
+    std::unique_ptr<geometry::IGeometryProcessor> handGeometryProcessor,
+    const HandPerceptionGraphOptions options)
     : palmGraph_{std::move(palmRunner), std::move(palmGeometryProcessor)},
-      handGraph_{std::move(handRunner), std::move(handGeometryProcessor)}
+      handGraph_{std::move(handRunner), std::move(handGeometryProcessor)},
+      options_{options}
 {
 }
 
@@ -30,8 +33,18 @@ bool HandPerceptionGraph::process(
 {
     result = {};
     metrics = {};
+    ++processedFrameCount_;
     if (hasTrackedRegion_)
     {
+        if (options_.calibrationPalmIntervalFrames > 0
+            && processedFrameCount_ % options_.calibrationPalmIntervalFrames == 0)
+        {
+            PalmDetectionResult calibrationPalms;
+            if (!palmGraph_.process(frame, calibrationPalms, metrics.palm, error))
+            {
+                return false;
+            }
+        }
         result.usedTracking = true;
         result.handRegion = trackedRegion_;
         if (!handGraph_.process(
