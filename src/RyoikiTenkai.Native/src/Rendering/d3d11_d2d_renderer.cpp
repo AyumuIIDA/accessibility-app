@@ -430,11 +430,6 @@ private:
 
     void drawHandOverlay(const RenderPacket& packet, const FrameTransforms& transforms)
     {
-        const auto& hand = packet.perception.hand;
-        if (!hand.detected)
-        {
-            return;
-        }
         constexpr std::array<std::array<int, 2>, 23> kConnections{{
             {0, 1}, {1, 2}, {2, 3}, {3, 4},
             {0, 5}, {5, 6}, {6, 7}, {7, 8},
@@ -443,38 +438,46 @@ private:
             {0, 17}, {17, 18}, {18, 19}, {19, 20},
             {5, 9}, {9, 13}, {13, 17}}};
 
-        const auto mapLandmark = [&hand, &transforms](const int index)
+        for (std::size_t handIndex = 0; handIndex < packet.perception.handCount; ++handIndex)
         {
-            return transforms.uprightToViewport.transform(
-                {hand.landmarks[index].x, hand.landmarks[index].y});
-        };
-        for (const auto& connection : kConnections)
-        {
-            d2dContext_->DrawLine(
-                toD2dPoint(mapLandmark(connection[0])),
-                toD2dPoint(mapLandmark(connection[1])),
-                handBrush_.Get(),
-                2.0F);
-        }
-        for (int index = 0; index < 21; ++index)
-        {
-            d2dContext_->FillEllipse(
-                D2D1::Ellipse(toD2dPoint(mapLandmark(index)), 3.5F, 3.5F),
-                handBrush_.Get());
-        }
+            const auto& hand = packet.perception.hands[handIndex];
+            if (!hand.detected)
+            {
+                continue;
+            }
+            const auto mapLandmark = [&hand, &transforms](const int index)
+            {
+                return transforms.uprightToViewport.transform(
+                    {hand.landmarks[index].x, hand.landmarks[index].y});
+            };
+            for (const auto& connection : kConnections)
+            {
+                d2dContext_->DrawLine(
+                    toD2dPoint(mapLandmark(connection[0])),
+                    toD2dPoint(mapLandmark(connection[1])),
+                    handBrush_.Get(),
+                    2.0F);
+            }
+            for (int index = 0; index < 21; ++index)
+            {
+                d2dContext_->FillEllipse(
+                    D2D1::Ellipse(toD2dPoint(mapLandmark(index)), 3.5F, 3.5F),
+                    handBrush_.Get());
+            }
 
-        const auto topLeft = transforms.uprightToViewport.transform(
-            {hand.box.left, hand.box.top});
-        const auto bottomRight = transforms.uprightToViewport.transform(
-            {hand.box.right, hand.box.bottom});
-        d2dContext_->DrawRectangle(
-            D2D1::RectF(
-                (std::min)(topLeft.x, bottomRight.x),
-                (std::min)(topLeft.y, bottomRight.y),
-                (std::max)(topLeft.x, bottomRight.x),
-                (std::max)(topLeft.y, bottomRight.y)),
-            handBrush_.Get(),
-            1.5F);
+            const auto topLeft = transforms.uprightToViewport.transform(
+                {hand.box.left, hand.box.top});
+            const auto bottomRight = transforms.uprightToViewport.transform(
+                {hand.box.right, hand.box.bottom});
+            d2dContext_->DrawRectangle(
+                D2D1::RectF(
+                    (std::min)(topLeft.x, bottomRight.x),
+                    (std::min)(topLeft.y, bottomRight.y),
+                    (std::max)(topLeft.x, bottomRight.x),
+                    (std::max)(topLeft.y, bottomRight.y)),
+                handBrush_.Get(),
+                1.5F);
+        }
     }
 
     HWND hwnd_{nullptr};

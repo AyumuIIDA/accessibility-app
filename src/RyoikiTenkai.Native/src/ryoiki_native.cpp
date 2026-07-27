@@ -23,7 +23,7 @@
 
 static_assert(sizeof(RyoikiMetrics) == 640);
 static_assert(sizeof(RyoikiPalmResult) == 96);
-static_assert(sizeof(RyoikiHandResult) == 296);
+static_assert(sizeof(RyoikiHandResult) == 576);
 
 namespace
 {
@@ -542,30 +542,38 @@ void runPerceptionLoop(RyoikiHandle& handle)
             }
 
             handle.hand.frame_id = frame->frameId();
-            handle.hand.hand_count = perceptionResult.hand.detected ? 1 : 0;
-            handle.hand.confidence = perceptionResult.hand.confidence;
-            handle.hand.handedness = perceptionResult.hand.detected
-                ? perceptionResult.hand.handedness : -1.0F;
+            handle.hand.hand_count = static_cast<std::int32_t>(perceptionResult.handCount);
+            std::memset(handle.hand.confidence, 0, sizeof(handle.hand.confidence));
+            std::memset(handle.hand.handedness, 0, sizeof(handle.hand.handedness));
             std::memset(handle.hand.bbox, 0, sizeof(handle.hand.bbox));
             std::memset(handle.hand.landmarks, 0, sizeof(handle.hand.landmarks));
-            if (perceptionResult.hand.detected)
+            for (std::size_t handIndex = 0;
+                handIndex < perceptionResult.handCount
+                && handIndex < static_cast<std::size_t>(kRyoikiMaxHands);
+                ++handIndex)
             {
-                handle.hand.bbox[0] = std::clamp(
-                    perceptionResult.hand.box.left * inverseWidth, 0.0F, 1.0F);
-                handle.hand.bbox[1] = std::clamp(
-                    perceptionResult.hand.box.top * inverseHeight, 0.0F, 1.0F);
-                handle.hand.bbox[2] = std::clamp(
-                    perceptionResult.hand.box.right * inverseWidth, 0.0F, 1.0F);
-                handle.hand.bbox[3] = std::clamp(
-                    perceptionResult.hand.box.bottom * inverseHeight, 0.0F, 1.0F);
-                for (std::size_t index = 0; index < perceptionResult.hand.landmarks.size(); ++index)
+                const auto& hand = perceptionResult.hands[handIndex];
+                handle.hand.confidence[handIndex] = hand.confidence;
+                handle.hand.handedness[handIndex] = hand.handedness;
+                const auto bboxOffset = handIndex * 4;
+                handle.hand.bbox[bboxOffset] = std::clamp(
+                    hand.box.left * inverseWidth, 0.0F, 1.0F);
+                handle.hand.bbox[bboxOffset + 1] = std::clamp(
+                    hand.box.top * inverseHeight, 0.0F, 1.0F);
+                handle.hand.bbox[bboxOffset + 2] = std::clamp(
+                    hand.box.right * inverseWidth, 0.0F, 1.0F);
+                handle.hand.bbox[bboxOffset + 3] = std::clamp(
+                    hand.box.bottom * inverseHeight, 0.0F, 1.0F);
+                const auto landmarkOffset = handIndex * 21 * 3;
+                for (std::size_t index = 0; index < hand.landmarks.size(); ++index)
                 {
-                    const auto& landmark = perceptionResult.hand.landmarks[index];
-                    handle.hand.landmarks[index * 3] = std::clamp(
+                    const auto& landmark = hand.landmarks[index];
+                    handle.hand.landmarks[landmarkOffset + index * 3] = std::clamp(
                         landmark.x * inverseWidth, 0.0F, 1.0F);
-                    handle.hand.landmarks[index * 3 + 1] = std::clamp(
+                    handle.hand.landmarks[landmarkOffset + index * 3 + 1] = std::clamp(
                         landmark.y * inverseHeight, 0.0F, 1.0F);
-                    handle.hand.landmarks[index * 3 + 2] = landmark.z * inverseWidth;
+                    handle.hand.landmarks[landmarkOffset + index * 3 + 2] =
+                        landmark.z * inverseWidth;
                 }
             }
         }

@@ -10,7 +10,8 @@
 
 struct RyoikiHandle;
 
-inline constexpr std::uint32_t kRyoikiAbiVersion = 6;
+inline constexpr std::uint32_t kRyoikiAbiVersion = 7;
+inline constexpr std::int32_t kRyoikiMaxHands = 2;
 inline constexpr std::int32_t kRyoikiStatusFailure = 0;
 inline constexpr std::int32_t kRyoikiStatusSuccess = 1;
 
@@ -59,10 +60,10 @@ struct RyoikiHandResult
     std::uint32_t struct_size;
     std::uint64_t frame_id;
     std::int32_t hand_count;
-    float confidence;
-    float handedness;
-    float bbox[4];
-    float landmarks[21 * 3];
+    float confidence[kRyoikiMaxHands];
+    float handedness[kRyoikiMaxHands];
+    float bbox[kRyoikiMaxHands * 4];
+    float landmarks[kRyoikiMaxHands * 21 * 3];
 };
 
 struct RyoikiPalmResult

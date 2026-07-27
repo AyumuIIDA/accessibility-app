@@ -6,7 +6,8 @@ namespace RyoikiTenkai.Wpf.Native;
 internal static partial class NativeVisionInterop
 {
     public const string LibraryName = "RyoikiTenkai.Native";
-    public const uint AbiVersion = 6;
+    public const uint AbiVersion = 7;
+    public const int MaxHands = 2;
 
     [LibraryImport(LibraryName, EntryPoint = "ryoiki_get_abi_version")]
     public static partial uint GetAbiVersion();
@@ -170,12 +171,27 @@ internal unsafe struct NativePalmResult
 [StructLayout(LayoutKind.Sequential)]
 internal unsafe struct NativeHandResult
 {
+    private const int NativeMaxHands = 2;
+
     public uint AbiVersion;
     public uint StructSize;
     public ulong FrameId;
     public int HandCount;
-    public float Confidence;
-    public float Handedness;
-    public fixed float Bbox[4];
-    public fixed float Landmarks[21 * 3];
+    public fixed float Confidence[NativeMaxHands];
+    public fixed float Handedness[NativeMaxHands];
+    public fixed float Bbox[NativeMaxHands * 4];
+    public fixed float Landmarks[NativeMaxHands * 21 * 3];
+
+    public float GetConfidence(int index)
+    {
+        if (index < 0 || index >= NativeMaxHands)
+        {
+            return 0;
+        }
+
+        fixed (float* confidence = Confidence)
+        {
+            return confidence[index];
+        }
+    }
 }

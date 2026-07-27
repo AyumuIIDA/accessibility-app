@@ -33,8 +33,7 @@ internal sealed class RyoikiTenkaiApp
             Console.WriteLine("5. Trigger gesture");
             Console.WriteLine("6. Run fake vision gesture source");
             Console.WriteLine("7. Run camera gesture source");
-            Console.WriteLine("8. Run MediaPipe Hands camera source");
-            Console.WriteLine("9. Reset sample binding");
+            Console.WriteLine("8. Clear bindings");
             Console.WriteLine("0. Exit");
             Console.Write("> ");
 
@@ -62,9 +61,6 @@ internal sealed class RyoikiTenkaiApp
                     RunCameraSource();
                     break;
                 case "8":
-                    RunMediaPipeHandsSource();
-                    break;
-                case "9":
                     ResetSampleBinding();
                     break;
                 case "0":
@@ -83,17 +79,7 @@ internal sealed class RyoikiTenkaiApp
             return;
         }
 
-        _store.Save([
-            new GestureBinding(
-                GestureId: "open_palm",
-                DisplayName: "Open palm -> launch Notepad",
-                Action: new ActionSpec(
-                    Type: "app.launch",
-                    Params: new Dictionary<string, string>
-                    {
-                        ["path"] = "notepad.exe"
-                    }))
-        ]);
+        _store.Save([]);
     }
 
     private void ListBindings()
@@ -117,7 +103,7 @@ internal sealed class RyoikiTenkaiApp
 
     private void RegisterLaunchBinding()
     {
-        Console.Write("Gesture id (example: fist): ");
+        Console.Write("Gesture id: ");
         var gestureId = ReadRequired();
 
         Console.Write("Display name: ");
@@ -155,7 +141,7 @@ internal sealed class RyoikiTenkaiApp
 
     private void RegisterHotkeyBinding()
     {
-        Console.Write("Gesture id (example: pinch): ");
+        Console.Write("Gesture id: ");
         var gestureId = ReadRequired();
 
         Console.Write("Display name: ");
@@ -190,7 +176,7 @@ internal sealed class RyoikiTenkaiApp
 
     private void RunFakeVisionSource()
     {
-        Console.Write("Gesture id to emit (example: open_palm): ");
+        Console.Write("Gesture id to emit: ");
         var gestureId = ReadRequired();
 
         Console.Write("How many times? ");
@@ -208,7 +194,7 @@ internal sealed class RyoikiTenkaiApp
 
     private void RunCameraSource()
     {
-        Console.Write("Gesture id to emit on camera-model detection (example: open_palm): ");
+        Console.Write("Gesture id to emit on camera-model detection: ");
         var gestureId = ReadRequired();
 
         Console.Write("How many frames? ");
@@ -228,44 +214,10 @@ internal sealed class RyoikiTenkaiApp
         source.Start();
     }
 
-    private void RunMediaPipeHandsSource()
-    {
-        Console.Write("How many frames? ");
-        var countText = ReadRequired();
-        var frameCount = int.TryParse(countText, out var parsedCount) ? Math.Max(1, parsedCount) : 10;
-
-        Console.Write("Interval milliseconds: ");
-        var intervalText = ReadRequired();
-        var intervalMs = int.TryParse(intervalText, out var parsedInterval) ? Math.Max(1, parsedInterval) : 500;
-
-        var modelDirectory = Path.Combine(AppContext.BaseDirectory, "models");
-        var handModel = new MediaPipeHandsModel(new MediaPipeHandsModelOptions(
-            PalmDetectorPath: Path.Combine(modelDirectory, "palm_detection.onnx"),
-            HandLandmarkPath: Path.Combine(modelDirectory, "hand_landmark.onnx")));
-        var gestureModel = new MediaPipeLandmarkGestureModel(handModel);
-
-        var source = new CameraGestureSource(
-            model: gestureModel,
-            frameCount: frameCount,
-            interval: TimeSpan.FromMilliseconds(intervalMs));
-
-        source.GestureDetected += _dispatcher.Dispatch;
-
-        try
-        {
-            source.Start();
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine(ex.Message);
-        }
-    }
-
     private void ResetSampleBinding()
     {
         _store.Save([]);
-        EnsureSeedData();
-        Console.WriteLine("Reset to sample binding: open_palm -> notepad.exe");
+        Console.WriteLine("Bindings cleared.");
     }
 
     private static string ReadRequired()

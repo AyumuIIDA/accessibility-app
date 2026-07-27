@@ -1,6 +1,6 @@
 # Native Vision Runtime Contract
 
-This document defines the version 6 contract between the WPF host and
+This document defines the version 7 contract between the WPF host and
 `RyoikiTenkai.Native.dll`. The public declarations are in
 `src/RyoikiTenkai.Native/include/ryoiki_native.h`.
 
@@ -18,7 +18,7 @@ CameraCapture
             -> PalmDetectionToRoi -> rotated hand ROI
             -> HandLandmarkGraph -> IHandLandmarkRunner
             -> HandLandmarksToRoi -> next-frame ROI loopback
-            -> ONNX Runtime runners (QNN/HTP required by default)
+            -> ONNX Runtime runners (QNN/HTP required by default, up to 2 hands)
        -> Rendering/NativeRenderStage (latest value, render-thread ownership)
             -> D3D11 + DXGI flip swap chain + Direct2D -> atomic present
 ```
@@ -100,7 +100,7 @@ with a mutex and copies it into caller-owned structures.
 - WPF owns the output structure passed to a polling call.
 - A successful polling call copies one small metadata snapshot into that structure.
 - WPF never retains a native image or tensor pointer.
-- Version 6 camera and perception frames use CPU memory internally. Rendering uploads
+- Version 7 camera and perception frames use CPU memory internally. Rendering uploads
   the retained CPU BGRA frame into a reusable Direct2D bitmap. Future GPU or NPU
   buffers remain native-owned; capture-memory migration criteria are documented in
   `doc/native-frame-memory-roadmap.md`.
@@ -140,8 +140,9 @@ with a mutex and copies it into caller-owned structures.
   front camera on the current Surface reports enclosure rotation `0` and no media-type
   rotation, so it must not receive a hard-coded 180-degree device correction.
 - `bbox` is `[left, top, right, bottom]`.
-- Palm results include the highest-scoring bbox and seven `[x, y]` keypoints. The
-  `palm_count` may be greater than one even though version 6 copies only the best palm.
+- Palm results include the highest-scoring bbox and seven `[x, y]` keypoints. Hand
+  polling exposes up to two landmark sets in fixed arrays, with `hand_count`
+  indicating how many entries are valid.
 - Image `x` and `y` values are expressed in the logical upright image defined by the
   frame orientation metadata, then normalized to `[0, 1]` before presentation
   mirroring. `x` increases right and `y` increases down. Storage width/height remain

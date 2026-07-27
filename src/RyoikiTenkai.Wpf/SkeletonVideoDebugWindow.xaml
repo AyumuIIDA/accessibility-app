@@ -1,0 +1,12 @@
+<Window x:Class="RyoikiTenkai.Wpf.SkeletonVideoDebugWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:RyoikiTenkai.Wpf"
+        Title="Skeleton Video Debugger"
+        Width="1500"
+        Height="920"
+        MinWidth="1180"
+        MinHeight="760"
+        Background="#101319">
+    <local:SkeletonVideoDebugView x:Name="DebugView" />
+</Window>

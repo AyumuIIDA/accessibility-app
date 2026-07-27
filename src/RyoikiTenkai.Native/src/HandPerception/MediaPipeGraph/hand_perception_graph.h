@@ -6,16 +6,22 @@
 #include "HandPerception/MediaPipeGraph/palm_detection_graph.h"
 #include "HandPerception/MediaPipeGraph/palm_detection_to_roi.h"
 
+#include <array>
 #include <memory>
 #include <string>
 
 namespace ryoiki::hand_perception
 {
+inline constexpr std::size_t kMaxPerceivedHands = 2;
+
 struct HandPerceptionResult
 {
     PalmDetectionResult palms;
+    std::array<HandLandmarkResult, kMaxPerceivedHands> hands{};
+    std::array<geometry::RotatedRegion, kMaxPerceivedHands> handRegions{};
     HandLandmarkResult hand;
     geometry::RotatedRegion handRegion;
+    std::size_t handCount{0};
     bool usedTracking{false};
 };
 
@@ -51,7 +57,8 @@ private:
     HandLandmarkGraph handGraph_;
     PalmDetectionToRoiCalculator detectionToRoi_;
     HandLandmarksToRoiCalculator landmarksToRoi_;
-    geometry::RotatedRegion trackedRegion_{};
-    bool hasTrackedRegion_{false};
+    std::array<geometry::RotatedRegion, kMaxPerceivedHands> trackedRegions_{};
+    std::size_t trackedRegionCount_{0};
+    std::size_t trackedFramesSincePalmDiscovery_{0};
 };
 }

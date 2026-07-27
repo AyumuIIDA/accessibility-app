@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
@@ -16,9 +17,14 @@ namespace RyoikiTenkai.Wpf;
 public partial class MainWindow : Window
 {
     private const int RequiredTemplateCount = 3;
+    private const int NativeMetricsPollMilliseconds = 250;
+    private const int NativeGesturePollMilliseconds = 16;
+    private const int MaxUiLogLines = 1000;
+    private static readonly bool GestureRecognitionEnabled = false;
+    private static readonly TimeSpan NoHandResetGrace = TimeSpan.FromMilliseconds(500);
     private static readonly TimeSpan RecordingLeadInDuration = TimeSpan.FromMilliseconds(900);
-    private static readonly TimeSpan RecordingDuration = TimeSpan.FromMilliseconds(1500);
-    private static readonly string[] BuiltInGestureIds = ["open_palm", "fist", "pinch", "peace"];
+    private static readonly TimeSpan RecordingDuration = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan DebugTimelineHistoryDuration = TimeSpan.FromSeconds(12);
     private static readonly OverlayStyle TrackingOverlay = new(
         Line: new SolidColorBrush(Color.FromRgb(150, 168, 190)),
         PointFill: Brushes.White,
@@ -49,8 +55,13 @@ public partial class MainWindow : Window
     private readonly GestureDefinitionStore _gestureStore;
     private readonly ActionExecutor _executor = new();
     private readonly WindowGestureRecognizer _recognizer = new();
+    private readonly string _gestureStorePath;
     private readonly string _modelDirectory;
     private readonly string _logPath;
+    private readonly string _classifierFrameLogPath;
+    private readonly string _debugExportPath;
+    private readonly string _debugTimelineLogPath;
+    private readonly GestureDebugSession _debugSession = new(TimeSpan.FromMinutes(5), 20_000);
 
     private List<GestureDefinition> _gestureDefinitions = [];
     private CancellationTokenSource? _cameraLoopCts;
@@ -60,36 +71,80 @@ public partial class MainWindow : Window
     private bool _isExecuting;
     private bool _isInferenceRunning;
     private readonly DispatcherTimer _nativePollTimer;
+    private readonly DispatcherTimer _nativeGesturePollTimer;
+    private readonly DispatcherTimer _gesturePlaybackTimer;
+    private readonly DispatcherTimer _debugPlaybackTimer;
     private string? _lastNativeRuntimeError;
     private string? _lastNativeProviderSummary;
     private string? _lastNativeProviderFallbackReason;
     private DateTimeOffset _lastNativePerfLogAt;
+    private string _lastNativeLatencyText = "-";
     private bool _isRecordingGesture;
     private bool _isCapturingGesture;
+    private bool _recordingTakeFailed;
+    private int _recordingTakeIndex;
+    private int _recordingAttemptCount;
     private DateTimeOffset _recordingStartedAt;
     private DateTimeOffset _recordingCaptureStartedAt;
     private string? _recordingGestureName;
+    private GestureKind? _recordingGestureKind;
     private readonly List<GestureFrameSample> _recordingSamples = [];
+    private readonly List<GestureTemplate> _recordingCompletedTemplates = [];
+    private readonly List<DebugTimelinePoint> _debugTimelineHistory = [];
+    private bool _debugLiveFollow = true;
+    private bool _isDebugPlaybackRunning;
+    private bool _isUpdatingDebugSlider;
+    private SkeletonVideoDebugWindow? _skeletonDebugWindow;
+    private DateTimeOffset? _lastValidHandSampleAt;
+    private bool _recognizerResetForNoHand;
+    private ulong _lastProcessedNativeHandFrameId;
+    private IReadOnlyList<GestureSkeletonFrame> _playbackFrames = [];
+    private int _playbackFrameIndex;
+    private string _playbackGestureName = string.Empty;
 
     public MainWindow()
     {
         InitializeComponent();
 
         _store = new BindingStore(System.IO.Path.Combine(AppContext.BaseDirectory, "bindings.json"));
-        _gestureStore = new GestureDefinitionStore(System.IO.Path.Combine(AppContext.BaseDirectory, "gestures.json"));
+        _gestureStorePath = System.IO.Path.Combine(AppContext.BaseDirectory, "gestures.json");
+        _gestureStore = new GestureDefinitionStore(_gestureStorePath);
         _modelDirectory = System.IO.Path.Combine(AppContext.BaseDirectory, "models");
         _logPath = System.IO.Path.Combine(AppContext.BaseDirectory, "ryoikitenkai.log");
+        _classifierFrameLogPath = System.IO.Path.Combine(AppContext.BaseDirectory, "classifier-frames.jsonl");
+        _debugExportPath = System.IO.Path.Combine(AppContext.BaseDirectory, "gesture-debug-session.jsonl");
+        _debugTimelineLogPath = System.IO.Path.Combine(
+            AppContext.BaseDirectory,
+            $"gesture-debug-{DateTimeOffset.Now:yyyyMMdd-HHmmss}.jsonl");
         NativeVisionHostControl.DiagnosticLogged += Log;
         _nativePollTimer = new DispatcherTimer
         {
-            Interval = TimeSpan.FromMilliseconds(250)
+            Interval = TimeSpan.FromMilliseconds(NativeMetricsPollMilliseconds)
         };
         _nativePollTimer.Tick += NativePollTimer_Tick;
-        _recognizer.SetBuiltInGesturesEnabled(false);
-        RemoveLegacySampleBinding();
+        _nativeGesturePollTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(NativeGesturePollMilliseconds)
+        };
+        _nativeGesturePollTimer.Tick += NativeGesturePollTimer_Tick;
+        _gesturePlaybackTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(66)
+        };
+        _gesturePlaybackTimer.Tick += GesturePlaybackTimer_Tick;
+        _debugPlaybackTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(33)
+        };
+        _debugPlaybackTimer.Tick += DebugPlaybackTimer_Tick;
         RefreshGestures();
         RefreshBindings();
+        ApplyGestureRecognitionMode();
+        StopGesturePlayback("Select a recorded custom gesture to play its hand skeleton.");
         Log($"Ready. Log file: {_logPath}");
+        Log($"Classifier frame log file: {_classifierFrameLogPath}");
+        Log($"Gesture debug timeline file: {_debugTimelineLogPath}");
+        Log($"Gesture store file: {_gestureStorePath}");
     }
 
     private async void StartButton_Click(object sender, RoutedEventArgs e)
@@ -187,14 +242,18 @@ public partial class MainWindow : Window
         _lastNativeProviderSummary = null;
         _lastNativeProviderFallbackReason = null;
         _lastNativePerfLogAt = DateTimeOffset.MinValue;
+        _lastNativeLatencyText = "-";
+        _lastProcessedNativeHandFrameId = 0;
         _nativePollTimer.Start();
-        Log("Using native runtime path.");
+        _nativeGesturePollTimer.Start();
+        Log($"Using native runtime path. Gesture samples poll every {NativeGesturePollMilliseconds} ms (~{1000.0 / NativeGesturePollMilliseconds:0} Hz).");
         return true;
     }
 
     private void StopNativeRuntime()
     {
         _nativePollTimer.Stop();
+        _nativeGesturePollTimer.Stop();
         NativeVisionHostControl.StopNativeRuntime();
         NativeVisionHostControl.Visibility = Visibility.Collapsed;
         CameraImage.Visibility = Visibility.Visible;
@@ -250,8 +309,6 @@ public partial class MainWindow : Window
                 return;
             }
 
-            GestureText.Text = "native";
-            ConfidenceText.Text = "-";
             if (NativeVisionHostControl.TryGetPalm(out var palm)
                 && palm.FrameId > 0)
             {
@@ -260,14 +317,8 @@ public partial class MainWindow : Window
                     ? palm.Confidence.ToString("0.000")
                     : "-";
             }
-            if (NativeVisionHostControl.TryGetHand(out var hand)
-                && hand.FrameId > 0
-                && hand.HandCount > 0)
-            {
-                GestureText.Text = "hand";
-                ConfidenceText.Text = hand.Confidence.ToString("0.000");
-            }
-            LatencyText.Text = $"{metrics.EndToEndLatencyMs:0.0} ms";
+            _lastNativeLatencyText = $"{metrics.EndToEndLatencyMs:0.0} ms";
+            LatencyText.Text = _lastNativeLatencyText;
             StateText.Text = $"Native frame {metrics.FrameId}";
             RuntimeProviderText.Text = metrics.PalmProvider.Contains("QNN", StringComparison.OrdinalIgnoreCase)
                 || metrics.HandProvider.Contains("QNN", StringComparison.OrdinalIgnoreCase)
@@ -277,13 +328,63 @@ public partial class MainWindow : Window
             var frameMb = metrics.FrameBytes / (1024.0 * 1024.0);
             var tensorMb = metrics.TensorInputBytes / (1024.0 * 1024.0);
             OverlayStatusText.Text =
-                $"Native {metrics.CaptureWidth}x{metrics.CaptureHeight} {metrics.CameraSubtype}  " +
-                $"cam {metrics.CameraFps:0.0} disp {metrics.DisplayFps:0.0} perc {metrics.PerceptionFps:0.0} fps  " +
-                $"copy {metrics.FrameCopyMs:0.0} graph {metrics.GraphTotalMs:0.0} age {metrics.PerceptionFrameAgeMs:0.0} ms  " +
-                $"drops {metrics.FramePoolDroppedFrames}/{metrics.PerceptionDroppedFrames}  frame {frameMb:0.0} MB tensor {tensorMb:0.0} MB  " +
-                $"mem {workingSetMb:0} MB";
+                $"Native frame {metrics.FrameId}  perc {metrics.PerceptionFps:0.0} fps  graph {metrics.GraphTotalMs:0.0} ms";
             LogNativePerformanceSample(metrics, providerSummary, workingSetMb);
         }
+    }
+
+    private async void NativeGesturePollTimer_Tick(object? sender, EventArgs e)
+    {
+        if (!NativeVisionHostControl.NativeAvailable || !NativeVisionHostControl.IsStarted)
+        {
+            return;
+        }
+
+        if (!NativeVisionHostControl.TryGetHand(out var hand)
+            || hand.FrameId == 0
+            || hand.HandCount <= 0)
+        {
+            if (_isRecordingGesture)
+            {
+                UpdateRecordingClock(DateTimeOffset.UtcNow);
+                GestureText.Text = "recording";
+                ConfidenceText.Text = "-";
+            }
+            else
+            {
+                TrackNoHandForRecognition(DateTimeOffset.UtcNow, "native hand unavailable");
+            }
+
+            return;
+        }
+
+        if (hand.FrameId == _lastProcessedNativeHandFrameId)
+        {
+            return;
+        }
+
+        _lastProcessedNativeHandFrameId = hand.FrameId;
+        var handCount = Math.Min(hand.HandCount, NativeVisionInterop.MaxHands);
+        var bestConfidence = 0f;
+        var bestHandIndex = 0;
+        for (var index = 0; index < handCount; ++index)
+        {
+            var confidence = hand.GetConfidence(index);
+            if (confidence > bestConfidence)
+            {
+                bestConfidence = confidence;
+                bestHandIndex = index;
+            }
+        }
+
+        GestureText.Text = handCount == 1 ? "hand" : $"{handCount} hands";
+        ConfidenceText.Text = bestConfidence.ToString("0.000");
+        var sample = CreateNativeGestureSample(hand, bestHandIndex, DateTimeOffset.UtcNow);
+        TrackValidHandSample(sample.Timestamp);
+        await ProcessNativeGestureSampleAsync(
+            sample,
+            elapsedText: _lastNativeLatencyText,
+            updateTrackingState: false);
     }
 
     private void LogNativePerformanceSample(
@@ -316,6 +417,77 @@ public partial class MainWindow : Window
             ? "hand=?"
             : $"hand={metrics.HandProvider}";
         return $"{palmProvider}, {handProvider}";
+    }
+
+    private async Task ProcessNativeGestureSampleAsync(
+        GestureFrameSample sample,
+        string elapsedText,
+        bool updateTrackingState)
+    {
+        try
+        {
+            await ProcessGestureSampleAsync(
+                sample,
+                elapsedText,
+                drawOverlay: null,
+                updateTrackingState);
+        }
+        catch (Exception ex)
+        {
+            Log("Native gesture classification error: " + ex);
+        }
+    }
+
+    private void TrackValidHandSample(DateTimeOffset timestamp)
+    {
+        _lastValidHandSampleAt = timestamp;
+        _recognizerResetForNoHand = false;
+    }
+
+    private void TrackNoHandForRecognition(DateTimeOffset now, string reason)
+    {
+        var missingDuration = _lastValidHandSampleAt is null
+            ? NoHandResetGrace
+            : now - _lastValidHandSampleAt.Value;
+        if (missingDuration < NoHandResetGrace || _recognizerResetForNoHand)
+        {
+            return;
+        }
+
+        _recognizer.Reset($"No hand for {missingDuration.TotalMilliseconds:0} ms");
+        _recognizerResetForNoHand = true;
+        Log($"Classifier reset: no hand for {missingDuration.TotalMilliseconds:0} ms ({reason}).");
+        var debugFrame = _debugSession.AddNoHandFrame(now, reason, _recognizer.GetDebugSnapshot());
+        SaveDebugFrame(debugFrame);
+        UpdateDebugLab(debugFrame);
+    }
+
+    private static unsafe GestureFrameSample CreateNativeGestureSample(
+        NativeHandResult hand,
+        int handIndex,
+        DateTimeOffset timestamp)
+    {
+        var landmarks = new List<HandLandmark>(21);
+        var landmarkOffset = handIndex * 21 * 3;
+        for (var landmarkIndex = 0; landmarkIndex < 21; landmarkIndex++)
+        {
+            var offset = landmarkOffset + (landmarkIndex * 3);
+            landmarks.Add(new HandLandmark(
+                hand.Landmarks[offset],
+                hand.Landmarks[offset + 1],
+                hand.Landmarks[offset + 2]));
+        }
+
+        var confidence = hand.GetConfidence(handIndex);
+        var handedness = hand.Handedness[handIndex];
+        var bboxOffset = handIndex * 4;
+        var boundingBox = new HandBox(
+            hand.Bbox[bboxOffset],
+            hand.Bbox[bboxOffset + 1],
+            hand.Bbox[bboxOffset + 2],
+            hand.Bbox[bboxOffset + 3]);
+
+        return new GestureFrameSample(timestamp, landmarks, confidence, boundingBox, handedness);
     }
 
     private async Task RunCameraLoopAsync(CancellationToken cancellationToken)
@@ -389,40 +561,76 @@ public partial class MainWindow : Window
             }
 
             ResetGestureUi($"No hand / {elapsedMs} ms");
-            _recognizer.Reset();
-            UpdateDebugLab(_recognizer.GetDebugSnapshot());
+            TrackNoHandForRecognition(DateTimeOffset.UtcNow, $"managed no hand / {elapsedMs} ms");
             return;
         }
 
-        var now = DateTimeOffset.UtcNow;
-        var sample = new GestureFrameSample(now, result.Landmarks, result.Confidence, result.BoundingBox, result.Handedness);
+        var sample = new GestureFrameSample(
+            DateTimeOffset.UtcNow,
+            result.Landmarks,
+            result.Confidence,
+            result.BoundingBox,
+            result.Handedness);
+        TrackValidHandSample(sample.Timestamp);
+        await ProcessGestureSampleAsync(
+            sample,
+            elapsedText: $"{elapsedMs} ms",
+            drawOverlay: (modelFrame, result),
+            updateTrackingState: true);
+    }
 
+    private async Task ProcessGestureSampleAsync(
+        GestureFrameSample sample,
+        string elapsedText,
+        (CameraFrame Frame, HandLandmarkResult Result)? drawOverlay,
+        bool updateTrackingState)
+    {
         if (_isRecordingGesture)
         {
             CaptureRecordingSample(sample);
         }
 
-        var recognition = _isRecordingGesture ? null : _recognizer.Recognize(sample);
-        UpdateDebugLab(_recognizer.GetDebugSnapshot());
+        var recognition = !_isRecordingGesture && GestureRecognitionEnabled
+            ? _recognizer.Recognize(sample)
+            : null;
+        var snapshot = _isRecordingGesture
+            ? CreateTrackingOnlyDebugSnapshot(sample, "Recording gesture")
+            : !GestureRecognitionEnabled
+                ? CreateTrackingOnlyDebugSnapshot(sample, "Gesture recognition disabled")
+            : _recognizer.GetDebugSnapshot();
         var hasBoundAction = recognition is not null && HasBindingForGesture(recognition.GestureId);
-        DrawOverlay(modelFrame, result, GetOverlayStyle(recognition, hasBoundAction));
+        var debugFrame = _debugSession.AddHandFrame(
+            sample,
+            snapshot,
+            recognition,
+            hasBoundAction,
+            drawOverlay is null ? "native" : "managed",
+            elapsedText);
+        SaveDebugFrame(debugFrame);
+        UpdateDebugLab(debugFrame);
+        if (drawOverlay is { } overlay)
+        {
+            DrawOverlay(overlay.Frame, overlay.Result, GetOverlayStyle(recognition, hasBoundAction));
+        }
 
-        var displayGesture = recognition?.DisplayName
-            ?? (EnableBuiltInsCheckBox.IsChecked == true ? MediaPipeLandmarkGestureModel.Classify(result.Landmarks) : null);
+        var displayGesture = recognition?.DisplayName;
         if (displayGesture is null)
         {
             GestureText.Text = _isRecordingGesture ? "recording" : "tracking";
-            ConfidenceText.Text = result.Confidence.ToString("0.00");
-            LatencyText.Text = $"{elapsedMs} ms";
+            ConfidenceText.Text = sample.Confidence.ToString("0.00");
+            LatencyText.Text = elapsedText;
             OverlayStatusText.Text = _isRecordingGesture ? "RECORDING" : "TRACKING";
-            StateText.Text = _isRecordingGesture ? StateText.Text : "Tracking hand";
+            if (updateTrackingState)
+            {
+                StateText.Text = _isRecordingGesture ? StateText.Text : "Tracking hand";
+            }
             return;
         }
 
         GestureText.Text = displayGesture;
-        ConfidenceText.Text = (recognition?.Confidence ?? result.Confidence).ToString("0.00");
-        LatencyText.Text = $"{elapsedMs} ms";
-        OverlayStatusText.Text = $"{displayGesture}  {(recognition?.Confidence ?? result.Confidence):0.00}";
+        ConfidenceText.Text = (recognition?.Confidence ?? sample.Confidence).ToString("0.00");
+        LatencyText.Text = elapsedText;
+        OverlayStatusText.Text = $"{displayGesture}  {(recognition?.Confidence ?? sample.Confidence):0.00}";
 
         if (recognition is not null)
         {
@@ -590,6 +798,12 @@ public partial class MainWindow : Window
 
     private void SaveBindingButton_Click(object sender, RoutedEventArgs e)
     {
+        if (!GestureRecognitionEnabled)
+        {
+            Log("Gesture recognition is disabled for redesign; bindings are not active.");
+            return;
+        }
+
         if (GestureCombo.SelectedItem is not GestureChoice selectedGesture)
         {
             Log("Select a gesture before saving a binding.");
@@ -628,6 +842,12 @@ public partial class MainWindow : Window
 
     private void ResetSampleButton_Click(object sender, RoutedEventArgs e)
     {
+        if (!GestureRecognitionEnabled)
+        {
+            Log("Gesture recognition is disabled for redesign; bindings are not active.");
+            return;
+        }
+
         _store.Save([]);
         RefreshBindings();
         Log("Bindings cleared.");
@@ -657,58 +877,77 @@ public partial class MainWindow : Window
         };
     }
 
-    private void RemoveLegacySampleBinding()
+    private void ApplyGestureRecognitionMode()
     {
-        var bindings = _store.Load();
-        var removed = bindings.RemoveAll(binding =>
-            StringComparer.OrdinalIgnoreCase.Equals(binding.GestureId, "open_palm")
-            && StringComparer.OrdinalIgnoreCase.Equals(binding.DisplayName, "Open palm -> launch Notepad")
-            && StringComparer.OrdinalIgnoreCase.Equals(binding.Action.Type, "app.launch")
-            && binding.Action.Params.TryGetValue("path", out var path)
-            && StringComparer.OrdinalIgnoreCase.Equals(path, "notepad.exe"));
-        if (removed == 0)
+        if (GestureRecognitionEnabled)
         {
             return;
         }
 
-        _store.Save(bindings);
-        Log("Removed legacy sample binding: open_palm -> Notepad.");
+        RuntimeModeText.Text = "Gesture recognition disabled";
+        GestureText.Text = "tracking";
+        ConfidenceText.Text = "-";
+        RecordingCounterText.Text = "Recognizer removed";
+        RecordingWindowText.Text = "Disabled";
+        RecordingStatusText.Text = "Skeleton video recording/debugging only.";
+        GestureNameText.IsEnabled = false;
+        GesturesList.IsEnabled = false;
+        GestureCombo.IsEnabled = false;
+        ActionTypeCombo.IsEnabled = false;
+        ActionValueText.IsEnabled = false;
+        RecordGestureButton.IsEnabled = false;
+        DeleteGestureButton.IsEnabled = false;
+        FlushGesturesButton.IsEnabled = false;
+        SaveBindingButton.IsEnabled = false;
+        ClearBindingsButton.IsEnabled = false;
+        BindingsList.Items.Clear();
+        BindingsList.Items.Add("Disabled while gesture recognition is redesigned.");
     }
 
     private void RefreshGestures()
     {
-        _gestureDefinitions = _gestureStore.Load();
-        _recognizer.SetDefinitions(_gestureDefinitions);
-        var builtInsEnabled = EnableBuiltInsCheckBox?.IsChecked == true;
-        _recognizer.SetBuiltInGesturesEnabled(builtInsEnabled);
-        RuntimeModeText.Text = builtInsEnabled
-            ? "Custom + built-in gestures / Cooldown: 1500 ms"
-            : "Custom gestures only / Built-ins off";
-
-        GesturesList.Items.Clear();
-        if (builtInsEnabled)
+        if (!GestureRecognitionEnabled)
         {
-            foreach (var id in BuiltInGestureIds)
+            _gestureDefinitions = [];
+            _recognizer.SetDefinitions([]);
+            RuntimeModeText.Text = "Gesture recognition disabled";
+            GesturesList.Items.Clear();
+            GestureCombo.Items.Clear();
+            if (!_isRecordingGesture)
             {
-                GesturesList.Items.Add($"{id}  built-in");
+                RecordingCounterText.Text = "Recognizer removed";
+                RecordingStatusText.Text = "Skeleton video recording/debugging only.";
+                RecordingWindowText.Text = "Disabled";
             }
+            return;
         }
 
+        _gestureDefinitions = _gestureStore.Load();
+        _recognizer.SetDefinitions(_gestureDefinitions);
+        RuntimeModeText.Text = "Recorded custom gestures only";
+
+        GesturesList.Items.Clear();
         foreach (var gesture in _gestureDefinitions.OrderBy(x => x.DisplayName))
         {
             var state = gesture.Templates.Count >= RequiredTemplateCount ? "active" : "needs examples";
-            GesturesList.Items.Add($"{gesture.DisplayName}  {gesture.Templates.Count}/{RequiredTemplateCount} {state}");
+            var kind = gesture.Templates.Count == 0
+                ? "-"
+                : gesture.Templates
+                    .GroupBy(x => x.Kind)
+                    .OrderByDescending(x => x.Count())
+                    .First()
+                    .Key
+                    .ToString();
+            var avgMotion = gesture.Templates.Count == 0
+                ? 0
+                : gesture.Templates.Average(x => x.MotionSummary?.MotionScore ?? 0);
+            GesturesList.Items.Add(new GestureListItem(
+                gesture.Id,
+                gesture.DisplayName,
+                $"{gesture.Templates.Count}/{RequiredTemplateCount} {state}  {kind}  motion {avgMotion:0.00}"));
         }
 
         GestureCombo.Items.Clear();
-        if (builtInsEnabled)
-        {
-            foreach (var id in BuiltInGestureIds)
-            {
-                GestureCombo.Items.Add(new GestureChoice(id, id));
-            }
-        }
-
         foreach (var gesture in _gestureDefinitions.OrderBy(x => x.DisplayName))
         {
             GestureCombo.Items.Add(new GestureChoice(gesture.Id, gesture.DisplayName));
@@ -718,16 +957,44 @@ public partial class MainWindow : Window
         {
             GestureCombo.SelectedIndex = 0;
         }
+
+        if (!_isRecordingGesture)
+        {
+            var activeCount = _gestureDefinitions.Count(x => x.Templates.Count >= RequiredTemplateCount);
+            RecordingCounterText.Text = "Accepted 0/3  Idle";
+            RecordingStatusText.Text = $"{activeCount}/{_gestureDefinitions.Count} custom gestures active";
+        }
+
+        LogLoadedGestureState("Gesture store loaded");
     }
 
-    private void EnableBuiltInsCheckBox_Changed(object sender, RoutedEventArgs e)
+    private void LogLoadedGestureState(string prefix)
     {
-        RefreshGestures();
-        _recognizer.Reset();
-        UpdateDebugLab(_recognizer.GetDebugSnapshot());
-        Log(EnableBuiltInsCheckBox.IsChecked == true
-            ? "Built-in gestures enabled."
-            : "Built-in gestures disabled.");
+        var ids = _gestureDefinitions.Count == 0
+            ? "-"
+            : string.Join(", ", _gestureDefinitions.Select(x => $"{x.Id}:{x.Templates.Count}"));
+        Log($"{prefix}: count={_gestureDefinitions.Count}; ids={ids}; path={_gestureStorePath}");
+    }
+
+    private void GesturesList_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (GesturesList.SelectedItem is not GestureListItem item)
+        {
+            StopGesturePlayback("Select a recorded custom gesture to play its hand skeleton.");
+            return;
+        }
+
+        GestureNameText.Text = item.DisplayName;
+        var definition = _gestureDefinitions.FirstOrDefault(x =>
+            StringComparer.OrdinalIgnoreCase.Equals(x.Id, item.Id));
+        var template = definition?.Templates.LastOrDefault(x => x.SkeletonFrames?.Count > 0);
+        if (definition is null || template?.SkeletonFrames is not { Count: > 0 } frames)
+        {
+            StopGesturePlayback($"{item.DisplayName}: no skeleton frames stored yet. Record another example.");
+            return;
+        }
+
+        StartGesturePlayback(item.DisplayName, frames);
     }
 
     private void RefreshBindings()
@@ -742,16 +1009,203 @@ public partial class MainWindow : Window
 
     private void ClearDebugButton_Click(object sender, RoutedEventArgs e)
     {
+        StopDebugPlayback();
+        _debugSession.Clear();
+        SkeletonVideoDebugView.Clear();
+        _skeletonDebugWindow?.Clear();
+        ClassifierDebugRecordButton.Content = "Live";
+        DebugRecordText.Text = "No debug frames captured yet";
         DebugScoresList.Items.Clear();
         DebugVectorList.Items.Clear();
+        _debugTimelineHistory.Clear();
+        DebugTimelineCanvas.Children.Clear();
+        DebugSkeletonCanvas.Children.Clear();
+        DebugMatchCanvas.Children.Clear();
         DebugPathCanvas.Children.Clear();
-        DebugStateText.Text = "Debug cleared";
+        DebugStateText.Text = "Live follow";
         DebugCandidateText.Text = "No candidate vector";
+        DebugSelectionText.Text = "-";
+        UpdateDebugSlider(null);
+    }
+
+    private void OpenSkeletonDebuggerButton_Click(object sender, RoutedEventArgs e)
+    {
+        EnsureSkeletonDebuggerWindow();
+        _skeletonDebugWindow!.Show();
+        _skeletonDebugWindow.Activate();
+        if (_debugSession.Latest is { } latest)
+        {
+            UpdateSkeletonDebuggers(latest);
+        }
+    }
+
+    private void EnsureSkeletonDebuggerWindow()
+    {
+        if (_skeletonDebugWindow is not null)
+        {
+            return;
+        }
+
+        _skeletonDebugWindow = new SkeletonVideoDebugWindow
+        {
+            Owner = this
+        };
+        _skeletonDebugWindow.Closed += (_, _) => _skeletonDebugWindow = null;
+    }
+
+    private void ClassifierDebugRecordButton_Click(object sender, RoutedEventArgs e)
+    {
+        StopDebugPlayback();
+        _debugLiveFollow = true;
+        PauseDebugCheckBox.IsChecked = false;
+        ClassifierDebugRecordButton.Content = "Live";
+        DebugStateText.Text = "Live follow";
+        if (_debugSession.Latest is { } latest)
+        {
+            RenderDebugFrame(latest);
+        }
+    }
+
+    private void DebugStepBackButton_Click(object sender, RoutedEventArgs e)
+    {
+        StopDebugPlayback();
+        StepDebugFrame(-1);
+    }
+
+    private void DebugStepForwardButton_Click(object sender, RoutedEventArgs e)
+    {
+        StopDebugPlayback();
+        StepDebugFrame(1);
+    }
+
+    private void DebugPlayPauseButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_isDebugPlaybackRunning)
+        {
+            StopDebugPlayback();
+            return;
+        }
+
+        if (_debugSession.Frames.Count == 0)
+        {
+            return;
+        }
+
+        _debugLiveFollow = false;
+        PauseDebugCheckBox.IsChecked = true;
+        _isDebugPlaybackRunning = true;
+        DebugPlayPauseButton.Content = "Pause";
+        DebugStateText.Text = "Playing timeline";
+        _debugPlaybackTimer.Start();
+    }
+
+    private void DebugPlaybackTimer_Tick(object? sender, EventArgs e)
+    {
+        if (_debugSession.Frames.Count == 0)
+        {
+            StopDebugPlayback();
+            return;
+        }
+
+        var current = (int)Math.Round(DebugFrameSlider.Value);
+        if (current >= _debugSession.Frames.Count - 1)
+        {
+            StopDebugPlayback();
+            return;
+        }
+
+        SelectDebugFrame(current + 1);
+    }
+
+    private void StepDebugFrame(int delta)
+    {
+        if (_debugSession.Frames.Count == 0)
+        {
+            return;
+        }
+
+        var current = (int)Math.Round(DebugFrameSlider.Value);
+        SelectDebugFrame(current + delta);
+    }
+
+    private void SelectDebugFrame(int index)
+    {
+        var frames = _debugSession.Frames;
+        if (frames.Count == 0)
+        {
+            return;
+        }
+
+        index = Math.Clamp(index, 0, frames.Count - 1);
+        _debugLiveFollow = false;
+        PauseDebugCheckBox.IsChecked = true;
+        DebugStateText.Text = "Scrubbed frame";
+        RenderDebugFrame(frames[index]);
+    }
+
+    private void StopDebugPlayback()
+    {
+        _debugPlaybackTimer.Stop();
+        _isDebugPlaybackRunning = false;
+        DebugPlayPauseButton.Content = "Play";
+    }
+
+    private void ExportDebugButton_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            _debugSession.ExportJsonLines(_debugExportPath);
+            DebugRecordText.Text = $"Exported {_debugSession.Frames.Count} frames";
+            Log($"Gesture debug session exported: {_debugExportPath}");
+        }
+        catch (Exception ex)
+        {
+            DebugRecordText.Text = "Export failed";
+            Log("Gesture debug export failed: " + ex);
+        }
+    }
+
+    private void DebugFrameSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        if (_isUpdatingDebugSlider)
+        {
+            return;
+        }
+
+        var frame = _debugSession.FrameAtSliderValue(e.NewValue);
+        if (frame is null)
+        {
+            return;
+        }
+
+        _debugLiveFollow = false;
+        PauseDebugCheckBox.IsChecked = true;
+        DebugStateText.Text = "Scrubbed frame";
+        RenderDebugFrame(frame);
     }
 
     private void RecordGestureButton_Click(object sender, RoutedEventArgs e)
     {
-        if (_camera is null || _model is null)
+        if (!GestureRecognitionEnabled)
+        {
+            Log("Gesture recording is disabled while recognition is redesigned. Skeleton debug recording still runs.");
+            return;
+        }
+
+        if (_isRecordingGesture)
+        {
+            if (_recordingTakeFailed)
+            {
+                _recordingTakeFailed = false;
+                BeginRecordingTake(_recordingTakeIndex, DateTimeOffset.UtcNow, "Retrying failed take.");
+                return;
+            }
+
+            CancelGestureRecording();
+            return;
+        }
+
+        if ((_camera is null || _model is null) && !NativeVisionHostControl.IsStarted)
         {
             Log("Start the camera before recording a gesture.");
             return;
@@ -764,22 +1218,79 @@ public partial class MainWindow : Window
             return;
         }
 
-        _recordingSamples.Clear();
         _recordingGestureName = name;
-        _recordingStartedAt = DateTimeOffset.UtcNow;
-        _recordingCaptureStartedAt = _recordingStartedAt + RecordingLeadInDuration;
+        _recordingCompletedTemplates.Clear();
+        _recordingAttemptCount = 0;
+        _recordingTakeFailed = false;
+        _recordingGestureKind = null;
+        BeginRecordingTake(1, DateTimeOffset.UtcNow, statusPrefix: null);
+        Log($"Gesture recording session armed: {name}. Capturing {RequiredTemplateCount} takes of {RecordingDuration.TotalMilliseconds:0} ms each.");
+    }
+
+    private void BeginRecordingTake(int takeIndex, DateTimeOffset now, string? statusPrefix)
+    {
+        _recordingSamples.Clear();
+        _recordingTakeIndex = takeIndex;
+        _recordingAttemptCount++;
+        _recordingStartedAt = now;
+        _recordingCaptureStartedAt = now + RecordingLeadInDuration;
         _isRecordingGesture = true;
         _isCapturingGesture = false;
-        RecordGestureButton.IsEnabled = false;
+        RecordGestureButton.Content = "Cancel";
+        RecordGestureButton.IsEnabled = true;
         RecordingProgressBar.Value = 0;
         RecordingWindowText.Text = "GET READY";
-        RecordingStatusText.Text = $"{name}: capture starts in {RecordingLeadInDuration.TotalMilliseconds:0} ms";
-        StateText.Text = $"Get ready: {name}";
+        UpdateRecordingCounterText();
+        var prefix = string.IsNullOrWhiteSpace(statusPrefix) ? string.Empty : $"{statusPrefix} ";
+        RecordingStatusText.Text = $"{_recordingGestureName}: get ready";
+        Log($"{prefix}{_recordingGestureName}: take {_recordingTakeIndex}/{RequiredTemplateCount} starts in {RecordingLeadInDuration.TotalMilliseconds:0} ms. Accepted {_recordingCompletedTemplates.Count}/{RequiredTemplateCount}. Saving to {_gestureStorePath}");
+        StateText.Text = $"Get ready: {_recordingGestureName} take {_recordingTakeIndex}/{RequiredTemplateCount}";
         OverlayStatusText.Text = "GET READY";
+    }
+
+    private void CancelGestureRecording()
+    {
+        var name = _recordingGestureName ?? "gesture";
+        _isRecordingGesture = false;
+        _isCapturingGesture = false;
+        _recordingSamples.Clear();
+        _recordingCompletedTemplates.Clear();
+        _recordingGestureName = null;
+        _recordingGestureKind = null;
+        _recordingTakeIndex = 0;
+        _recordingAttemptCount = 0;
+        _recordingTakeFailed = false;
+        RecordGestureButton.Content = "Record 3 Examples";
+        RecordGestureButton.IsEnabled = true;
+        RecordingWindowText.Text = "CANCELLED";
+        UpdateRecordingCounterText();
+        RecordingStatusText.Text = $"{name}: cancelled";
+        OverlayStatusText.Text = "TRACKING";
+        Log($"Gesture recording cancelled: {name}");
+    }
+
+    private void UpdateRecordingCounterText()
+    {
+        var accepted = _recordingCompletedTemplates.Count;
+        var phase = _recordingTakeFailed
+            ? "failed"
+            : _isCapturingGesture
+                ? "capturing"
+                : _isRecordingGesture
+                    ? "ready"
+                    : "idle";
+        RecordingCounterText.Text =
+            $"Accepted {accepted}/{RequiredTemplateCount}  Take {_recordingTakeIndex}/{RequiredTemplateCount}  Attempts {_recordingAttemptCount}  {_recordingGestureKind?.ToString() ?? "-"}  {phase}";
     }
 
     private void DeleteGestureButton_Click(object sender, RoutedEventArgs e)
     {
+        if (!GestureRecognitionEnabled)
+        {
+            Log("Gesture recognition is disabled for redesign; stored gesture editing is inactive.");
+            return;
+        }
+
         var name = GestureNameText.Text.Trim();
         if (string.IsNullOrWhiteSpace(name))
         {
@@ -803,10 +1314,46 @@ public partial class MainWindow : Window
         Log($"Deleted custom gesture: {name}");
     }
 
+    private void FlushGesturesButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (!GestureRecognitionEnabled)
+        {
+            Log("Gesture recognition is disabled for redesign; stored gesture editing is inactive.");
+            return;
+        }
+
+        FlushAllGestures();
+    }
+
+    private void FlushAllGestures()
+    {
+        if (_isRecordingGesture)
+        {
+            CancelGestureRecording();
+        }
+
+        _gestureStore.Save([]);
+        _gestureDefinitions.Clear();
+        _recognizer.SetDefinitions([]);
+        _recognizer.Reset("Gestures flushed");
+        _recordingCompletedTemplates.Clear();
+        _recordingSamples.Clear();
+        _recordingGestureKind = null;
+        StopGesturePlayback("Recorded custom gestures flushed.");
+        RefreshGestures();
+        RefreshBindings();
+        SelectGestureInList(string.Empty);
+        RecordingCounterText.Text = "Accepted 0/3  Idle";
+        RecordingWindowText.Text = "Idle";
+        RecordingStatusText.Text = "All recorded gestures flushed";
+        AppendDebugCascadeLine($"{DateTimeOffset.Now:HH:mm:ss.fff} Gestures flushed; recognizer reset.");
+        Log($"Flushed all recorded custom gestures from memory and {_gestureStorePath}.");
+    }
+
     private void CaptureRecordingSample(GestureFrameSample sample)
     {
         UpdateRecordingClock(sample.Timestamp);
-        if (!_isRecordingGesture)
+        if (!_isRecordingGesture || _recordingTakeFailed)
         {
             return;
         }
@@ -822,8 +1369,9 @@ public partial class MainWindow : Window
             _recordingSamples.Clear();
             RecordingProgressBar.Value = 0;
             RecordingWindowText.Text = "CAPTURING";
-            StateText.Text = $"Capturing: {_recordingGestureName}";
+            StateText.Text = $"Capturing: {_recordingGestureName} take {_recordingTakeIndex}/{RequiredTemplateCount}";
             OverlayStatusText.Text = "CAPTURING";
+            UpdateRecordingCounterText();
         }
 
         _recordingSamples.Add(sample);
@@ -833,24 +1381,22 @@ public partial class MainWindow : Window
             0,
             1);
         RecordingWindowText.Text = "CAPTURING";
-        RecordingStatusText.Text = $"{_recordingGestureName}: {elapsed.TotalMilliseconds:0}/{RecordingDuration.TotalMilliseconds:0} ms";
+        RecordingStatusText.Text =
+            $"{_recordingGestureName}: {elapsed.TotalMilliseconds:0}/{RecordingDuration.TotalMilliseconds:0} ms";
         OverlayStatusText.Text = $"CAPTURING  {elapsed.TotalMilliseconds:0} ms";
         if (elapsed < RecordingDuration)
         {
             return;
         }
 
-        _isRecordingGesture = false;
-        _isCapturingGesture = false;
-        RecordGestureButton.IsEnabled = true;
         RecordingProgressBar.Value = 100;
         RecordingWindowText.Text = "DONE";
-        SaveRecordedGestureTemplate();
+        FinishRecordingTake();
     }
 
     private void UpdateRecordingClock(DateTimeOffset now)
     {
-        if (!_isRecordingGesture)
+        if (!_isRecordingGesture || _recordingTakeFailed)
         {
             return;
         }
@@ -864,7 +1410,9 @@ public partial class MainWindow : Window
                 1);
             var remaining = Math.Max(0, (_recordingCaptureStartedAt - now).TotalMilliseconds);
             RecordingWindowText.Text = "GET READY";
-            RecordingStatusText.Text = $"{_recordingGestureName}: capture starts in {remaining:0} ms";
+            UpdateRecordingCounterText();
+            RecordingStatusText.Text =
+                $"{_recordingGestureName}: starts in {remaining:0} ms";
             OverlayStatusText.Text = "GET READY";
             return;
         }
@@ -877,7 +1425,8 @@ public partial class MainWindow : Window
         if (!_isCapturingGesture)
         {
             RecordingWindowText.Text = "CAPTURING";
-            StateText.Text = $"Capturing: {_recordingGestureName}";
+            StateText.Text = $"Capturing: {_recordingGestureName} take {_recordingTakeIndex}/{RequiredTemplateCount}";
+            UpdateRecordingCounterText();
         }
 
         if (elapsed < RecordingDuration)
@@ -885,24 +1434,76 @@ public partial class MainWindow : Window
             return;
         }
 
-        _isRecordingGesture = false;
-        _isCapturingGesture = false;
-        RecordGestureButton.IsEnabled = true;
         RecordingProgressBar.Value = 100;
         RecordingWindowText.Text = "DONE";
-        SaveRecordedGestureTemplate();
+        FinishRecordingTake();
     }
 
-    private void SaveRecordedGestureTemplate()
+    private void FinishRecordingTake()
     {
-        var template = GestureTemplateFactory.Create(_recordingSamples);
+        if (!_isRecordingGesture || _recordingTakeFailed)
+        {
+            return;
+        }
+
+        _isCapturingGesture = false;
+        var creation = GestureTemplateFactory.TryCreate(_recordingSamples);
+        var template = creation.Template;
         if (template is null || _recordingGestureName is null)
         {
-            RecordingStatusText.Text = "Recording failed: not enough tracked hand frames.";
-            RecordingWindowText.Text = "FAILED";
-            RecordGestureButton.IsEnabled = true;
-            Log("Gesture recording failed: not enough tracked hand frames.");
+            var reason = string.IsNullOrWhiteSpace(creation.FailureReason)
+                ? "Template creation returned no result."
+                : creation.FailureReason;
+            var failure = $"Take {_recordingTakeIndex}/{RequiredTemplateCount} failed: {reason} {FormatTemplateCreationCounts(creation)}";
+            _recordingTakeFailed = true;
+            _isCapturingGesture = false;
+            RecordingStatusText.Text = $"Take {_recordingTakeIndex}/{RequiredTemplateCount} failed";
+            RecordingWindowText.Text = "RETRY";
+            RecordGestureButton.Content = "Retry Take";
+            UpdateRecordingCounterText();
+            Log($"Gesture recording take failed: {_recordingGestureName} take {_recordingTakeIndex}/{RequiredTemplateCount}. {reason} {FormatTemplateCreationCounts(creation)}");
             _recordingSamples.Clear();
+            return;
+        }
+
+        if (_recordingGestureKind is not null && _recordingGestureKind.Value != template.Kind)
+        {
+            var failure =
+                $"Take {_recordingTakeIndex}/{RequiredTemplateCount} failed: detected {template.Kind}, but prior accepted takes are {_recordingGestureKind}. Record the session again with consistent motion. {FormatTemplateCreationCounts(creation)}";
+            _recordingTakeFailed = true;
+            _isCapturingGesture = false;
+            RecordingStatusText.Text = "Take type mismatch";
+            RecordingWindowText.Text = "TYPE MISMATCH";
+            RecordGestureButton.Content = "Retry Take";
+            UpdateRecordingCounterText();
+            Log($"Gesture recording type mismatch: {_recordingGestureName} take {_recordingTakeIndex}/{RequiredTemplateCount}. {failure}");
+            _recordingSamples.Clear();
+            return;
+        }
+
+        _recordingGestureKind ??= template.Kind;
+        _recordingCompletedTemplates.Add(template);
+        UpdateRecordingCounterText();
+        Log($"Captured gesture take: {_recordingGestureName} ({_recordingCompletedTemplates.Count}/{RequiredTemplateCount}) kind={template.Kind} motion={template.MotionSummary?.MotionScore:0.000} {FormatTemplateCreationCounts(creation)}");
+        _recordingSamples.Clear();
+
+        if (_recordingCompletedTemplates.Count < RequiredTemplateCount)
+        {
+            RecordingWindowText.Text = "TAKE SAVED";
+            var saved = $"{_recordingGestureName}: saved take {_recordingCompletedTemplates.Count}/{RequiredTemplateCount}.";
+            RecordingStatusText.Text = "Take saved";
+            BeginRecordingTake(_recordingCompletedTemplates.Count + 1, DateTimeOffset.UtcNow, saved);
+            return;
+        }
+
+        SaveRecordedGestureSession();
+    }
+
+    private void SaveRecordedGestureSession()
+    {
+        if (_recordingGestureName is null || _recordingCompletedTemplates.Count == 0)
+        {
+            CancelGestureRecording();
             return;
         }
 
@@ -920,16 +1521,55 @@ public partial class MainWindow : Window
             definitions.Add(definition);
         }
 
-        definition.Templates.Add(template);
+        definition.Templates.AddRange(_recordingCompletedTemplates);
         _gestureStore.Save(definitions);
+        var savedCount = _recordingCompletedTemplates.Count;
+        _recordingCompletedTemplates.Clear();
         _recordingSamples.Clear();
+        _recordingGestureKind = null;
+        _isRecordingGesture = false;
+        _isCapturingGesture = false;
+        _recordingTakeIndex = 0;
+        _recordingAttemptCount = 0;
+        _recordingTakeFailed = false;
+        RecordGestureButton.Content = "Record 3 Examples";
+        RecordGestureButton.IsEnabled = true;
         RefreshGestures();
+        SelectGestureInList(definition.Id);
+        RecordingCounterText.Text = $"Accepted {savedCount}/{RequiredTemplateCount}  Complete  {definition.Templates.LastOrDefault()?.Kind}";
 
         var remaining = Math.Max(0, RequiredTemplateCount - definition.Templates.Count);
         RecordingStatusText.Text = remaining == 0
-            ? $"{definition.DisplayName} active with {definition.Templates.Count} examples."
-            : $"{definition.DisplayName} saved. Record {remaining} more example(s).";
-        Log($"Saved gesture example: {definition.DisplayName} ({definition.Templates.Count}/{RequiredTemplateCount})");
+            ? $"{definition.DisplayName} active"
+            : $"{definition.DisplayName}: need {remaining} more";
+        Log($"Saved gesture session: {definition.DisplayName} (+{savedCount}, total {definition.Templates.Count}/{RequiredTemplateCount}) to {_gestureStorePath}");
+    }
+
+    private static string FormatRecordingSampleCounts(IReadOnlyList<GestureFrameSample> samples)
+    {
+        var landmarkFrames = samples.Count(x => x.Landmarks.Count >= 21);
+        var usableFrames = samples.Count(x => x.Landmarks.Count >= 21 && x.Confidence >= 0.35f);
+        var durationMilliseconds = samples.Count < 2
+            ? 0
+            : Math.Max(0, (samples[^1].Timestamp - samples[0].Timestamp).TotalMilliseconds);
+        var fps = durationMilliseconds <= 0
+            ? 0
+            : samples.Count * 1000.0 / durationMilliseconds;
+        var usableFps = durationMilliseconds <= 0
+            ? 0
+            : usableFrames * 1000.0 / durationMilliseconds;
+        return
+            $"{samples.Count} captured, {landmarkFrames} landmark, {usableFrames}/{GestureTemplateFactory.MinimumUsableSampleCount} usable, " +
+            $"fps {fps:0.0} / usable {usableFps:0.0}";
+    }
+
+    private static string FormatTemplateCreationCounts(GestureTemplateCreationResult creation)
+    {
+        return
+            $"Captured={creation.SourceFrameCount}, landmarks={creation.ValidLandmarkFrameCount}, " +
+            $"usable={creation.HighConfidenceFrameCount}, minConf={creation.MinimumConfidence:0.00}, " +
+            $"duration={creation.DurationMilliseconds:0} ms, kind={creation.Template?.Kind.ToString() ?? "-"}, " +
+            $"motion={creation.Template?.MotionSummary?.MotionScore ?? 0:0.000}.";
     }
 
     private static string CreateGestureId(string displayName, IReadOnlyList<GestureDefinition> existing)
@@ -947,8 +1587,7 @@ public partial class MainWindow : Window
 
         var id = baseId;
         var index = 2;
-        while (existing.Any(x => StringComparer.OrdinalIgnoreCase.Equals(x.Id, id))
-            || BuiltInGestureIds.Any(x => StringComparer.OrdinalIgnoreCase.Equals(x, id)))
+        while (existing.Any(x => StringComparer.OrdinalIgnoreCase.Equals(x.Id, id)))
         {
             id = $"{baseId}_{index}";
             index++;
@@ -980,7 +1619,7 @@ public partial class MainWindow : Window
     private void LogToUi(string line)
     {
         ActionLogList.Items.Insert(0, line);
-        while (ActionLogList.Items.Count > 80)
+        while (ActionLogList.Items.Count > MaxUiLogLines)
         {
             ActionLogList.Items.RemoveAt(ActionLogList.Items.Count - 1);
         }
@@ -1004,6 +1643,8 @@ public partial class MainWindow : Window
 
     protected override async void OnClosed(EventArgs e)
     {
+        _debugPlaybackTimer.Stop();
+        _gesturePlaybackTimer.Stop();
         _cameraLoopCts?.Cancel();
         await DisposeRuntimeAsync();
         base.OnClosed(e);
@@ -1017,23 +1658,249 @@ public partial class MainWindow : Window
         public override string ToString() => DisplayName;
     }
 
-    private void UpdateDebugLab(GestureRecognitionDebugSnapshot snapshot)
+    private sealed record GestureListItem(string Id, string DisplayName, string Status = "")
     {
-        if (PauseDebugCheckBox.IsChecked == true)
+        public override string ToString() => $"{DisplayName}  {Status}";
+    }
+
+    private sealed record DebugTimelinePoint(
+        DateTimeOffset Timestamp,
+        int FrameCount,
+        int UsableFrameCount,
+        double WindowDurationMilliseconds,
+        double EffectiveFps,
+        double UsableFps,
+        string? BestDisplayName,
+        float? BestConfidence,
+        GestureRecognitionPath Path,
+        float MotionScore,
+        string TriggerState,
+        GestureConfirmedMatch? ConfirmedMatch);
+
+    private void SelectGestureInList(string gestureId)
+    {
+        foreach (var item in GesturesList.Items.OfType<GestureListItem>())
+        {
+            if (StringComparer.OrdinalIgnoreCase.Equals(item.Id, gestureId))
+            {
+                GesturesList.SelectedItem = item;
+                return;
+            }
+        }
+    }
+
+    private void StartGesturePlayback(string gestureName, IReadOnlyList<GestureSkeletonFrame> frames)
+    {
+        _playbackGestureName = gestureName;
+        _playbackFrames = frames;
+        _playbackFrameIndex = 0;
+        DrawGesturePlaybackFrame();
+        _gesturePlaybackTimer.Start();
+    }
+
+    private void StopGesturePlayback(string message)
+    {
+        _gesturePlaybackTimer.Stop();
+        _playbackFrames = [];
+        _playbackFrameIndex = 0;
+        _playbackGestureName = string.Empty;
+        GesturePlaybackText.Text = "Recorded hand skeleton playback";
+        Log("Gesture playback stopped: " + message);
+        GesturePlaybackCanvas.Children.Clear();
+        GesturePlaybackCanvas.Children.Add(new TextBlock
+        {
+            Text = "No recorded skeleton selected.",
+            Foreground = Brushes.Gray,
+            Margin = new Thickness(10)
+        });
+    }
+
+    private void GesturePlaybackTimer_Tick(object? sender, EventArgs e)
+    {
+        if (_playbackFrames.Count == 0)
         {
             return;
         }
 
-        var best = snapshot.BestDisplayName is null
-            ? "best: -"
-            : $"best: {snapshot.BestDisplayName} {snapshot.BestConfidence:0.00}";
-        DebugStateText.Text =
-            $"{snapshot.TriggerState} | {best} | static: {snapshot.StaticGestureId ?? "-"} | frames: {snapshot.BufferFrameCount} / {snapshot.BufferDurationMilliseconds:0} ms";
+        _playbackFrameIndex = (_playbackFrameIndex + 1) % _playbackFrames.Count;
+        DrawGesturePlaybackFrame();
+    }
+
+    private void DrawGesturePlaybackFrame()
+    {
+        GesturePlaybackCanvas.Children.Clear();
+        if (_playbackFrames.Count == 0)
+        {
+            return;
+        }
+
+        var frame = _playbackFrames[Math.Clamp(_playbackFrameIndex, 0, _playbackFrames.Count - 1)];
+        if (frame.Landmarks.Count < 21)
+        {
+            GesturePlaybackText.Text = "Recorded hand skeleton playback";
+            Log($"{_playbackGestureName}: playback frame has {frame.Landmarks.Count}/21 landmarks");
+            return;
+        }
+
+        GesturePlaybackText.Text = "Recorded hand skeleton playback";
+
+        var width = Math.Max(1, GesturePlaybackCanvas.ActualWidth > 1 ? GesturePlaybackCanvas.ActualWidth : 400);
+        var height = Math.Max(1, GesturePlaybackCanvas.ActualHeight > 1 ? GesturePlaybackCanvas.ActualHeight : 146);
+        var pad = 16d;
+        var minX = frame.Landmarks.Min(x => x.X);
+        var maxX = frame.Landmarks.Max(x => x.X);
+        var minY = frame.Landmarks.Min(x => x.Y);
+        var maxY = frame.Landmarks.Max(x => x.Y);
+        var xSpan = Math.Max(0.001f, maxX - minX);
+        var ySpan = Math.Max(0.001f, maxY - minY);
+
+        Point Map(GestureSkeletonPoint point)
+        {
+            var x = pad + ((point.X - minX) / xSpan * Math.Max(1, width - (pad * 2)));
+            var y = pad + ((point.Y - minY) / ySpan * Math.Max(1, height - (pad * 2)));
+            return new Point(x, y);
+        }
+
+        foreach (var (start, end) in HandConnections)
+        {
+            var a = Map(frame.Landmarks[start]);
+            var b = Map(frame.Landmarks[end]);
+            GesturePlaybackCanvas.Children.Add(new Line
+            {
+                X1 = a.X,
+                Y1 = a.Y,
+                X2 = b.X,
+                Y2 = b.Y,
+                Stroke = Brushes.DeepSkyBlue,
+                StrokeThickness = 2,
+                StrokeStartLineCap = PenLineCap.Round,
+                StrokeEndLineCap = PenLineCap.Round
+            });
+        }
+
+        for (var i = 0; i < frame.Landmarks.Count; i++)
+        {
+            var point = Map(frame.Landmarks[i]);
+            var radius = i == 0 ? 4.2 : 3.2;
+            var dot = new Ellipse
+            {
+                Width = radius * 2,
+                Height = radius * 2,
+                Fill = i == 0 ? Brushes.Gold : Brushes.White,
+                Stroke = Brushes.Black,
+                StrokeThickness = 0.6
+            };
+            Canvas.SetLeft(dot, point.X - radius);
+            Canvas.SetTop(dot, point.Y - radius);
+            GesturePlaybackCanvas.Children.Add(dot);
+        }
+    }
+
+    private void UpdateDebugLab(GestureDebugFrame frame)
+    {
+        var snapshot = frame.Snapshot;
+        TrackClassifierLiveLog(snapshot);
+
+        if (PauseDebugCheckBox.IsChecked == true || !_debugLiveFollow)
+        {
+            UpdateDebugSlider(frame);
+            return;
+        }
+
+        TrackDebugTimelinePoint(snapshot);
+        RenderDebugFrame(frame);
+    }
+
+    private void SaveDebugFrame(GestureDebugFrame frame)
+    {
+        try
+        {
+            GestureDebugSession.AppendJsonLine(_debugTimelineLogPath, frame);
+        }
+        catch (Exception ex)
+        {
+            Log("Gesture debug timeline write failed: " + ex.Message);
+        }
+    }
+
+    private static GestureRecognitionDebugSnapshot CreateTrackingOnlyDebugSnapshot(
+        GestureFrameSample sample,
+        string triggerState)
+    {
+        return new GestureRecognitionDebugSnapshot(
+            Timestamp: sample.Timestamp,
+            BufferFrameCount: 1,
+            UsableFrameCount: sample.Landmarks.Count >= 21 && sample.Confidence >= 0.35f ? 1 : 0,
+            BufferDurationMilliseconds: 0,
+            BufferEffectiveFps: 0,
+            UsableEffectiveFps: 0,
+            CandidateTemplate: null,
+            CandidateFailureReason: triggerState,
+            Scores: [],
+            BestGestureId: null,
+            BestDisplayName: null,
+            BestConfidence: null,
+            BestTemplate: null,
+            MatchThreshold: 0.72f,
+            triggerState,
+            ConfirmedMatch: null,
+            WindowFrames:
+            [
+                new GestureDebugWindowFrame(
+                    Index: 0,
+                    TimeOffsetMilliseconds: 0,
+                    AgeMilliseconds: 0,
+                    Confidence: sample.Confidence,
+                    IsUsable: sample.Landmarks.Count >= 21 && sample.Confidence >= 0.35f,
+                    IsAcceptedMatch: false)
+            ]);
+    }
+
+    private void RenderDebugFrame(GestureDebugFrame frame)
+    {
+        UpdateSkeletonDebuggers(frame);
+
+        var snapshot = frame.Snapshot;
+        UpdateDebugSlider(frame);
+        DebugStateText.Text = _debugLiveFollow && PauseDebugCheckBox.IsChecked != true
+            ? "Live follow"
+            : "Scrubbed frame";
+        DebugRecordText.Text =
+            $"Frames {_debugSession.Frames.Count}  dropped {_debugSession.DroppedFrameCount}  selected #{frame.SequenceNumber}";
+        DebugSelectionText.Text = frame.Kind == GestureDebugFrameKind.NoHand
+            ? $"{frame.Timestamp:HH:mm:ss.fff} no hand: {frame.NoHandReason}"
+            : $"{frame.Timestamp:HH:mm:ss.fff} {snapshot.TriggerState}  conf={frame.Sample?.Confidence.ToString("0.00") ?? "-"}  action={frame.ActionState}";
 
         DebugScoresList.Items.Clear();
+        DebugScoresList.Items.Add(
+            $"{frame.Timestamp:HH:mm:ss.fff} {frame.Kind} source={frame.Source} {snapshot.TriggerState}");
+        DebugScoresList.Items.Add(
+            $"path={snapshot.DetectedPath} motion={snapshot.MotionScore:0.000} frames={snapshot.UsableFrameCount}/{snapshot.BufferFrameCount} fps={snapshot.UsableEffectiveFps:0.0}");
+        DebugScoresList.Items.Add(
+            $"candidate={(snapshot.CandidateTemplate is null ? "none" : snapshot.CandidateTemplate.Kind)} best={snapshot.BestDisplayName ?? "-"} conf={snapshot.BestConfidence?.ToString("0.00") ?? "-"} action={frame.ActionState}");
+        if (!string.IsNullOrWhiteSpace(snapshot.CandidateFailureReason))
+        {
+            DebugScoresList.Items.Add("candidate failure: " + snapshot.CandidateFailureReason);
+        }
+        if (!string.IsNullOrWhiteSpace(snapshot.RejectionReason))
+        {
+            DebugScoresList.Items.Add("rejection: " + snapshot.RejectionReason);
+        }
+        if (!string.IsNullOrWhiteSpace(frame.NoHandReason))
+        {
+            DebugScoresList.Items.Add("no hand: " + frame.NoHandReason);
+        }
+        if (snapshot.ConfirmedMatch is not null)
+        {
+            DebugScoresList.Items.Add(
+                $"CONFIRMED {snapshot.ConfirmedMatch.DisplayName} conf={snapshot.ConfirmedMatch.Confidence:0.00}");
+        }
+
         if (snapshot.Scores.Count == 0)
         {
-            DebugScoresList.Items.Add("No custom templates scored.");
+            DebugScoresList.Items.Add(string.IsNullOrWhiteSpace(snapshot.CandidateFailureReason)
+                ? "No custom templates scored."
+                : snapshot.CandidateFailureReason);
         }
         else
         {
@@ -1044,14 +1911,789 @@ public partial class MainWindow : Window
             {
                 var marker = score.IsBest ? "* " : "  ";
                 var template = score.TemplateIndex < 0 ? "-" : score.TemplateIndex.ToString();
-                var rawScore = float.IsFinite(score.Score) ? score.Score.ToString("0.000") : "-";
+                var rawScore = FormatDebugScore(score.Score);
+                var warp = score.WarpRatio is null ? string.Empty : $" warp={score.WarpRatio:0.00}";
                 DebugScoresList.Items.Add(
-                    $"{marker}{score.DisplayName} t{template} conf={score.Confidence:0.00} score={rawScore} threshold={snapshot.MatchThreshold:0.00} {score.Reason}");
+                    TrimDebugLine($"{marker}{score.DisplayName} {score.Kind} t{template} conf={score.Confidence:0.00} score={rawScore} threshold={snapshot.MatchThreshold:0.00}{warp} {score.Reason}", 112));
             }
         }
 
-        DrawDebugPaths(snapshot);
+        DrawDebugSessionTimeline(frame);
+        DrawSelectedRawSkeleton(frame);
+        DrawRollingWindowFrames(DebugMatchCanvas, snapshot, "selected frame rolling 2s input window");
         UpdateDebugVectors(snapshot);
+        DrawDebugPaths(snapshot);
+    }
+
+    private void UpdateDebugSlider(GestureDebugFrame? selected)
+    {
+        _isUpdatingDebugSlider = true;
+        try
+        {
+            var frameCount = _debugSession.Frames.Count;
+            DebugFrameSlider.Maximum = Math.Max(0, frameCount - 1);
+            DebugFrameSlider.IsEnabled = frameCount > 0;
+            if (selected is null)
+            {
+                DebugFrameSlider.Value = 0;
+                return;
+            }
+
+            var index = _debugSession.Frames
+                .Select((frame, frameIndex) => (frame, frameIndex))
+                .FirstOrDefault(x => x.frame.SequenceNumber == selected.SequenceNumber)
+                .frameIndex;
+        DebugFrameSlider.Value = Math.Clamp(index, 0, Math.Max(0, frameCount - 1));
+        }
+        finally
+        {
+            _isUpdatingDebugSlider = false;
+        }
+    }
+
+    private void UpdateSkeletonDebuggers(GestureDebugFrame frame)
+    {
+        SkeletonVideoDebugView.UpdateSession(
+            _debugSession.Frames,
+            frame,
+            _debugLiveFollow,
+            _debugSession.DroppedFrameCount,
+            _debugTimelineLogPath);
+        _skeletonDebugWindow?.UpdateSession(
+            _debugSession.Frames,
+            frame,
+            _debugLiveFollow,
+            _debugSession.DroppedFrameCount,
+            _debugTimelineLogPath);
+        SkeletonDebuggerStatusText.Text =
+            $"Saved {_debugSession.Frames.Count} in-memory frames; writing every frame to {System.IO.Path.GetFileName(_debugTimelineLogPath)}";
+    }
+
+    private void AppendDebugCascadeLine(string line)
+    {
+        DebugScoresList.Items.Insert(0, line);
+        while (DebugScoresList.Items.Count > MaxUiLogLines)
+        {
+            DebugScoresList.Items.RemoveAt(DebugScoresList.Items.Count - 1);
+        }
+    }
+
+    private void TrackClassifierLiveLog(GestureRecognitionDebugSnapshot snapshot)
+    {
+        if (snapshot.Timestamp == DateTimeOffset.MinValue)
+        {
+            return;
+        }
+
+        var closest = FindClosestScore(snapshot);
+        WriteClassifierFrameLog(snapshot, closest);
+        Log(FormatClassifierLiveLog(snapshot, closest));
+    }
+
+    private void WriteClassifierFrameLog(
+        GestureRecognitionDebugSnapshot snapshot,
+        GestureTemplateScore? closest)
+    {
+        var record = new
+        {
+            Timestamp = snapshot.Timestamp,
+            Snapshot = new
+            {
+                snapshot.TriggerState,
+                Path = snapshot.DetectedPath.ToString(),
+                snapshot.MotionScore,
+                snapshot.BufferFrameCount,
+                snapshot.UsableFrameCount,
+                snapshot.BufferDurationMilliseconds,
+                snapshot.BufferEffectiveFps,
+                snapshot.UsableEffectiveFps,
+                snapshot.CandidateFailureReason,
+                snapshot.RejectionReason,
+                snapshot.MatchThreshold,
+                snapshot.BestGestureId,
+                snapshot.BestDisplayName,
+                snapshot.BestConfidence,
+                snapshot.StaticPoseScore,
+                snapshot.DtwScore,
+                snapshot.DtwWarpRatio,
+                snapshot.ActiveSegmentStartMilliseconds,
+                snapshot.ActiveSegmentEndMilliseconds
+            },
+            Confirmed = snapshot.ConfirmedMatch,
+            Definitions = new
+            {
+                Count = _gestureDefinitions.Count,
+                Ids = _gestureDefinitions.Select(x => x.Id).ToList()
+            },
+            ClosestScore = closest is null ? null : CreateScoreLogRecord(closest),
+            Scores = snapshot.Scores.Select(CreateScoreLogRecord).ToList(),
+            CandidateTemplate = CreateTemplateLogRecord(snapshot.CandidateTemplate),
+            BestTemplate = CreateTemplateLogRecord(snapshot.BestTemplate),
+            DtwPath = snapshot.DtwPath,
+            WindowFrames = snapshot.WindowFrames
+        };
+
+        try
+        {
+            System.IO.File.AppendAllText(
+                _classifierFrameLogPath,
+                JsonSerializer.Serialize(record) + Environment.NewLine);
+        }
+        catch
+        {
+        }
+    }
+
+    private static object CreateScoreLogRecord(GestureTemplateScore score)
+    {
+        return new
+        {
+            score.GestureId,
+            score.DisplayName,
+            score.TemplateIndex,
+            Kind = score.Kind.ToString(),
+            score.Score,
+            score.Confidence,
+            score.IsEligible,
+            score.IsBest,
+            score.Reason,
+            score.WarpRatio
+        };
+    }
+
+    private static object? CreateTemplateLogRecord(GestureTemplate? template)
+    {
+        if (template is null)
+        {
+            return null;
+        }
+
+        return new
+        {
+            Kind = template.Kind.ToString(),
+            template.SourceFrameCount,
+            template.SourceSkeletonFrameCount,
+            template.DurationMilliseconds,
+            template.AverageConfidence,
+            Motion = template.MotionSummary,
+            ActiveSegment = template.ActiveSegment,
+            SampleCount = template.Samples.Count,
+            FeatureFrameCount = template.FeatureFrames?.Count ?? 0,
+            SkeletonFrameCount = template.SkeletonFrames?.Count ?? 0,
+            Samples = template.Samples.Select(x => new
+            {
+                x.TimeOffsetMilliseconds,
+                x.CenterX,
+                x.CenterY,
+                x.Values
+            }).ToList(),
+            FeatureFrames = template.FeatureFrames?.Select(x => new
+            {
+                x.TimeOffsetMilliseconds,
+                x.CenterX,
+                x.CenterY,
+                x.PalmOrientationRadians,
+                x.PalmVelocity,
+                x.Values
+            }).ToList(),
+            SkeletonFrames = template.SkeletonFrames?.Select(x => new
+            {
+                x.TimeOffsetMilliseconds,
+                x.Landmarks
+            }).ToList()
+        };
+    }
+
+    private static string FormatClassifierLiveLog(
+        GestureRecognitionDebugSnapshot snapshot,
+        GestureTemplateScore? closest)
+    {
+        var match = snapshot.ConfirmedMatch is null
+            ? snapshot.BestDisplayName is null
+                ? "match=-"
+                : $"best={snapshot.BestDisplayName} conf={snapshot.BestConfidence:0.00}"
+            : $"CONFIRMED {snapshot.ConfirmedMatch.DisplayName} conf={snapshot.ConfirmedMatch.Confidence:0.00}";
+        var closestText = closest is null
+            ? "closest=-"
+            : $"closest={closest.DisplayName} {closest.Kind} t{closest.TemplateIndex} conf={closest.Confidence:0.00} score={FormatDebugScore(closest.Score)} {closest.Reason}";
+        var activeSegment = snapshot.ActiveSegmentStartMilliseconds is null
+            ? "active=-"
+            : $"active={snapshot.ActiveSegmentStartMilliseconds:0}-{snapshot.ActiveSegmentEndMilliseconds:0}ms";
+        var rejection = string.IsNullOrWhiteSpace(snapshot.RejectionReason)
+            ? string.Empty
+            : $" reject=\"{snapshot.RejectionReason}\"";
+
+        return
+            $"Classifier: {snapshot.TriggerState}; {match}; path={snapshot.DetectedPath}; motion={snapshot.MotionScore:0.000}; " +
+            $"{activeSegment}; frames={snapshot.UsableFrameCount}/{snapshot.BufferFrameCount}; fps={snapshot.UsableEffectiveFps:0.0}; defs={snapshot.Scores.Select(x => x.GestureId).Distinct().Count()}; {closestText}{rejection}";
+    }
+
+    private void TrackDebugTimelinePoint(GestureRecognitionDebugSnapshot snapshot)
+    {
+        if (snapshot.Timestamp == DateTimeOffset.MinValue)
+        {
+            return;
+        }
+
+        _debugTimelineHistory.Add(new DebugTimelinePoint(
+            snapshot.Timestamp,
+            snapshot.BufferFrameCount,
+            snapshot.UsableFrameCount,
+            snapshot.BufferDurationMilliseconds,
+            snapshot.BufferEffectiveFps,
+            snapshot.UsableEffectiveFps,
+            snapshot.BestDisplayName,
+            snapshot.BestConfidence,
+            snapshot.DetectedPath,
+            snapshot.MotionScore,
+            snapshot.TriggerState,
+            snapshot.ConfirmedMatch));
+
+        var cutoff = snapshot.Timestamp - DebugTimelineHistoryDuration;
+        _debugTimelineHistory.RemoveAll(x => x.Timestamp < cutoff);
+    }
+
+    private void DrawDebugSessionTimeline(GestureDebugFrame selectedFrame)
+    {
+        DebugTimelineCanvas.Children.Clear();
+        var frames = _debugSession.Frames;
+        var width = Math.Max(1, DebugTimelineCanvas.ActualWidth > 1 ? DebugTimelineCanvas.ActualWidth : 400);
+        var height = Math.Max(1, DebugTimelineCanvas.ActualHeight > 1 ? DebugTimelineCanvas.ActualHeight : 66);
+        var pad = 10d;
+        var top = 24d;
+        var usableWidth = Math.Max(1, width - (pad * 2));
+        var barHeight = Math.Max(12, height - 42);
+
+        DebugTimelineCanvas.Children.Add(new TextBlock
+        {
+            Text = $"session timeline | {frames.Count} frames | selected #{selectedFrame.SequenceNumber}",
+            Foreground = Brushes.LightGray,
+            FontSize = 12,
+            Margin = new Thickness(8, 4, 0, 0)
+        });
+
+        if (frames.Count == 0)
+        {
+            return;
+        }
+
+        var background = new Rectangle
+        {
+            Width = usableWidth,
+            Height = barHeight,
+            Fill = new SolidColorBrush(Color.FromRgb(26, 31, 39)),
+            Stroke = new SolidColorBrush(Color.FromRgb(51, 58, 72)),
+            StrokeThickness = 1
+        };
+        Canvas.SetLeft(background, pad);
+        Canvas.SetTop(background, top);
+        DebugTimelineCanvas.Children.Add(background);
+
+        var first = frames[0].Timestamp;
+        var last = frames[^1].Timestamp;
+        var duration = Math.Max(1, (last - first).TotalMilliseconds);
+        var frameWidth = Math.Max(2, usableWidth / Math.Max(1, frames.Count));
+        foreach (var frame in frames)
+        {
+            var x = pad + Math.Clamp((frame.Timestamp - first).TotalMilliseconds / duration, 0, 1)
+                * Math.Max(1, usableWidth - frameWidth);
+            var rect = new Rectangle
+            {
+                Width = Math.Max(1.5, frameWidth - 1),
+                Height = frame.SequenceNumber == selectedFrame.SequenceNumber ? barHeight : Math.Max(5, barHeight * 0.72),
+                Fill = DebugFrameBrush(frame),
+                Opacity = frame.SequenceNumber == selectedFrame.SequenceNumber ? 1.0 : 0.82
+            };
+            Canvas.SetLeft(rect, x);
+            Canvas.SetTop(rect, top + barHeight - rect.Height);
+            DebugTimelineCanvas.Children.Add(rect);
+        }
+    }
+
+    private void DrawSelectedRawSkeleton(GestureDebugFrame frame)
+    {
+        DebugSkeletonCanvas.Children.Clear();
+        if (frame.Sample?.Landmarks is not { Count: >= 21 } landmarks)
+        {
+            DebugSkeletonCanvas.Children.Add(new TextBlock
+            {
+                Text = string.IsNullOrWhiteSpace(frame.NoHandReason)
+                    ? "No hand skeleton for selected frame"
+                    : frame.NoHandReason,
+                Foreground = Brushes.Gray,
+                Margin = new Thickness(10)
+            });
+            return;
+        }
+
+        var width = Math.Max(1, DebugSkeletonCanvas.ActualWidth > 1 ? DebugSkeletonCanvas.ActualWidth : 400);
+        var height = Math.Max(1, DebugSkeletonCanvas.ActualHeight > 1 ? DebugSkeletonCanvas.ActualHeight : 114);
+        var pad = 12d;
+        var minX = landmarks.Min(x => x.X);
+        var maxX = landmarks.Max(x => x.X);
+        var minY = landmarks.Min(x => x.Y);
+        var maxY = landmarks.Max(x => x.Y);
+        var xSpan = Math.Max(0.001f, maxX - minX);
+        var ySpan = Math.Max(0.001f, maxY - minY);
+
+        Point Map(HandLandmark point)
+        {
+            var x = pad + ((point.X - minX) / xSpan * Math.Max(1, width - (pad * 2)));
+            var y = pad + ((point.Y - minY) / ySpan * Math.Max(1, height - (pad * 2)));
+            return new Point(x, y);
+        }
+
+        foreach (var (start, end) in HandConnections)
+        {
+            var a = Map(landmarks[start]);
+            var b = Map(landmarks[end]);
+            DebugSkeletonCanvas.Children.Add(new Line
+            {
+                X1 = a.X,
+                Y1 = a.Y,
+                X2 = b.X,
+                Y2 = b.Y,
+                Stroke = Brushes.Gold,
+                StrokeThickness = 1.6,
+                StrokeStartLineCap = PenLineCap.Round,
+                StrokeEndLineCap = PenLineCap.Round
+            });
+        }
+
+        for (var i = 0; i < Math.Min(21, landmarks.Count); i++)
+        {
+            var point = Map(landmarks[i]);
+            var radius = i == 0 ? 4.4 : 3.2;
+            var dot = new Ellipse
+            {
+                Width = radius * 2,
+                Height = radius * 2,
+                Fill = i == 0 ? Brushes.DeepSkyBlue : Brushes.White,
+                Stroke = Brushes.Black,
+                StrokeThickness = 0.6
+            };
+            Canvas.SetLeft(dot, point.X - radius);
+            Canvas.SetTop(dot, point.Y - radius);
+            DebugSkeletonCanvas.Children.Add(dot);
+        }
+
+        DebugSkeletonCanvas.Children.Add(new TextBlock
+        {
+            Text = $"raw skeleton | conf={frame.Sample.Confidence:0.00} | handedness={frame.Sample.Handedness:0.00}",
+            Foreground = Brushes.LightGray,
+            FontSize = 12,
+            Margin = new Thickness(8, 4, 0, 0)
+        });
+    }
+
+    private static Brush DebugFrameBrush(GestureDebugFrame frame)
+    {
+        if (frame.Kind == GestureDebugFrameKind.NoHand)
+        {
+            return Brushes.DimGray;
+        }
+        if (frame.Snapshot.ConfirmedMatch is not null)
+        {
+            return Brushes.Lime;
+        }
+        if (frame.Recognition is not null)
+        {
+            return Brushes.Gold;
+        }
+        if (frame.Snapshot.CandidateTemplate is null)
+        {
+            return Brushes.SteelBlue;
+        }
+        if (!string.IsNullOrWhiteSpace(frame.Snapshot.RejectionReason)
+            || frame.ClosestScore is { IsEligible: false })
+        {
+            return Brushes.OrangeRed;
+        }
+
+        return Brushes.DeepSkyBlue;
+    }
+
+    private static void DrawRollingWindowFrames(
+        Canvas canvas,
+        GestureRecognitionDebugSnapshot snapshot,
+        string label)
+    {
+        canvas.Children.Clear();
+        var frames = snapshot.WindowFrames ?? [];
+        var width = Math.Max(1, canvas.ActualWidth > 1 ? canvas.ActualWidth : 400);
+        var height = Math.Max(1, canvas.ActualHeight > 1 ? canvas.ActualHeight : 66);
+        var pad = 10d;
+        var top = 22d;
+        var usableWidth = Math.Max(1, width - (pad * 2));
+        var barHeight = Math.Max(8, height - 38);
+
+        var background = new Rectangle
+        {
+            Width = usableWidth,
+            Height = barHeight,
+            Fill = new SolidColorBrush(Color.FromRgb(26, 31, 39)),
+            Stroke = new SolidColorBrush(Color.FromRgb(51, 58, 72)),
+            StrokeThickness = 1
+        };
+        Canvas.SetLeft(background, pad);
+        Canvas.SetTop(background, top);
+        canvas.Children.Add(background);
+
+        if (frames.Count == 0)
+        {
+            canvas.Children.Add(new TextBlock
+            {
+                Text = "no frames in rolling window",
+                Foreground = Brushes.Gray,
+                FontSize = 12,
+                Margin = new Thickness(10, 4, 0, 0)
+            });
+            return;
+        }
+
+        var maxTime = Math.Max(1, frames.Max(x => x.TimeOffsetMilliseconds));
+        var frameWidth = Math.Max(2, usableWidth / Math.Max(1, frames.Count));
+        foreach (var frame in frames)
+        {
+            var x = pad + ((frame.TimeOffsetMilliseconds / maxTime) * Math.Max(1, usableWidth - frameWidth));
+            var confidenceHeight = Math.Clamp(frame.Confidence, 0, 1) * barHeight;
+            var fill = frame.IsAcceptedMatch
+                ? Brushes.Lime
+                : frame.IsUsable
+                    ? Brushes.DeepSkyBlue
+                    : Brushes.DimGray;
+            var rect = new Rectangle
+            {
+                Width = Math.Max(1.5, frameWidth - 1),
+                Height = Math.Max(3, confidenceHeight),
+                Fill = fill,
+                Opacity = frame.IsAcceptedMatch ? 1 : 0.82
+            };
+            Canvas.SetLeft(rect, x);
+            Canvas.SetTop(rect, top + barHeight - rect.Height);
+            canvas.Children.Add(rect);
+        }
+
+        var status = snapshot.ConfirmedMatch is null
+            ? $"accepted match frames: 0"
+            : $"accepted match frames: {frames.Count(x => x.IsAcceptedMatch)} ({snapshot.ConfirmedMatch.DisplayName} {snapshot.ConfirmedMatch.Confidence:0.00})";
+        canvas.Children.Add(new TextBlock
+        {
+            Text = $"{label} | frames {snapshot.UsableFrameCount}/{snapshot.BufferFrameCount} | fps {snapshot.UsableEffectiveFps:0.0} | {status}",
+            Foreground = snapshot.ConfirmedMatch is null ? Brushes.LightGray : Brushes.Lime,
+            FontSize = 12,
+            Margin = new Thickness(8, 4, 0, 0)
+        });
+    }
+
+    private static double MapDebugTimelineTime(
+        DateTimeOffset timestamp,
+        DateTimeOffset start,
+        DateTimeOffset end,
+        double left,
+        double width)
+    {
+        var duration = Math.Max(1, (end - start).TotalMilliseconds);
+        var offset = Math.Clamp((timestamp - start).TotalMilliseconds / duration, 0, 1);
+        return left + (offset * width);
+    }
+
+    private void DrawDebugSkeletonComparison(GestureRecognitionDebugSnapshot snapshot)
+    {
+        DebugSkeletonCanvas.Children.Clear();
+        var candidateFrames = snapshot.CandidateTemplate?.SkeletonFrames;
+        var templateFrames = snapshot.BestTemplate?.SkeletonFrames;
+        if (candidateFrames is not { Count: > 0 } && templateFrames is not { Count: > 0 })
+        {
+            DebugSkeletonCanvas.Children.Add(new TextBlock
+            {
+                Text = string.IsNullOrWhiteSpace(snapshot.CandidateFailureReason)
+                    ? "Waiting for candidate skeleton"
+                    : snapshot.CandidateFailureReason,
+                Foreground = Brushes.Gray,
+                Margin = new Thickness(10)
+            });
+            return;
+        }
+
+        var width = Math.Max(1, DebugSkeletonCanvas.ActualWidth > 1 ? DebugSkeletonCanvas.ActualWidth : 400);
+        var height = Math.Max(1, DebugSkeletonCanvas.ActualHeight > 1 ? DebugSkeletonCanvas.ActualHeight : 114);
+        var halfWidth = width / 2;
+        if (candidateFrames is { Count: > 0 })
+        {
+            DrawSkeletonStrip(DebugSkeletonCanvas, candidateFrames, 0, halfWidth, height, Brushes.Gold);
+        }
+
+        if (templateFrames is { Count: > 0 })
+        {
+            DrawSkeletonStrip(DebugSkeletonCanvas, templateFrames, halfWidth, halfWidth, height, Brushes.DeepSkyBlue);
+        }
+
+        DebugSkeletonCanvas.Children.Add(new Line
+        {
+            X1 = halfWidth,
+            X2 = halfWidth,
+            Y1 = 8,
+            Y2 = height - 8,
+            Stroke = new SolidColorBrush(Color.FromRgb(43, 49, 61)),
+            StrokeThickness = 1
+        });
+    }
+
+    private static void DrawSkeletonStrip(
+        Canvas canvas,
+        IReadOnlyList<GestureSkeletonFrame> frames,
+        double left,
+        double width,
+        double height,
+        Brush stroke)
+    {
+        var selectedFrames = SelectSkeletonStripFrames(frames, 4);
+        if (selectedFrames.Count == 0)
+        {
+            return;
+        }
+
+        var cellWidth = Math.Max(1, width / selectedFrames.Count);
+        for (var i = 0; i < selectedFrames.Count; i++)
+        {
+            DrawMiniSkeleton(canvas, selectedFrames[i], left + (i * cellWidth), 0, cellWidth, height, stroke);
+        }
+    }
+
+    private static List<GestureSkeletonFrame> SelectSkeletonStripFrames(
+        IReadOnlyList<GestureSkeletonFrame> frames,
+        int count)
+    {
+        if (frames.Count == 0 || count <= 0)
+        {
+            return [];
+        }
+
+        if (frames.Count <= count)
+        {
+            return frames.ToList();
+        }
+
+        var result = new List<GestureSkeletonFrame>(count);
+        for (var i = 0; i < count; i++)
+        {
+            var index = (int)Math.Round(i * (frames.Count - 1) / (double)(count - 1));
+            result.Add(frames[index]);
+        }
+
+        return result;
+    }
+
+    private static void DrawMiniSkeleton(
+        Canvas canvas,
+        GestureSkeletonFrame frame,
+        double left,
+        double top,
+        double width,
+        double height,
+        Brush stroke)
+    {
+        if (frame.Landmarks.Count < 21)
+        {
+            return;
+        }
+
+        var pad = 8d;
+        var minX = frame.Landmarks.Min(x => x.X);
+        var maxX = frame.Landmarks.Max(x => x.X);
+        var minY = frame.Landmarks.Min(x => x.Y);
+        var maxY = frame.Landmarks.Max(x => x.Y);
+        var xSpan = Math.Max(0.001f, maxX - minX);
+        var ySpan = Math.Max(0.001f, maxY - minY);
+
+        Point Map(GestureSkeletonPoint point)
+        {
+            var x = left + pad + ((point.X - minX) / xSpan * Math.Max(1, width - (pad * 2)));
+            var y = top + pad + ((point.Y - minY) / ySpan * Math.Max(1, height - (pad * 2)));
+            return new Point(x, y);
+        }
+
+        foreach (var (start, end) in HandConnections)
+        {
+            var a = Map(frame.Landmarks[start]);
+            var b = Map(frame.Landmarks[end]);
+            canvas.Children.Add(new Line
+            {
+                X1 = a.X,
+                Y1 = a.Y,
+                X2 = b.X,
+                Y2 = b.Y,
+                Stroke = stroke,
+                StrokeThickness = 1.2,
+                StrokeStartLineCap = PenLineCap.Round,
+                StrokeEndLineCap = PenLineCap.Round,
+                Opacity = 0.9
+            });
+        }
+
+        var wrist = Map(frame.Landmarks[0]);
+        var dot = new Ellipse
+        {
+            Width = 4,
+            Height = 4,
+            Fill = Brushes.White,
+            Opacity = 0.9
+        };
+        Canvas.SetLeft(dot, wrist.X - 2);
+        Canvas.SetTop(dot, wrist.Y - 2);
+        canvas.Children.Add(dot);
+    }
+
+    private void DrawDebugMatchAlignment(GestureRecognitionDebugSnapshot snapshot)
+    {
+        DebugMatchCanvas.Children.Clear();
+        var candidate = snapshot.CandidateTemplate?.Samples;
+        var template = snapshot.BestTemplate?.Samples ?? FindBestTemplate(snapshot);
+        if (candidate is not { Count: > 0 } || template is not { Count: > 0 })
+        {
+            DebugMatchCanvas.Children.Add(new TextBlock
+            {
+                Text = string.IsNullOrWhiteSpace(snapshot.CandidateFailureReason)
+                    ? "Waiting for a candidate/template comparison"
+                    : snapshot.CandidateFailureReason,
+                Foreground = Brushes.Gray,
+                Margin = new Thickness(10)
+            });
+            return;
+        }
+
+        var count = Math.Min(candidate.Count, template.Count);
+        if (count == 0)
+        {
+            return;
+        }
+
+        var distances = new float[count];
+        var sum = 0f;
+        var worst = 0f;
+        var worstIndex = 0;
+        for (var i = 0; i < count; i++)
+        {
+            var distance = SampleDistance(candidate[i], template[i]);
+            distances[i] = distance;
+            sum += distance;
+            if (distance > worst)
+            {
+                worst = distance;
+                worstIndex = i;
+            }
+        }
+
+        var average = sum / count;
+        var closestScore = FindClosestScore(snapshot);
+        var confidence = closestScore?.Confidence ?? Math.Clamp(1f - (average / 0.9f), 0, 1);
+        var width = Math.Max(1, DebugMatchCanvas.ActualWidth > 1 ? DebugMatchCanvas.ActualWidth : 400);
+        var height = Math.Max(1, DebugMatchCanvas.ActualHeight > 1 ? DebugMatchCanvas.ActualHeight : 88);
+        var pad = 14d;
+        var usableWidth = Math.Max(1, width - (pad * 2));
+        var topY = 24d;
+        var bottomY = 52d;
+        var barBaseY = height - 8;
+        var maxDistance = Math.Max(0.35f, worst);
+
+        DebugMatchCanvas.Children.Add(new Line
+        {
+            X1 = pad,
+            X2 = pad + usableWidth,
+            Y1 = topY,
+            Y2 = topY,
+            Stroke = new SolidColorBrush(Color.FromRgb(70, 74, 85)),
+            StrokeThickness = 1
+        });
+        DebugMatchCanvas.Children.Add(new Line
+        {
+            X1 = pad,
+            X2 = pad + usableWidth,
+            Y1 = bottomY,
+            Y2 = bottomY,
+            Stroke = new SolidColorBrush(Color.FromRgb(70, 74, 85)),
+            StrokeThickness = 1
+        });
+
+        for (var i = 0; i < count; i++)
+        {
+            var x = pad + (count <= 1 ? 0 : usableWidth * i / (count - 1));
+            var brush = DistanceBrush(distances[i]);
+            DebugMatchCanvas.Children.Add(new Line
+            {
+                X1 = x,
+                X2 = x,
+                Y1 = topY,
+                Y2 = bottomY,
+                Stroke = brush,
+                StrokeThickness = i == worstIndex ? 2.4 : 1.2,
+                Opacity = i == worstIndex ? 1.0 : 0.72
+            });
+
+            var radius = i == worstIndex ? 3.2 : 2.2;
+            var topDot = new Ellipse
+            {
+                Width = radius * 2,
+                Height = radius * 2,
+                Fill = Brushes.Gold,
+                Stroke = brush,
+                StrokeThickness = 0.8
+            };
+            Canvas.SetLeft(topDot, x - radius);
+            Canvas.SetTop(topDot, topY - radius);
+            DebugMatchCanvas.Children.Add(topDot);
+
+            var bottomDot = new Ellipse
+            {
+                Width = radius * 2,
+                Height = radius * 2,
+                Fill = Brushes.DeepSkyBlue,
+                Stroke = brush,
+                StrokeThickness = 0.8
+            };
+            Canvas.SetLeft(bottomDot, x - radius);
+            Canvas.SetTop(bottomDot, bottomY - radius);
+            DebugMatchCanvas.Children.Add(bottomDot);
+
+            var barHeight = Math.Clamp(distances[i] / maxDistance, 0, 1) * 18;
+            var bar = new Rectangle
+            {
+                Width = Math.Max(2, usableWidth / count * 0.62),
+                Height = barHeight,
+                Fill = brush,
+                Opacity = 0.85
+            };
+            Canvas.SetLeft(bar, x - (bar.Width / 2));
+            Canvas.SetTop(bar, barBaseY - barHeight);
+            DebugMatchCanvas.Children.Add(bar);
+        }
+
+        var label = closestScore is null
+            ? $"closest: -  avg d={average:0.000}  worst #{worstIndex + 1}={worst:0.000}"
+            : $"closest: {closestScore.DisplayName} t{closestScore.TemplateIndex}  conf={confidence:0.00}/{snapshot.MatchThreshold:0.00}  avg d={average:0.000}  worst #{worstIndex + 1}={worst:0.000}";
+        DebugMatchCanvas.Children.Add(new TextBlock
+        {
+            Text = label,
+            Foreground = confidence >= snapshot.MatchThreshold ? Brushes.Lime : Brushes.LightGray,
+            FontSize = 12,
+            Margin = new Thickness(8, 3, 0, 0)
+        });
+
+        DebugMatchCanvas.Children.Add(new TextBlock
+        {
+            Text = "candidate",
+            Foreground = Brushes.Gold,
+            FontSize = 10,
+            Margin = new Thickness(8, topY - 18, 0, 0)
+        });
+        DebugMatchCanvas.Children.Add(new TextBlock
+        {
+            Text = "template",
+            Foreground = Brushes.DeepSkyBlue,
+            FontSize = 10,
+            Margin = new Thickness(8, bottomY - 2, 0, 0)
+        });
     }
 
     private void DrawDebugPaths(GestureRecognitionDebugSnapshot snapshot)
@@ -1062,7 +2704,7 @@ public partial class MainWindow : Window
             (snapshot.CandidateTemplate?.Samples ?? [], Brushes.Gold, 3)
         };
 
-        var bestScore = snapshot.Scores.FirstOrDefault(x => x.IsBest);
+        var bestScore = FindClosestScore(snapshot);
         if (bestScore is not null)
         {
             var definition = _gestureDefinitions.FirstOrDefault(x =>
@@ -1122,12 +2764,11 @@ public partial class MainWindow : Window
         var candidate = snapshot.CandidateTemplate?.Samples;
         if (candidate is null || candidate.Count == 0)
         {
-            DebugCandidateText.Text = "No candidate vector";
+            DebugCandidateText.Text = "Raw classifier vectors";
             return;
         }
 
-        DebugCandidateText.Text =
-            $"candidate: {candidate.Count} samples, {snapshot.CandidateTemplate!.SourceFrameCount} source frames, avg conf {snapshot.CandidateTemplate.AverageConfidence:0.00}";
+        DebugCandidateText.Text = "Raw classifier vectors";
         if (DebugRawVectorsCheckBox.IsChecked != true)
         {
             return;
@@ -1147,6 +2788,11 @@ public partial class MainWindow : Window
 
     private IReadOnlyList<GestureTemplateSample>? FindBestTemplate(GestureRecognitionDebugSnapshot snapshot)
     {
+        if (snapshot.BestTemplate?.Samples is { Count: > 0 } samples)
+        {
+            return samples;
+        }
+
         var bestScore = snapshot.Scores.FirstOrDefault(x => x.IsBest);
         if (bestScore is null || bestScore.TemplateIndex < 1)
         {
@@ -1158,6 +2804,47 @@ public partial class MainWindow : Window
         return definition is null || definition.Templates.Count < bestScore.TemplateIndex
             ? null
             : definition.Templates[bestScore.TemplateIndex - 1].Samples;
+    }
+
+    private static GestureTemplateScore? FindClosestScore(GestureRecognitionDebugSnapshot snapshot)
+    {
+        return snapshot.Scores
+            .Where(x => x.TemplateIndex > 0 && float.IsFinite(x.Score))
+            .OrderBy(x => x.Score)
+            .FirstOrDefault();
+    }
+
+    private static string FormatDebugScore(float score)
+    {
+        return !float.IsFinite(score) || score > 999
+            ? "-"
+            : score.ToString("0.000");
+    }
+
+    private static string TrimDebugLine(string value, int maxLength)
+    {
+        return value.Length <= maxLength
+            ? value
+            : value[..Math.Max(0, maxLength - 1)] + "...";
+    }
+
+    private static Brush DistanceBrush(float distance)
+    {
+        var normalized = Math.Clamp(distance / 0.42f, 0, 1);
+        byte red;
+        byte green;
+        if (normalized < 0.5f)
+        {
+            red = (byte)(80 + normalized * 2 * 175);
+            green = 220;
+        }
+        else
+        {
+            red = 255;
+            green = (byte)(220 - ((normalized - 0.5f) * 2 * 150));
+        }
+
+        return new SolidColorBrush(Color.FromRgb(red, green, 70));
     }
 
     private static Point MapDebugPoint(
