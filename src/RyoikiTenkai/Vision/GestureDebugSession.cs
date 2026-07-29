@@ -186,7 +186,10 @@ internal sealed class GestureDebugSession
                 frame.Sample.Confidence,
                 frame.Sample.BoundingBox,
                 frame.Sample.Handedness,
-                frame.Sample.Landmarks
+                frame.Sample.Landmarks,
+                FingerPose = frame.Sample.Landmarks.Count >= 21
+                    ? GestureFeatureExtractor.AnalyzeFingerPose(frame.Sample.Landmarks)
+                    : null
             },
             Snapshot = new
             {
@@ -207,6 +210,7 @@ internal sealed class GestureDebugSession
                 frame.Snapshot.StaticPoseScore,
                 frame.Snapshot.DtwScore,
                 frame.Snapshot.DtwWarpRatio,
+                frame.Snapshot.ScoreBreakdown,
                 frame.Snapshot.ActiveSegmentStartMilliseconds,
                 frame.Snapshot.ActiveSegmentEndMilliseconds,
                 frame.Snapshot.ConfirmedMatch,
@@ -236,11 +240,20 @@ internal sealed class GestureDebugSession
             template.AverageConfidence,
             template.MotionSummary,
             template.ActiveSegment,
+            template.Topology,
+            template.SourceRecordingId,
             SampleCount = template.Samples.Count,
             FeatureFrameCount = template.FeatureFrames?.Count ?? 0,
             SkeletonFrameCount = template.SkeletonFrames?.Count ?? 0,
             template.Samples,
             template.FeatureFrames,
+            FingerStates = template.FeatureFrames?.Select(x => new
+            {
+                x.TimeOffsetMilliseconds,
+                Straightness = x.FingerStraightness,
+                Mask = x.FingerStateMask,
+                MaskText = GestureFeatureExtractor.FormatFingerMask(x.FingerStateMask)
+            }).ToList(),
             template.SkeletonFrames
         };
     }

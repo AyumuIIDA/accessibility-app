@@ -6,8 +6,15 @@ internal static class GestureTemplateFactory
 {
     private static readonly int[] LandmarkIds = [0, 4, 5, 8, 9, 12, 13, 16, 17, 20];
     internal const int MinimumUsableSampleCount = 40;
-    internal const double MinimumSampleRateFps = 30;
+    internal const double MinimumSampleRateFps = 20;
     internal const double MinimumDurationMilliseconds = 1900;
+    internal const float MinimumTopologyChangeScore = 0.32f;
+    internal const float MinimumPalmTravel = 0.22f;
+    internal const float MinimumPalmOrientationRangeRadians = 0.45f;
+    internal const float MinimumHandednessRange = 0.20f;
+    internal const float MinimumPalmTurnScore = 0.55f;
+    internal const float MinimumPalmCompressionDrop = 0.30f;
+    internal const float MinimumFingerStraightnessRange = 0.30f;
     private const float MinimumConfidence = 0.35f;
     private const int ResampledLength = 32;
 
@@ -31,9 +38,13 @@ internal static class GestureTemplateFactory
         var sourceDurationMilliseconds = orderedSourceSamples.Count < 2
             ? 0
             : Math.Max(0, (orderedSourceSamples[^1].Timestamp - orderedSourceSamples[0].Timestamp).TotalMilliseconds);
+        var usableEffectiveFps = sourceDurationMilliseconds <= 0
+            ? 0
+            : highConfidenceFrameCount / (sourceDurationMilliseconds / 1000.0);
 
         if (samples.Count < MinimumUsableSampleCount
-            || sourceDurationMilliseconds < MinimumDurationMilliseconds)
+            || sourceDurationMilliseconds < MinimumDurationMilliseconds
+            || usableEffectiveFps < MinimumSampleRateFps)
         {
             return new GestureTemplateCreationResult(
                 Template: null,
@@ -46,17 +57,40 @@ internal static class GestureTemplateFactory
                     sourceSamples.Count,
                     validLandmarkFrameCount,
                     highConfidenceFrameCount,
-                    sourceDurationMilliseconds));
+                    sourceDurationMilliseconds,
+                    usableEffectiveFps));
         }
 
         var normalized = Normalize(samples);
         var resampled = Resample(normalized, ResampledLength);
         var skeletonFrames = NormalizeSkeleton(samples);
         var featureSequence = GestureFeatureExtractor.Extract(samples);
+        var featureFrames = GestureFeatureExtractor.BuildUnifiedSequence(featureSequence);
+        var topology = GestureFeatureExtractor.SummarizeTopology(featureSequence.Frames);
+        var featureTrack = GestureFeatureExtractor.BuildFeatureTrack(samples);
         var kind = GestureFeatureExtractor.DetectKind(featureSequence.Motion);
-        var featureFrames = kind == GestureKind.Static
-            ? GestureFeatureExtractor.BuildStaticPose(featureSequence.Frames)
-            : GestureFeatureExtractor.BuildDynamicMotion(featureSequence);
+        if (kind == GestureKind.Static && topology.PalmTurnScore >= MinimumPalmTurnScore)
+        {
+            kind = GestureKind.Dynamic;
+        }
+        if (kind == GestureKind.Static
+            && (topology.FingerStateTransitionCount > 0
+                || topology.FingerStraightnessRangeMax >= MinimumFingerStraightnessRange))
+        {
+            kind = GestureKind.Dynamic;
+        }
+        if (!HasMeaningfulTopologyChange(topology))
+        {
+            return new GestureTemplateCreationResult(
+                Template: null,
+                SourceFrameCount: sourceSamples.Count,
+                ValidLandmarkFrameCount: validLandmarkFrameCount,
+                HighConfidenceFrameCount: highConfidenceFrameCount,
+                MinimumConfidence: MinimumConfidence,
+                DurationMilliseconds: sourceDurationMilliseconds,
+                FailureReason: CreateTopologyFailureReason(topology));
+        }
+
         var duration = (samples[^1].Timestamp - samples[0].Timestamp).TotalMilliseconds;
         var template = new GestureTemplate(
             Samples: resampled,
@@ -68,7 +102,9 @@ internal static class GestureTemplateFactory
             FeatureFrames: featureFrames,
             MotionSummary: featureSequence.Motion,
             SourceSkeletonFrameCount: skeletonFrames.Count,
-            ActiveSegment: featureSequence.ActiveSegment);
+            ActiveSegment: featureSequence.ActiveSegment,
+            Topology: topology,
+            FeatureTrack: featureTrack);
         return new GestureTemplateCreationResult(
             Template: template,
             SourceFrameCount: sourceSamples.Count,
@@ -100,7 +136,9 @@ internal static class GestureTemplateFactory
                 x.CenterY,
                 PalmOrientationRadians: 0,
                 PalmVelocity: 0,
-                x.Values))
+                x.Values,
+                GestureFeatureExtractor.ReadFingerStraightness(x.Values),
+                GestureFeatureExtractor.ReadFingerStateMask(x.Values)))
             .ToList();
 
         var motion = template.MotionSummary ?? new GestureMotionSummary(
@@ -114,15 +152,56 @@ internal static class GestureTemplateFactory
         {
             Kind = kind,
             FeatureFrames = featureFrames,
-            MotionSummary = motion
+            MotionSummary = motion,
+            Topology = template.Topology ?? GestureFeatureExtractor.SummarizeTopology(featureFrames),
+            FeatureTrack = template.FeatureTrack ?? new GestureFeatureTrack(
+                featureFrames.Select(x => x.Features ?? new GestureFrameFeatures(
+                    x.TimeOffsetMilliseconds,
+                    x.CenterX,
+                    x.CenterY,
+                    x.PalmOrientationRadians,
+                    x.PalmVelocity,
+                    GestureFeatureExtractor.ReadSignedPalmArea(x),
+                    GestureFeatureExtractor.ReadPalmCompression(x),
+                    GestureFeatureExtractor.ReadPalmDepthRange(x),
+                    0,
+                    GestureFeatureExtractor.ReadHandedness(x),
+                    0,
+                    x.FingerStraightness ?? GestureFeatureExtractor.ReadFingerStraightness(x.Values),
+                    x.FingerStateMask)).ToList(),
+                GestureFeatureExtractor.BuildFeatureSummary(featureFrames))
         };
+    }
+
+    private static bool HasMeaningfulTopologyChange(GestureTopologySummary topology)
+    {
+        return topology.TopologyChangeScore >= MinimumTopologyChangeScore
+            || topology.PalmTravel >= MinimumPalmTravel
+            || topology.PalmOrientationRangeRadians >= MinimumPalmOrientationRangeRadians
+            || topology.HandednessRange >= MinimumHandednessRange
+            || topology.PalmTurnScore >= MinimumPalmTurnScore
+            || topology.FingerStraightnessRangeMax >= MinimumFingerStraightnessRange
+            || topology.FingerStateTransitionCount > 0;
+    }
+
+    private static string CreateTopologyFailureReason(GestureTopologySummary topology)
+    {
+        return
+            "Captured a stable pose, not a gesture movement. " +
+            $"topology score={topology.TopologyChangeScore:0.000}, travel={topology.PalmTravel:0.000}, " +
+            $"palm angle={topology.PalmOrientationRangeRadians * 180 / MathF.PI:0.0} deg, " +
+            $"handedness range={topology.HandednessRange:0.000}, palm turn={topology.PalmTurnScore:0.000}, " +
+            $"area crossings={topology.SignedPalmAreaSignChanges}, compression drop={topology.PalmCompressionDrop:0.000}, " +
+            $"finger transitions={topology.FingerStateTransitionCount}, finger curl range={topology.FingerStraightnessRangeMax:0.000}. " +
+            "Move/flip/change shape more during the capture window; for grab, start with an open palm and finish with a closed fist inside the capture window.";
     }
 
     private static string CreateFailureReason(
         int sourceFrameCount,
         int validLandmarkFrameCount,
         int highConfidenceFrameCount,
-        double durationMilliseconds)
+        double durationMilliseconds,
+        double usableEffectiveFps)
     {
         if (sourceFrameCount == 0)
         {
@@ -144,6 +223,12 @@ internal static class GestureTemplateFactory
         {
             return
                 $"Captured {validLandmarkFrameCount} landmark frame(s), but only {highConfidenceFrameCount} met confidence >= {MinimumConfidence:0.00}; need {MinimumUsableSampleCount} usable frames over about 2 seconds for resampling.";
+        }
+
+        if (usableEffectiveFps < MinimumSampleRateFps)
+        {
+            return
+                $"Captured {usableEffectiveFps:0.0} usable fps, but gesture recordings need {MinimumSampleRateFps:0.0}+ fps for reliable frame-by-frame recognition.";
         }
 
         return

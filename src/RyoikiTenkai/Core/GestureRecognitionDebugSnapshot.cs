@@ -26,7 +26,8 @@ internal sealed record GestureRecognitionDebugSnapshot(
     float? DtwWarpRatio = null,
     string RejectionReason = "",
     IReadOnlyList<GestureDtwPoint>? DtwPath = null,
-    IReadOnlyList<GestureDebugWindowFrame>? WindowFrames = null);
+    IReadOnlyList<GestureDebugWindowFrame>? WindowFrames = null,
+    GestureScoreBreakdown? ScoreBreakdown = null);
 
 internal sealed record GestureConfirmedMatch(
     string GestureId,
@@ -44,7 +45,8 @@ internal sealed record GestureTemplateScore(
     string Reason,
     bool IsBest,
     GestureKind Kind = GestureKind.Dynamic,
-    float? WarpRatio = null);
+    float? WarpRatio = null,
+    GestureScoreBreakdown? Breakdown = null);
 
 internal readonly record struct GestureDtwPoint(int CandidateIndex, int TemplateIndex);
 

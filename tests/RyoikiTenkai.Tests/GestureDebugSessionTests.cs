@@ -73,7 +73,7 @@ public sealed class GestureDebugSessionTests
             [
                 new GestureTemplateScore("hold", "Hold", 1, 0.2f, 0.78f, true, "Eligible", true)
             ]),
-            new GestureRecognitionResult("hold", "Hold", 0.78f, "custom-static", TimeSpan.FromSeconds(2)),
+            new GestureRecognitionResult("hold", "Hold", 0.78f, "custom-unified", TimeSpan.FromSeconds(2)),
             hasBoundAction: true,
             source: "native",
             elapsedText: "8 ms");

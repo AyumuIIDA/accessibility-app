@@ -5,10 +5,18 @@ namespace RyoikiTenkai.Vision;
 internal static class GestureFeatureExtractor
 {
     internal const int DynamicResampledLength = 32;
+    internal const int UnifiedSequenceLength = 32;
     internal const int StaticFeatureLength = 1;
     internal const float StaticMotionThreshold = 0.18f;
     internal const float ActiveVelocityThreshold = 0.09f;
+    internal const int FingerStraightnessOffset = (21 * 2) + 5 + 4;
+    internal const int FingerStraightnessLength = 5;
+    internal const int HandednessOffset = FingerStraightnessOffset + FingerStraightnessLength + 2;
+    internal const int SignedPalmAreaOffset = HandednessOffset + 1;
+    internal const int PalmCompressionOffset = SignedPalmAreaOffset + 1;
+    internal const int PalmDepthRangeOffset = PalmCompressionOffset + 1;
     private const float MinimumConfidence = 0.35f;
+    private const float FingerOpenThreshold = 0.55f;
     private static readonly int[] FingerBases = [1, 5, 9, 13, 17];
     private static readonly int[] FingerTips = [4, 8, 12, 16, 20];
 
@@ -36,7 +44,10 @@ internal static class GestureFeatureExtractor
             var sin = MathF.Sin(-orientation);
             var centerX = (indexMcp.X - wrist.X) / scale;
             var centerY = (indexMcp.Y - wrist.Y) / scale;
-            var values = new float[(21 * 2) + 5 + 4 + 2 + 1];
+            var fingerPose = AnalyzeFingerPose(sample.Landmarks);
+            var timeOffsetMilliseconds = (sample.Timestamp - firstTimestamp).TotalMilliseconds;
+            var features = AnalyzePalmTurn(sample, scale, orientation, timeOffsetMilliseconds, 0, 0, 0, fingerPose);
+            var values = new float[(21 * 2) + 5 + 4 + 5 + 2 + 1 + 3];
             var offset = 0;
             for (var landmarkIndex = 0; landmarkIndex < 21; landmarkIndex++)
             {
@@ -61,12 +72,20 @@ internal static class GestureFeatureExtractor
                 values[offset++] = Math.Clamp(Distance(previous, current) / scale, 0, 3);
             }
 
+            foreach (var straightness in fingerPose.Straightness)
+            {
+                values[offset++] = straightness;
+            }
+
             values[offset++] = MathF.Sin(orientation);
             values[offset++] = MathF.Cos(orientation);
-            values[offset] = sample.Handedness;
+            values[offset++] = sample.Handedness;
+            values[offset++] = features.SignedPalmArea;
+            values[offset++] = features.PalmCompression;
+            values[offset] = features.PalmDepthRange;
 
             rawFrames.Add(new RawFeatureFrame(
-                (sample.Timestamp - firstTimestamp).TotalMilliseconds,
+                timeOffsetMilliseconds,
                 sample.Timestamp,
                 wrist.X,
                 wrist.Y,
@@ -74,7 +93,10 @@ internal static class GestureFeatureExtractor
                 orientation,
                 centerX,
                 centerY,
-                values));
+                values,
+                fingerPose.Straightness,
+                fingerPose.StateMask,
+                features));
         }
 
         var peakVelocity = 0f;
@@ -108,7 +130,13 @@ internal static class GestureFeatureExtractor
             {
                 CenterX = previousCenterX,
                 CenterY = previousCenterY,
-                Velocity = velocity
+                Velocity = velocity,
+                Features = rawFrames[i].Features with
+                {
+                    PalmCenterX = previousCenterX,
+                    PalmCenterY = previousCenterY,
+                    PalmVelocity = velocity
+                }
             };
         }
 
@@ -123,7 +151,10 @@ internal static class GestureFeatureExtractor
                 x.CenterY,
                 x.Orientation,
                 x.Velocity,
-                x.Values))
+                x.Values,
+                x.FingerStraightness,
+                x.FingerStateMask,
+                x.Features))
             .ToList();
         var summary = new GestureMotionSummary(motionScore, averageVelocity, peakVelocity, duration, frames.Count);
         return new GestureFeatureSequence(frames, summary, FindActiveSegment(frames));
@@ -132,6 +163,107 @@ internal static class GestureFeatureExtractor
     public static GestureKind DetectKind(GestureMotionSummary motion)
     {
         return motion.MotionScore < StaticMotionThreshold ? GestureKind.Static : GestureKind.Dynamic;
+    }
+
+    public static List<GestureFeatureFrame> BuildUnifiedSequence(GestureFeatureSequence sequence)
+    {
+        return Resample(sequence.Frames, UnifiedSequenceLength);
+    }
+
+    public static GestureTopologySummary SummarizeTopology(IReadOnlyList<GestureFeatureFrame> frames)
+    {
+        if (frames.Count == 0)
+        {
+            return new GestureTopologySummary(0, 0, 0, 0, 0, 0, 0);
+        }
+
+        var palmTravel = 0f;
+        for (var i = 1; i < frames.Count; i++)
+        {
+            var dx = frames[i].CenterX - frames[i - 1].CenterX;
+            var dy = frames[i].CenterY - frames[i - 1].CenterY;
+            palmTravel += MathF.Sqrt((dx * dx) + (dy * dy));
+        }
+
+        var unwrappedAngles = UnwrapAngles(frames.Select(x => x.PalmOrientationRadians).ToList());
+        var orientationRange = unwrappedAngles.Count == 0
+            ? 0
+            : unwrappedAngles.Max() - unwrappedAngles.Min();
+        var handednessValues = frames.Select(ReadHandedness).ToList();
+        var handednessRange = handednessValues.Count == 0
+            ? 0
+            : handednessValues.Max() - handednessValues.Min();
+        var transitions = 0;
+        for (var i = 1; i < frames.Count; i++)
+        {
+            transitions += CountSetBits(frames[i - 1].FingerStateMask ^ frames[i].FingerStateMask);
+        }
+
+        var fingerStraightnessRangeMax = MaxFingerStraightnessRange(frames);
+        var signedAreas = frames.Select(ReadSignedPalmArea).ToList();
+        var areaRange = signedAreas.Count == 0 ? 0 : signedAreas.Max() - signedAreas.Min();
+        var areaSignChanges = CountSignChanges(signedAreas);
+        var compressionValues = frames.Select(ReadPalmCompression).Where(x => x > 0).ToList();
+        var compressionMin = compressionValues.Count == 0 ? 0 : compressionValues.Min();
+        var compressionMax = compressionValues.Count == 0 ? 0 : compressionValues.Max();
+        var compressionDrop = compressionMax <= 0 ? 0 : Math.Clamp((compressionMax - compressionMin) / compressionMax, 0, 1);
+        var depthMax = frames.Select(ReadPalmDepthRange).DefaultIfEmpty(0).Max();
+        var palmTurnScore = (areaSignChanges > 0 ? 0.38f : 0)
+            + (compressionDrop * 0.42f)
+            + Math.Clamp(areaRange * 8f, 0, 0.35f)
+            + Math.Clamp(depthMax * 2.5f, 0, 0.30f);
+        var changeScore = palmTravel
+            + (orientationRange * 0.6f)
+            + (handednessRange * 0.8f)
+            + (transitions * 0.15f)
+            + (fingerStraightnessRangeMax * 0.75f)
+            + palmTurnScore;
+        return new GestureTopologySummary(
+            palmTravel,
+            orientationRange,
+            handednessRange,
+            transitions,
+            frames[0].FingerStateMask,
+            frames[^1].FingerStateMask,
+            changeScore,
+            areaRange,
+            areaSignChanges,
+            compressionMin,
+            compressionDrop,
+            depthMax,
+            palmTurnScore,
+            fingerStraightnessRangeMax);
+    }
+
+    public static GestureFeatureTrack BuildFeatureTrack(IReadOnlyList<GestureFrameSample> sourceSamples)
+    {
+        var sequence = Extract(sourceSamples);
+        var frames = sequence.Frames
+            .Select(frame => frame.Features ?? FeatureFrameToFeatures(frame))
+            .ToList();
+        return new GestureFeatureTrack(frames, BuildFeatureSummary(sequence.Frames));
+    }
+
+    public static GestureFeatureSummary BuildFeatureSummary(IReadOnlyList<GestureFeatureFrame> frames)
+    {
+        var topology = SummarizeTopology(frames);
+        var compressionValues = frames.Select(ReadPalmCompression).Where(x => x > 0).ToList();
+        return new GestureFeatureSummary(
+            topology.PalmTravel,
+            topology.PalmOrientationRangeRadians,
+            topology.HandednessRange,
+            topology.FingerStateTransitionCount,
+            topology.StartFingerStateMask,
+            topology.EndFingerStateMask,
+            topology.SignedPalmAreaRange,
+            topology.SignedPalmAreaSignChanges,
+            topology.PalmCompressionMin,
+            compressionValues.Count == 0 ? 0 : compressionValues.Max(),
+            topology.PalmCompressionDrop,
+            topology.PalmDepthRangeMax,
+            topology.PalmTurnScore,
+            topology.FingerStraightnessRangeMax,
+            topology.TopologyChangeScore);
     }
 
     public static List<GestureFeatureFrame> BuildStaticPose(IReadOnlyList<GestureFeatureFrame> frames)
@@ -267,7 +399,10 @@ internal static class GestureFeatureExtractor
             centerY / count,
             MathF.Atan2(orientationSin / count, orientationCos / count),
             frames.Average(x => x.PalmVelocity),
-            values);
+            values,
+            ReadFingerStraightness(values),
+            ReadFingerStateMask(values),
+            FeatureFrameToFeatures(timeOffsetMilliseconds, centerX / count, centerY / count, MathF.Atan2(orientationSin / count, orientationCos / count), frames.Average(x => x.PalmVelocity), values));
     }
 
     private static GestureFeatureFrame Interpolate(
@@ -288,7 +423,288 @@ internal static class GestureFeatureExtractor
             Lerp(a.CenterY, b.CenterY, t),
             LerpAngle(a.PalmOrientationRadians, b.PalmOrientationRadians, t),
             Lerp(a.PalmVelocity, b.PalmVelocity, t),
-            values);
+            values,
+            ReadFingerStraightness(values),
+            ReadFingerStateMask(values),
+            InterpolateFeatures(a, b, timeOffsetMilliseconds, t, values));
+    }
+
+    public static GestureFingerPose AnalyzeFingerPose(IReadOnlyList<HandLandmark> landmarks)
+    {
+        if (landmarks.Count < 21)
+        {
+            return new GestureFingerPose([0, 0, 0, 0, 0], 0);
+        }
+
+        var wrist = landmarks[0];
+        var straightness = new List<float>(FingerTips.Length);
+        var mask = 0;
+        for (var fingerIndex = 0; fingerIndex < FingerTips.Length; fingerIndex++)
+        {
+            var basePoint = landmarks[FingerBases[fingerIndex]];
+            var tipPoint = landmarks[FingerTips[fingerIndex]];
+            var baseDistance = Math.Max(0.001f, Distance(wrist, basePoint));
+            var tipDistance = Distance(wrist, tipPoint);
+            var ratio = tipDistance / baseDistance;
+            var value = Math.Clamp((ratio - 1.05f) / 0.65f, 0, 1);
+            straightness.Add(value);
+            if (value >= FingerOpenThreshold)
+            {
+                mask |= 1 << fingerIndex;
+            }
+        }
+
+        return new GestureFingerPose(straightness, mask);
+    }
+
+    public static string FormatFingerMask(int mask)
+    {
+        return string.Create(5, mask, (span, state) =>
+        {
+            for (var i = 0; i < span.Length; i++)
+            {
+                span[i] = (state & (1 << i)) == 0 ? '0' : '1';
+            }
+        });
+    }
+
+    internal static List<float> ReadFingerStraightness(float[] values)
+    {
+        if (values.Length < FingerStraightnessOffset + FingerStraightnessLength)
+        {
+            return [0, 0, 0, 0, 0];
+        }
+
+        return values
+            .Skip(FingerStraightnessOffset)
+            .Take(FingerStraightnessLength)
+            .ToList();
+    }
+
+    internal static int ReadFingerStateMask(float[] values)
+    {
+        var straightness = ReadFingerStraightness(values);
+        var mask = 0;
+        for (var i = 0; i < straightness.Count; i++)
+        {
+            if (straightness[i] >= FingerOpenThreshold)
+            {
+                mask |= 1 << i;
+            }
+        }
+
+        return mask;
+    }
+
+    internal static float ReadHandedness(GestureFeatureFrame frame)
+    {
+        return frame.Values.Length > HandednessOffset ? frame.Values[HandednessOffset] : 0;
+    }
+
+    internal static float ReadSignedPalmArea(GestureFeatureFrame frame)
+    {
+        return frame.Values.Length > SignedPalmAreaOffset ? frame.Values[SignedPalmAreaOffset] : frame.Features?.SignedPalmArea ?? 0;
+    }
+
+    internal static float ReadPalmCompression(GestureFeatureFrame frame)
+    {
+        return frame.Values.Length > PalmCompressionOffset ? frame.Values[PalmCompressionOffset] : frame.Features?.PalmCompression ?? 0;
+    }
+
+    internal static float ReadPalmDepthRange(GestureFeatureFrame frame)
+    {
+        return frame.Values.Length > PalmDepthRangeOffset ? frame.Values[PalmDepthRangeOffset] : frame.Features?.PalmDepthRange ?? 0;
+    }
+
+    private static GestureFrameFeatures AnalyzePalmTurn(
+        GestureFrameSample sample,
+        float scale,
+        float orientation,
+        double timeOffsetMilliseconds,
+        float centerX,
+        float centerY,
+        float velocity,
+        GestureFingerPose fingerPose)
+    {
+        var landmarks = sample.Landmarks;
+        var wrist = landmarks[0];
+        var middleMcp = landmarks[9];
+        var indexMcp = landmarks[5];
+        var pinkyMcp = landmarks[17];
+        var palmAxisLength = Math.Max(0.001f, Distance(wrist, middleMcp));
+        var signedPalmArea = (((indexMcp.X - wrist.X) * (pinkyMcp.Y - wrist.Y))
+            - ((indexMcp.Y - wrist.Y) * (pinkyMcp.X - wrist.X))) / Math.Max(0.001f, scale * scale);
+        var palmCompression = Distance(indexMcp, pinkyMcp) / palmAxisLength;
+        var zValues = landmarks.Take(21).Select(x => x.Z).ToList();
+        var depthRange = (zValues.Max() - zValues.Min()) / Math.Max(0.001f, scale);
+        var bboxAspect = 0f;
+        if (sample.BoundingBox is { } box)
+        {
+            var width = Math.Max(0, box.X2 - box.X1);
+            var height = Math.Max(0.001f, box.Y2 - box.Y1);
+            bboxAspect = width / height;
+        }
+
+        return new GestureFrameFeatures(
+            timeOffsetMilliseconds,
+            centerX,
+            centerY,
+            orientation,
+            velocity,
+            signedPalmArea,
+            palmCompression,
+            depthRange,
+            bboxAspect,
+            sample.Handedness,
+            sample.Confidence,
+            fingerPose.Straightness,
+            fingerPose.StateMask);
+    }
+
+    private static GestureFrameFeatures FeatureFrameToFeatures(
+        double timeOffsetMilliseconds,
+        float centerX,
+        float centerY,
+        float orientation,
+        float velocity,
+        float[] values)
+    {
+        return new GestureFrameFeatures(
+            timeOffsetMilliseconds,
+            centerX,
+            centerY,
+            orientation,
+            velocity,
+            values.Length > SignedPalmAreaOffset ? values[SignedPalmAreaOffset] : 0,
+            values.Length > PalmCompressionOffset ? values[PalmCompressionOffset] : 0,
+            values.Length > PalmDepthRangeOffset ? values[PalmDepthRangeOffset] : 0,
+            0,
+            values.Length > HandednessOffset ? values[HandednessOffset] : 0,
+            0,
+            ReadFingerStraightness(values),
+            ReadFingerStateMask(values));
+    }
+
+    private static GestureFrameFeatures FeatureFrameToFeatures(GestureFeatureFrame frame)
+    {
+        return FeatureFrameToFeatures(
+            frame.TimeOffsetMilliseconds,
+            frame.CenterX,
+            frame.CenterY,
+            frame.PalmOrientationRadians,
+            frame.PalmVelocity,
+            frame.Values);
+    }
+
+    private static GestureFrameFeatures InterpolateFeatures(
+        GestureFeatureFrame a,
+        GestureFeatureFrame b,
+        double timeOffsetMilliseconds,
+        float t,
+        float[] values)
+    {
+        var af = a.Features ?? FeatureFrameToFeatures(a);
+        var bf = b.Features ?? FeatureFrameToFeatures(b);
+        return new GestureFrameFeatures(
+            timeOffsetMilliseconds,
+            Lerp(af.PalmCenterX, bf.PalmCenterX, t),
+            Lerp(af.PalmCenterY, bf.PalmCenterY, t),
+            LerpAngle(af.PalmAxisRadians, bf.PalmAxisRadians, t),
+            Lerp(af.PalmVelocity, bf.PalmVelocity, t),
+            values.Length > SignedPalmAreaOffset ? values[SignedPalmAreaOffset] : 0,
+            values.Length > PalmCompressionOffset ? values[PalmCompressionOffset] : 0,
+            values.Length > PalmDepthRangeOffset ? values[PalmDepthRangeOffset] : 0,
+            Lerp(af.BoundingBoxAspect, bf.BoundingBoxAspect, t),
+            Lerp(af.Handedness, bf.Handedness, t),
+            Lerp(af.Confidence, bf.Confidence, t),
+            ReadFingerStraightness(values),
+            ReadFingerStateMask(values));
+    }
+
+    private static List<float> UnwrapAngles(IReadOnlyList<float> angles)
+    {
+        if (angles.Count == 0)
+        {
+            return [];
+        }
+
+        var result = new List<float>(angles.Count) { angles[0] };
+        var previous = angles[0];
+        var offset = 0f;
+        for (var i = 1; i < angles.Count; i++)
+        {
+            var current = angles[i];
+            var delta = current - previous;
+            if (delta > MathF.PI)
+            {
+                offset -= MathF.PI * 2;
+            }
+            else if (delta < -MathF.PI)
+            {
+                offset += MathF.PI * 2;
+            }
+
+            result.Add(current + offset);
+            previous = current;
+        }
+
+        return result;
+    }
+
+    private static int CountSetBits(int value)
+    {
+        var count = 0;
+        while (value != 0)
+        {
+            count += value & 1;
+            value >>= 1;
+        }
+
+        return count;
+    }
+
+    private static int CountSignChanges(IReadOnlyList<float> values)
+    {
+        var changes = 0;
+        var previous = 0;
+        foreach (var value in values)
+        {
+            var sign = MathF.Abs(value) < 0.002f ? 0 : MathF.Sign(value);
+            if (sign == 0)
+            {
+                continue;
+            }
+
+            if (previous != 0 && sign != previous)
+            {
+                changes++;
+            }
+
+            previous = sign;
+        }
+
+        return changes;
+    }
+
+    private static float MaxFingerStraightnessRange(IReadOnlyList<GestureFeatureFrame> frames)
+    {
+        var maxRange = 0f;
+        for (var fingerIndex = 0; fingerIndex < FingerStraightnessLength; fingerIndex++)
+        {
+            var values = frames
+                .Select(frame =>
+                {
+                    var straightness = frame.FingerStraightness ?? ReadFingerStraightness(frame.Values);
+                    return fingerIndex < straightness.Count ? straightness[fingerIndex] : 0;
+                })
+                .ToList();
+            if (values.Count > 0)
+            {
+                maxRange = Math.Max(maxRange, values.Max() - values.Min());
+            }
+        }
+
+        return maxRange;
     }
 
     private static float Lerp(float a, float b, float t)
@@ -328,7 +744,10 @@ internal static class GestureFeatureExtractor
         float Orientation,
         float CenterX,
         float CenterY,
-        float[] Values)
+        float[] Values,
+        List<float> FingerStraightness,
+        int FingerStateMask,
+        GestureFrameFeatures Features)
     {
         public float Velocity { get; init; }
     }

@@ -71,7 +71,7 @@ public sealed class WindowGestureRecognizerDebugTests
     }
 
     [Fact]
-    public void Recognize_DoesNotReportStaticGestureWithoutCustomDefinitions()
+    public void Recognize_DoesNotReportGestureWithoutCustomDefinitions()
     {
         var recognizer = new WindowGestureRecognizer();
 
@@ -174,11 +174,11 @@ public sealed class WindowGestureRecognizerDebugTests
     [Fact]
     public void DebugSnapshot_MarksConfirmedWindowFramesAsAcceptedMatch()
     {
-        var template = GestureTemplateFactory.Create(GestureTemplateFactoryTests.CreateHoldSamples());
+        var template = GestureTemplateFactory.Create(GestureTemplateFactoryTests.CreateWaveSamples());
         Assert.NotNull(template);
-        var recognizer = CreateRecognizer("hold", template);
+        var recognizer = CreateRecognizer("wave", template);
 
-        var result = Feed(recognizer, GestureTemplateFactoryTests.CreateHoldSamples(count: 62));
+        var result = Feed(recognizer, GestureTemplateFactoryTests.CreateWaveSamples(count: 62));
         var snapshot = recognizer.GetDebugSnapshot();
 
         Assert.NotNull(result);
@@ -218,43 +218,39 @@ public sealed class WindowGestureRecognizerDebugTests
         var snapshot = recognizer.GetDebugSnapshot();
 
         Assert.Null(snapshot.BestGestureId);
-        Assert.Contains("40 usable frames", snapshot.CandidateFailureReason);
+        Assert.Contains("No gesture recordings", snapshot.CandidateFailureReason);
         Assert.True(snapshot.UsableEffectiveFps < 30);
     }
 
     [Fact]
-    public void Recognize_StaticPoseMatchesAcrossScaleAndPosition()
+    public void Recognize_MovementSequenceMatchesAcrossScaleAndPosition()
     {
-        var template = GestureTemplateFactory.Create(GestureTemplateFactoryTests.CreateHoldSamples(shiftX: 100, scale: 80));
+        var template = GestureTemplateFactory.Create(GestureTemplateFactoryTests.CreateWaveSamples(shiftX: 100, scale: 80));
         Assert.NotNull(template);
-        var recognizer = CreateRecognizer("hold", template);
+        var recognizer = CreateRecognizer("wave", template);
 
-        var result = Feed(recognizer, GestureTemplateFactoryTests.CreateHoldSamples(count: 62, shiftX: 420, scale: 160));
+        var result = Feed(recognizer, GestureTemplateFactoryTests.CreateWaveSamples(count: 62, shiftX: 420, scale: 160));
 
         Assert.NotNull(result);
-        Assert.Equal("hold", result.GestureId);
-        Assert.Equal("custom-static", result.Source);
+        Assert.Equal("wave", result.GestureId);
+        Assert.Equal("custom-unified", result.Source);
     }
 
     [Fact]
-    public void Recognize_StaticPoseToleratesSmallJitter()
+    public void Create_StablePoseReturnsNoTemplate()
     {
-        var template = GestureTemplateFactory.Create(GestureTemplateFactoryTests.CreateHoldSamples());
-        Assert.NotNull(template);
-        var recognizer = CreateRecognizer("hold", template);
+        var result = GestureTemplateFactory.TryCreate(GestureTemplateFactoryTests.CreateHoldSamples(count: 62, jitter: 0.4f));
 
-        var result = Feed(recognizer, GestureTemplateFactoryTests.CreateHoldSamples(count: 62, jitter: 0.4f));
-
-        Assert.NotNull(result);
-        Assert.Equal("hold", result.GestureId);
+        Assert.Null(result.Template);
+        Assert.Contains("stable pose", result.FailureReason);
     }
 
     [Fact]
-    public void Recognize_UnrelatedStaticPoseReturnsUnknown()
+    public void Recognize_UnrelatedPoseSequenceReturnsUnknown()
     {
-        var template = GestureTemplateFactory.Create(GestureTemplateFactoryTests.CreateHoldSamples());
+        var template = GestureTemplateFactory.Create(GestureTemplateFactoryTests.CreateWaveSamples());
         Assert.NotNull(template);
-        var recognizer = CreateRecognizer("hold", template);
+        var recognizer = CreateRecognizer("wave", template);
 
         var result = Feed(recognizer, CreateFistHoldSamples(count: 62));
 
@@ -263,20 +259,20 @@ public sealed class WindowGestureRecognizerDebugTests
     }
 
     [Fact]
-    public void Recognize_RequiresStableConsecutiveStaticFrames()
+    public void Recognize_SuppressesDuplicateMovementSegment()
     {
-        var template = GestureTemplateFactory.Create(GestureTemplateFactoryTests.CreateHoldSamples());
+        var template = GestureTemplateFactory.Create(GestureTemplateFactoryTests.CreateWaveSamples());
         Assert.NotNull(template);
-        var recognizer = CreateRecognizer("hold", template);
+        var recognizer = CreateRecognizer("wave", template);
         GestureRecognitionResult? result = null;
 
-        foreach (var sample in GestureTemplateFactoryTests.CreateHoldSamples(count: 59))
+        foreach (var sample in GestureTemplateFactoryTests.CreateWaveSamples(count: 80))
         {
             result = recognizer.Recognize(sample);
         }
 
         Assert.Null(result);
-        Assert.Contains("Waiting for stable match", recognizer.GetDebugSnapshot().TriggerState);
+        Assert.Contains("Duplicate segment suppressed", recognizer.GetDebugSnapshot().TriggerState);
     }
 
     [Fact]
@@ -290,8 +286,55 @@ public sealed class WindowGestureRecognizerDebugTests
 
         Assert.NotNull(result);
         Assert.Equal("wave", result.GestureId);
-        Assert.Equal("custom-dynamic", result.Source);
+        Assert.Equal("custom-unified", result.Source);
         Assert.True(recognizer.GetDebugSnapshot().DtwWarpRatio <= 2.6f);
+    }
+
+    [Fact]
+    public void Recognize_PalmTurnRequiresPalmTurnTopology()
+    {
+        var template = GestureTemplateFactory.Create(GestureTemplateFactoryTests.CreatePalmTurnSamples());
+        Assert.NotNull(template);
+        var recognizer = CreateRecognizer("palm_flip", template);
+
+        var result = Feed(recognizer, GestureTemplateFactoryTests.CreatePalmTurnSamples(count: 64, shiftX: 360, scale: 150));
+
+        Assert.NotNull(result);
+        Assert.Equal("palm_flip", result.GestureId);
+        Assert.NotNull(recognizer.GetDebugSnapshot().ScoreBreakdown);
+        Assert.True(recognizer.GetDebugSnapshot().CandidateTemplate?.Topology?.PalmTurnScore >= GestureTemplateFactory.MinimumPalmTurnScore);
+    }
+
+    [Fact]
+    public void Recognize_OpenPalmHoldDoesNotMatchPalmTurn()
+    {
+        var template = GestureTemplateFactory.Create(GestureTemplateFactoryTests.CreatePalmTurnSamples());
+        Assert.NotNull(template);
+        var recognizer = CreateRecognizer("palm_flip", template);
+
+        var result = Feed(recognizer, GestureTemplateFactoryTests.CreateHoldSamples(count: 64, shiftX: 360, scale: 150));
+
+        Assert.Null(result);
+        Assert.Null(recognizer.GetDebugSnapshot().BestGestureId);
+        Assert.Contains(recognizer.GetDebugSnapshot().Scores, score => score.Reason.Contains("Palm turn", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Recognize_PeaceTurnDoesNotMatchOpenPalmTurn()
+    {
+        var template = GestureTemplateFactory.Create(GestureTemplateFactoryTests.CreatePalmTurnSamples());
+        Assert.NotNull(template);
+        var recognizer = CreateRecognizer("palm_flip", template);
+
+        var result = Feed(recognizer, GestureTemplateFactoryTests.CreatePalmTurnSamples(count: 64).Select(sample => sample with
+        {
+            Landmarks = CreatePeaceHand(sample.Landmarks)
+        }).ToList());
+
+        Assert.Null(result);
+        Assert.Null(recognizer.GetDebugSnapshot().BestGestureId);
+        Assert.Contains(recognizer.GetDebugSnapshot().Scores, score =>
+            score.Reason.Contains("Finger state mismatch", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
@@ -305,6 +348,21 @@ public sealed class WindowGestureRecognizerDebugTests
 
         Assert.Null(result);
         Assert.Null(recognizer.GetDebugSnapshot().BestGestureId);
+    }
+
+    [Fact]
+    public void Recognize_RejectsPeaceSignWhenTemplateIsOpenPalm()
+    {
+        var template = GestureTemplateFactory.Create(GestureTemplateFactoryTests.CreateWaveSamples(direction: 1));
+        Assert.NotNull(template);
+        var recognizer = CreateRecognizer("palm_flip", template);
+
+        var result = Feed(recognizer, CreatePeaceWaveSamples(direction: 1));
+
+        Assert.Null(result);
+        Assert.Null(recognizer.GetDebugSnapshot().BestGestureId);
+        Assert.Contains(recognizer.GetDebugSnapshot().Scores, score =>
+            score.Breakdown is not null && score.Breakdown.FingerStateScore > 0);
     }
 
     [Fact]
@@ -375,5 +433,38 @@ public sealed class WindowGestureRecognizerDebugTests
                 return sample with { Landmarks = landmarks };
             })
             .ToList();
+    }
+
+    private static List<GestureFrameSample> CreatePeaceWaveSamples(int direction)
+    {
+        return GestureTemplateFactoryTests.CreateWaveSamples(direction: direction)
+            .Select(sample => sample with { Landmarks = CreatePeaceHand(sample.Landmarks) })
+            .ToList();
+    }
+
+    private static List<HandLandmark> CreatePeaceHand(IReadOnlyList<HandLandmark> source)
+    {
+        var landmarks = source.ToList();
+        CurlFinger(landmarks, 4);
+        CurlFinger(landmarks, 16);
+        CurlFinger(landmarks, 20);
+        return landmarks;
+    }
+
+    private static void CurlFinger(List<HandLandmark> landmarks, int tipIndex)
+    {
+        var wrist = landmarks[0];
+        var basePoint = landmarks[tipIndex - 3];
+        landmarks[tipIndex - 2] = Lerp(basePoint, wrist, 0.28f);
+        landmarks[tipIndex - 1] = Lerp(basePoint, wrist, 0.38f);
+        landmarks[tipIndex] = Lerp(basePoint, wrist, 0.48f);
+    }
+
+    private static HandLandmark Lerp(HandLandmark a, HandLandmark b, float t)
+    {
+        return new HandLandmark(
+            a.X + ((b.X - a.X) * t),
+            a.Y + ((b.Y - a.Y) * t),
+            a.Z + ((b.Z - a.Z) * t));
     }
 }

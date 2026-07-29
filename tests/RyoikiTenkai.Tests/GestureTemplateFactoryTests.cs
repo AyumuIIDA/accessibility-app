@@ -41,25 +41,25 @@ public sealed class GestureTemplateFactoryTests
     }
 
     [Fact]
-    public void Create_LowMotionTakeCreatesStaticTemplate()
+    public void TryCreate_LowMotionTakeRejectsStablePose()
     {
-        var template = GestureTemplateFactory.Create(CreateHoldSamples(shiftX: 100, scale: 80));
+        var result = GestureTemplateFactory.TryCreate(CreateHoldSamples(shiftX: 100, scale: 80));
 
-        Assert.NotNull(template);
-        Assert.Equal(GestureKind.Static, template.Kind);
-        Assert.True(template.MotionSummary?.MotionScore < GestureFeatureExtractor.StaticMotionThreshold);
-        Assert.Single(template.FeatureFrames!);
+        Assert.Null(result.Template);
+        Assert.Contains("stable pose", result.FailureReason);
     }
 
     [Fact]
-    public void Create_HighMotionTakeCreatesDynamicTemplate()
+    public void Create_HighMotionTakeCreatesUnifiedTemplate()
     {
         var template = GestureTemplateFactory.Create(CreateWaveSamples());
 
         Assert.NotNull(template);
         Assert.Equal(GestureKind.Dynamic, template.Kind);
-        Assert.Equal(GestureFeatureExtractor.DynamicResampledLength, template.FeatureFrames!.Count);
+        Assert.Equal(GestureFeatureExtractor.UnifiedSequenceLength, template.FeatureFrames!.Count);
         Assert.NotNull(template.ActiveSegment);
+        Assert.NotNull(template.Topology);
+        Assert.True(template.Topology.TopologyChangeScore >= GestureTemplateFactory.MinimumTopologyChangeScore);
     }
 
     [Fact]
@@ -94,12 +94,38 @@ public sealed class GestureTemplateFactoryTests
     [Fact]
     public void TryCreate_RejectsLowFrameRateGestureWindows()
     {
-        var samples = CreateWaveSamples(count: 20, intervalMilliseconds: 100);
+        var samples = CreateWaveSamples(count: 40, intervalMilliseconds: 100);
 
         var result = GestureTemplateFactory.TryCreate(samples);
 
         Assert.Null(result.Template);
-        Assert.Contains("40 usable frames", result.FailureReason);
+        Assert.Contains("usable fps", result.FailureReason);
+    }
+
+    [Fact]
+    public void Create_PalmTurnAcceptsTopologyWithoutWristTravel()
+    {
+        var template = GestureTemplateFactory.Create(CreatePalmTurnSamples());
+
+        Assert.NotNull(template);
+        Assert.Equal(GestureKind.Dynamic, template.Kind);
+        Assert.NotNull(template.FeatureTrack);
+        Assert.NotNull(template.Topology);
+        Assert.True(template.Topology.PalmTurnScore >= GestureTemplateFactory.MinimumPalmTurnScore);
+        Assert.True(template.Topology.SignedPalmAreaSignChanges > 0);
+        Assert.True(template.Topology.PalmCompressionDrop >= GestureTemplateFactory.MinimumPalmCompressionDrop);
+    }
+
+    [Fact]
+    public void Create_GrabAcceptsPalmToFistFingerCurlTopology()
+    {
+        var template = GestureTemplateFactory.Create(CreateGrabSamples());
+
+        Assert.NotNull(template);
+        Assert.Equal(GestureKind.Dynamic, template.Kind);
+        Assert.NotNull(template.Topology);
+        Assert.True(template.Topology.FingerStateTransitionCount > 0);
+        Assert.True(template.Topology.FingerStraightnessRangeMax >= GestureTemplateFactory.MinimumFingerStraightnessRange);
     }
 
     internal static List<GestureFrameSample> CreateWaveSamples(
@@ -122,6 +148,75 @@ public sealed class GestureTemplateFactoryTests
                 Confidence: 0.95f,
                 BoundingBox: null,
                 Handedness: 0));
+        }
+
+        return samples;
+    }
+
+    internal static List<GestureFrameSample> CreatePalmTurnSamples(
+        int count = 62,
+        float shiftX = 100,
+        float scale = 100,
+        int intervalMilliseconds = 33)
+    {
+        var start = new DateTimeOffset(2026, 7, 17, 0, 0, 0, TimeSpan.Zero);
+        var baseHand = CreateHand(shiftX, 240, scale);
+        var centerX = shiftX;
+        var samples = new List<GestureFrameSample>();
+        for (var i = 0; i < count; i++)
+        {
+            var progress = count == 1 ? 0 : i / (float)(count - 1);
+            var angle = progress * MathF.PI;
+            var xFactor = MathF.Cos(angle);
+            var zFactor = MathF.Sin(angle) * 0.9f;
+            var landmarks = baseHand
+                .Select(point =>
+                {
+                    var dx = point.X - centerX;
+                    return new HandLandmark(
+                        centerX + (dx * xFactor),
+                        point.Y,
+                        dx * zFactor / scale);
+                })
+                .ToList();
+            var minX = landmarks.Min(x => x.X);
+            var maxX = landmarks.Max(x => x.X);
+            var minY = landmarks.Min(x => x.Y);
+            var maxY = landmarks.Max(x => x.Y);
+            samples.Add(new GestureFrameSample(
+                Timestamp: start + TimeSpan.FromMilliseconds(i * intervalMilliseconds),
+                Landmarks: landmarks,
+                Confidence: 0.95f,
+                BoundingBox: new HandBox(minX, minY, maxX, maxY),
+                Handedness: 0.92f));
+        }
+
+        return samples;
+    }
+
+    internal static List<GestureFrameSample> CreateGrabSamples(
+        int count = 62,
+        float shiftX = 100,
+        float scale = 100,
+        int intervalMilliseconds = 33)
+    {
+        var start = new DateTimeOffset(2026, 7, 17, 0, 0, 0, TimeSpan.Zero);
+        var samples = new List<GestureFrameSample>();
+        for (var i = 0; i < count; i++)
+        {
+            var progress = count == 1 ? 0 : i / (float)(count - 1);
+            var landmarks = CreateHand(shiftX, 240, scale);
+            CurlFingerTowardWrist(landmarks, 4, progress);
+            CurlFingerTowardWrist(landmarks, 8, progress);
+            CurlFingerTowardWrist(landmarks, 12, progress);
+            CurlFingerTowardWrist(landmarks, 16, progress);
+            CurlFingerTowardWrist(landmarks, 20, progress);
+            samples.Add(new GestureFrameSample(
+                Timestamp: start + TimeSpan.FromMilliseconds(i * intervalMilliseconds),
+                Landmarks: landmarks,
+                Confidence: 0.95f,
+                BoundingBox: null,
+                Handedness: 0.9f));
         }
 
         return samples;
@@ -168,5 +263,23 @@ public sealed class GestureTemplateFactoryTests
         points[17] = new HandLandmark(centerX + (scale * 0.35f), centerY, 0);
         points[20] = new HandLandmark(centerX + (scale * 0.38f), centerY - (scale * 0.85f), 0);
         return points;
+    }
+
+    private static void CurlFingerTowardWrist(List<HandLandmark> landmarks, int tipIndex, float progress)
+    {
+        var wrist = landmarks[0];
+        var basePoint = landmarks[tipIndex - 3];
+        var curl = Math.Clamp(progress, 0, 1);
+        landmarks[tipIndex - 2] = Lerp(landmarks[tipIndex - 2], wrist, curl * 0.45f);
+        landmarks[tipIndex - 1] = Lerp(landmarks[tipIndex - 1], wrist, curl * 0.60f);
+        landmarks[tipIndex] = Lerp(landmarks[tipIndex], basePoint, curl * 0.92f);
+    }
+
+    private static HandLandmark Lerp(HandLandmark a, HandLandmark b, float t)
+    {
+        return new HandLandmark(
+            a.X + ((b.X - a.X) * t),
+            a.Y + ((b.Y - a.Y) * t),
+            a.Z + ((b.Z - a.Z) * t));
     }
 }
