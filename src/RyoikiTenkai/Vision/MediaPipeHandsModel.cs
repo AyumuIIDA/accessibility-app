@@ -37,6 +37,13 @@ internal sealed class MediaPipeHandsModel : IHandLandmarkModel, IDisposable
 
     public HandLandmarkResult? Detect(CameraFrame frame)
     {
+        return DetectHands(frame)
+            .OrderByDescending(x => x.Confidence)
+            .FirstOrDefault();
+    }
+
+    public IReadOnlyList<HandLandmarkResult> DetectHands(CameraFrame frame)
+    {
         if (_trackedPalm is not null && _trackedFrameCount < MaxTrackedFramesWithoutPalm)
         {
             var tracked = DetectHandLandmarks(frame, _trackedPalm, HandTrackingConfidenceThreshold, source: "track");
@@ -44,7 +51,7 @@ internal sealed class MediaPipeHandsModel : IHandLandmarkModel, IDisposable
             {
                 _trackedPalm = CreatePalmFromLandmarks(tracked);
                 _trackedFrameCount++;
-                return tracked;
+                return [tracked];
             }
 
             _trackedPalm = null;
@@ -54,22 +61,23 @@ internal sealed class MediaPipeHandsModel : IHandLandmarkModel, IDisposable
         var palms = DetectPalms(frame);
         if (palms.Count == 0)
         {
-            return null;
+            return [];
         }
 
-        HandLandmarkResult? detected = null;
+        var detected = new List<HandLandmarkResult>();
         foreach (var palm in palms)
         {
             var candidate = DetectHandLandmarks(frame, palm, HandDetectionConfidenceThreshold, source: "palm");
-            if (candidate is not null && (detected is null || candidate.Confidence > detected.Confidence))
+            if (candidate is not null && detected.All(x => IntersectionOverUnion(candidate.BoundingBox ?? MakeHandBox(candidate.Landmarks), x.BoundingBox ?? MakeHandBox(x.Landmarks)) < PalmNmsThreshold))
             {
-                detected = candidate;
+                detected.Add(candidate);
             }
         }
 
-        if (detected is not null)
+        var best = detected.OrderByDescending(x => x.Confidence).FirstOrDefault();
+        if (best is not null)
         {
-            _trackedPalm = CreatePalmFromLandmarks(detected);
+            _trackedPalm = CreatePalmFromLandmarks(best);
             _trackedFrameCount = 0;
         }
 

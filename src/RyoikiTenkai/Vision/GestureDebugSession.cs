@@ -35,7 +35,8 @@ internal sealed class GestureDebugSession
         GestureRecognitionResult? recognition,
         bool hasBoundAction,
         string source,
-        string elapsedText)
+        string elapsedText,
+        GestureFrameSetSample? frameSet = null)
     {
         var frame = new GestureDebugFrame(
             SequenceNumber: ++_nextSequenceNumber,
@@ -44,6 +45,7 @@ internal sealed class GestureDebugSession
             Source: source,
             ElapsedText: elapsedText,
             Sample: sample,
+            FrameSet: frameSet,
             NormalizedSkeleton: CreateNormalizedSkeleton(sample),
             Snapshot: snapshot,
             Recognition: recognition,
@@ -67,6 +69,7 @@ internal sealed class GestureDebugSession
             Source: "no-hand",
             ElapsedText: string.Empty,
             Sample: null,
+            FrameSet: null,
             NormalizedSkeleton: null,
             Snapshot: snapshot,
             Recognition: null,
@@ -191,6 +194,20 @@ internal sealed class GestureDebugSession
                     ? GestureFeatureExtractor.AnalyzeFingerPose(frame.Sample.Landmarks)
                     : null
             },
+            FrameSet = frame.FrameSet is null ? null : new
+            {
+                frame.FrameSet.Timestamp,
+                Hands = frame.FrameSet.Hands.Select(hand => new
+                {
+                    hand.Confidence,
+                    hand.Handedness,
+                    hand.BoundingBox,
+                    hand.Landmarks,
+                    FingerPose = hand.Landmarks.Count >= 21
+                        ? GestureFeatureExtractor.AnalyzeFingerPose(hand.Landmarks)
+                        : null
+                }).ToList()
+            },
             Snapshot = new
             {
                 frame.Snapshot.TriggerState,
@@ -266,6 +283,7 @@ internal sealed record GestureDebugFrame(
     string Source,
     string ElapsedText,
     GestureFrameSample? Sample,
+    GestureFrameSetSample? FrameSet,
     GestureSkeletonFrame? NormalizedSkeleton,
     GestureRecognitionDebugSnapshot Snapshot,
     GestureRecognitionResult? Recognition,

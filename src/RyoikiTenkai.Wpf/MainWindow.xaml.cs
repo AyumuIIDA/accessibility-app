@@ -55,6 +55,9 @@ public partial class MainWindow : Window
     private readonly GestureDefinitionStore _gestureStore;
     private readonly ActionExecutor _executor = new();
     private readonly WindowGestureRecognizer _recognizer = new();
+    private readonly WindowGestureRecognizer _lowHandednessRecognizer = new();
+    private readonly WindowGestureRecognizer _highHandednessRecognizer = new();
+    private readonly MultiHandWindowGestureRecognizer _multiHandRecognizer = new();
     private readonly string _gestureStorePath;
     private readonly string _modelDirectory;
     private readonly string _logPath;
@@ -74,6 +77,7 @@ public partial class MainWindow : Window
     private readonly DispatcherTimer _nativeGesturePollTimer;
     private readonly DispatcherTimer _gesturePlaybackTimer;
     private readonly DispatcherTimer _debugPlaybackTimer;
+    private readonly DispatcherTimer _gestureFoundToastTimer;
     private string? _lastNativeRuntimeError;
     private string? _lastNativeProviderSummary;
     private string? _lastNativeProviderFallbackReason;
@@ -89,6 +93,7 @@ public partial class MainWindow : Window
     private string? _recordingGestureName;
     private GestureKind? _recordingGestureKind;
     private readonly List<GestureFrameSample> _recordingSamples = [];
+    private readonly List<GestureFrameSetSample> _recordingFrameSetSamples = [];
     private readonly List<GestureTemplate> _recordingCompletedTemplates = [];
     private readonly List<GestureRecording> _recordingCompletedRecordings = [];
     private readonly List<DebugTimelinePoint> _debugTimelineHistory = [];
@@ -138,6 +143,11 @@ public partial class MainWindow : Window
             Interval = TimeSpan.FromMilliseconds(33)
         };
         _debugPlaybackTimer.Tick += DebugPlaybackTimer_Tick;
+        _gestureFoundToastTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(1800)
+        };
+        _gestureFoundToastTimer.Tick += GestureFoundToastTimer_Tick;
         RefreshGestures();
         RefreshBindings();
         ApplyGestureRecognitionMode();
@@ -380,12 +390,38 @@ public partial class MainWindow : Window
 
         GestureText.Text = handCount == 1 ? "hand" : $"{handCount} hands";
         ConfidenceText.Text = bestConfidence.ToString("0.000");
-        var sample = CreateNativeGestureSample(hand, bestHandIndex, DateTimeOffset.UtcNow);
-        TrackValidHandSample(sample.Timestamp);
+        var timestamp = DateTimeOffset.UtcNow;
+        var frameSet = handCount >= 2 ? CreateNativeGestureFrameSet(hand, timestamp) : null;
+        if (_isRecordingGesture)
+        {
+            var sample = CreateNativeGestureSample(hand, bestHandIndex, timestamp);
+            if (frameSet is not null)
+            {
+                CaptureRecordingFrameSet(frameSet);
+            }
+
+            TrackValidHandSample(sample.Timestamp);
+            await ProcessNativeGestureSampleAsync(
+                sample,
+                elapsedText: _lastNativeLatencyText,
+                updateTrackingState: false,
+                frameSet);
+            return;
+        }
+
+        if (frameSet is not null)
+        {
+            TrackValidHandSample(frameSet.Timestamp);
+            await ProcessNativeGestureFrameSetAsync(frameSet, _lastNativeLatencyText);
+        }
+
+        var singleHandSample = CreateNativeGestureSample(hand, bestHandIndex, timestamp);
+        TrackValidHandSample(singleHandSample.Timestamp);
         await ProcessNativeGestureSampleAsync(
-            sample,
-            elapsedText: _lastNativeLatencyText,
-            updateTrackingState: false);
+            singleHandSample,
+            elapsedText: handCount == 1 ? _lastNativeLatencyText : $"{_lastNativeLatencyText} best hand {bestHandIndex + 1}/{handCount}",
+            updateTrackingState: false,
+            frameSet);
     }
 
     private void LogNativePerformanceSample(
@@ -423,7 +459,8 @@ public partial class MainWindow : Window
     private async Task ProcessNativeGestureSampleAsync(
         GestureFrameSample sample,
         string elapsedText,
-        bool updateTrackingState)
+        bool updateTrackingState,
+        GestureFrameSetSample? frameSet = null)
     {
         try
         {
@@ -431,11 +468,56 @@ public partial class MainWindow : Window
                 sample,
                 elapsedText,
                 drawOverlay: null,
-                updateTrackingState);
+                updateTrackingState,
+                frameSet);
         }
         catch (Exception ex)
         {
             Log("Native gesture classification error: " + ex);
+        }
+    }
+
+    private async Task ProcessNativeGestureFrameSetAsync(
+        GestureFrameSetSample frameSet,
+        string elapsedText)
+    {
+        try
+        {
+            var recognition = GestureRecognitionEnabled
+                ? _multiHandRecognizer.Recognize(frameSet)
+                : null;
+            if (recognition is null)
+            {
+                return;
+            }
+
+            var hasBoundAction = HasBindingForGesture(recognition.GestureId);
+            var sample = frameSet.Hands
+                .OrderByDescending(x => x.Confidence)
+                .FirstOrDefault();
+            if (sample is not null)
+            {
+                var debugFrame = _debugSession.AddHandFrame(
+                    sample,
+                    _multiHandRecognizer.GetDebugSnapshot(),
+                    recognition,
+                    hasBoundAction,
+                    "native-two-hand",
+                    elapsedText,
+                    frameSet);
+                SaveDebugFrame(debugFrame);
+                UpdateDebugLab(debugFrame);
+            }
+
+            ShowGestureFoundNotification(recognition, hasBoundAction, "two-hand");
+            if (hasBoundAction)
+            {
+                await HandleRecognizedGestureAsync(recognition);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log("Native two-hand gesture classification error: " + ex);
         }
     }
 
@@ -455,12 +537,34 @@ public partial class MainWindow : Window
             return;
         }
 
-        _recognizer.Reset($"No hand for {missingDuration.TotalMilliseconds:0} ms");
+        ResetRecognizers($"No hand for {missingDuration.TotalMilliseconds:0} ms");
         _recognizerResetForNoHand = true;
         Log($"Classifier reset: no hand for {missingDuration.TotalMilliseconds:0} ms ({reason}).");
         var debugFrame = _debugSession.AddNoHandFrame(now, reason, _recognizer.GetDebugSnapshot());
         SaveDebugFrame(debugFrame);
         UpdateDebugLab(debugFrame);
+    }
+
+    private void SetRecognizerDefinitions(IEnumerable<GestureDefinition> definitions)
+    {
+        var materialized = definitions.ToList();
+        _recognizer.SetDefinitions(materialized);
+        _lowHandednessRecognizer.SetDefinitions(materialized);
+        _highHandednessRecognizer.SetDefinitions(materialized);
+        _multiHandRecognizer.SetDefinitions(materialized);
+    }
+
+    private void ResetRecognizers(string triggerState)
+    {
+        _recognizer.Reset(triggerState);
+        _lowHandednessRecognizer.Reset(triggerState);
+        _highHandednessRecognizer.Reset(triggerState);
+        _multiHandRecognizer.Reset(triggerState);
+    }
+
+    private WindowGestureRecognizer RecognizerForSample(GestureFrameSample sample)
+    {
+        return _recognizer;
     }
 
     private static unsafe GestureFrameSample CreateNativeGestureSample(
@@ -489,6 +593,20 @@ public partial class MainWindow : Window
             hand.Bbox[bboxOffset + 3]);
 
         return new GestureFrameSample(timestamp, landmarks, confidence, boundingBox, handedness);
+    }
+
+    private static GestureFrameSetSample CreateNativeGestureFrameSet(
+        NativeHandResult hand,
+        DateTimeOffset timestamp)
+    {
+        var handCount = Math.Min(hand.HandCount, NativeVisionInterop.MaxHands);
+        var hands = new List<GestureFrameSample>(handCount);
+        for (var index = 0; index < handCount; index++)
+        {
+            hands.Add(CreateNativeGestureSample(hand, index, timestamp));
+        }
+
+        return new GestureFrameSetSample(timestamp, hands);
     }
 
     private async Task RunCameraLoopAsync(CancellationToken cancellationToken)
@@ -523,7 +641,7 @@ public partial class MainWindow : Window
         var stopwatch = Stopwatch.StartNew();
         try
         {
-            var result = await Task.Run(() => _model.Detect(modelFrame), cancellationToken);
+            var results = await Task.Run(() => _model.DetectHands(modelFrame), cancellationToken);
             stopwatch.Stop();
             await Dispatcher.InvokeAsync(async () =>
             {
@@ -532,7 +650,7 @@ public partial class MainWindow : Window
                     return;
                 }
 
-                await ApplyInferenceResultAsync(modelFrame, result, stopwatch.ElapsedMilliseconds);
+                await ApplyInferenceResultsAsync(modelFrame, results, stopwatch.ElapsedMilliseconds);
             });
         }
         catch (OperationCanceledException)
@@ -548,8 +666,9 @@ public partial class MainWindow : Window
         }
     }
 
-    private async Task ApplyInferenceResultAsync(CameraFrame modelFrame, HandLandmarkResult? result, long elapsedMs)
+    private async Task ApplyInferenceResultsAsync(CameraFrame modelFrame, IReadOnlyList<HandLandmarkResult> results, long elapsedMs)
     {
+        var result = results.OrderByDescending(x => x.Confidence).FirstOrDefault();
         if (result is null)
         {
             if (_isRecordingGesture)
@@ -566,8 +685,25 @@ public partial class MainWindow : Window
             return;
         }
 
+        var timestamp = DateTimeOffset.UtcNow;
+        var frameSet = new GestureFrameSetSample(
+            timestamp,
+            results
+                .OrderByDescending(x => x.Confidence)
+                .Take(2)
+                .Select(x => new GestureFrameSample(timestamp, x.Landmarks, x.Confidence, x.BoundingBox, x.Handedness))
+                .ToList());
+        if (_isRecordingGesture && frameSet.Hands.Count >= 2)
+        {
+            CaptureRecordingFrameSet(frameSet);
+        }
+        else if (!_isRecordingGesture && frameSet.Hands.Count >= 2)
+        {
+            await ProcessNativeGestureFrameSetAsync(frameSet, $"{elapsedMs} ms");
+        }
+
         var sample = new GestureFrameSample(
-            DateTimeOffset.UtcNow,
+            timestamp,
             result.Landmarks,
             result.Confidence,
             result.BoundingBox,
@@ -577,28 +713,31 @@ public partial class MainWindow : Window
             sample,
             elapsedText: $"{elapsedMs} ms",
             drawOverlay: (modelFrame, result),
-            updateTrackingState: true);
+            updateTrackingState: true,
+            frameSet.Hands.Count >= 2 ? frameSet : null);
     }
 
     private async Task ProcessGestureSampleAsync(
         GestureFrameSample sample,
         string elapsedText,
         (CameraFrame Frame, HandLandmarkResult Result)? drawOverlay,
-        bool updateTrackingState)
+        bool updateTrackingState,
+        GestureFrameSetSample? frameSet = null)
     {
         if (_isRecordingGesture)
         {
             CaptureRecordingSample(sample);
         }
 
+        var recognizer = RecognizerForSample(sample);
         var recognition = !_isRecordingGesture && GestureRecognitionEnabled
-            ? _recognizer.Recognize(sample)
+            ? recognizer.Recognize(sample)
             : null;
         var snapshot = _isRecordingGesture
             ? CreateTrackingOnlyDebugSnapshot(sample, "Recording gesture")
             : !GestureRecognitionEnabled
                 ? CreateTrackingOnlyDebugSnapshot(sample, "Gesture recognition disabled")
-            : _recognizer.GetDebugSnapshot();
+            : recognizer.GetDebugSnapshot();
         var hasBoundAction = recognition is not null && HasBindingForGesture(recognition.GestureId);
         var debugFrame = _debugSession.AddHandFrame(
             sample,
@@ -606,7 +745,8 @@ public partial class MainWindow : Window
             recognition,
             hasBoundAction,
             drawOverlay is null ? "native" : "managed",
-            elapsedText);
+            elapsedText,
+            frameSet);
         SaveDebugFrame(debugFrame);
         UpdateDebugLab(debugFrame);
         if (drawOverlay is { } overlay)
@@ -635,8 +775,25 @@ public partial class MainWindow : Window
 
         if (recognition is not null)
         {
+            ShowGestureFoundNotification(recognition, hasBoundAction, recognition.Source);
             await HandleRecognizedGestureAsync(recognition);
         }
+    }
+
+    private void ShowGestureFoundNotification(GestureRecognitionResult recognition, bool hasBoundAction, string source)
+    {
+        GestureFoundNameText.Text = recognition.DisplayName;
+        GestureFoundMetaText.Text =
+            $"{recognition.Confidence:0.00} confidence  |  {source}  |  {(hasBoundAction ? "binding ready" : "no binding")}";
+        GestureFoundToast.Visibility = Visibility.Visible;
+        _gestureFoundToastTimer.Stop();
+        _gestureFoundToastTimer.Start();
+    }
+
+    private void GestureFoundToastTimer_Tick(object? sender, EventArgs e)
+    {
+        _gestureFoundToastTimer.Stop();
+        GestureFoundToast.Visibility = Visibility.Collapsed;
     }
 
     private async Task HandleRecognizedGestureAsync(GestureRecognitionResult recognition)
@@ -812,8 +969,13 @@ public partial class MainWindow : Window
         }
 
         var gestureId = selectedGesture.Id;
-        var actionItem = (ComboBoxItem)ActionTypeCombo.SelectedItem;
-        var actionType = actionItem.Tag.ToString()!;
+        if (ActionTypeCombo.SelectedItem is not ListBoxItem actionItem)
+        {
+            Log("Select an action type before saving a binding.");
+            return;
+        }
+
+        var actionType = actionItem.Tag?.ToString() ?? string.Empty;
         var value = ActionValueText.Text.Trim();
         if (string.IsNullOrWhiteSpace(value))
         {
@@ -841,6 +1003,55 @@ public partial class MainWindow : Window
         Log($"Saved binding: {binding.DisplayName}");
     }
 
+    private void DeleteBindingButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (BindingsList.SelectedItem is not BindingListItem selected)
+        {
+            Log("Select a binding to delete.");
+            return;
+        }
+
+        var bindings = _store.Load();
+        var removed = bindings.RemoveAll(x =>
+            StringComparer.OrdinalIgnoreCase.Equals(x.GestureId, selected.GestureId));
+        if (removed == 0)
+        {
+            Log($"Binding not found: {selected.GestureId}");
+            return;
+        }
+
+        _store.Save(bindings);
+        RefreshBindings();
+        Log($"Deleted binding: {selected.GestureId}");
+    }
+
+    private async void TestBindingButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (BindingsList.SelectedItem is not BindingListItem selected)
+        {
+            Log("Select a binding to test.");
+            return;
+        }
+
+        var binding = _store.Load()
+            .FirstOrDefault(x => StringComparer.OrdinalIgnoreCase.Equals(x.GestureId, selected.GestureId));
+        if (binding is null)
+        {
+            Log($"Binding not found: {selected.GestureId}");
+            return;
+        }
+
+        try
+        {
+            Log($"Test binding: {binding.DisplayName}");
+            await Task.Run(() => _executor.Execute(binding.Action));
+        }
+        catch (Exception ex)
+        {
+            Log("Test binding failed: " + ex.Message);
+        }
+    }
+
     private void ResetSampleButton_Click(object sender, RoutedEventArgs e)
     {
         if (!GestureRecognitionEnabled)
@@ -856,7 +1067,7 @@ public partial class MainWindow : Window
 
     private void ActionTypeCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (ActionValueLabel is null || ActionValueText is null || ActionTypeCombo.SelectedItem is not ComboBoxItem item)
+        if (ActionValueLabel is null || ActionValueText is null || ActionTypeCombo.SelectedItem is not ListBoxItem item)
         {
             return;
         }
@@ -900,6 +1111,8 @@ public partial class MainWindow : Window
         DeleteGestureButton.IsEnabled = false;
         FlushGesturesButton.IsEnabled = false;
         SaveBindingButton.IsEnabled = false;
+        DeleteBindingButton.IsEnabled = false;
+        TestBindingButton.IsEnabled = false;
         ClearBindingsButton.IsEnabled = false;
         BindingsList.Items.Clear();
         BindingsList.Items.Add("Disabled while gesture recognition is redesigned.");
@@ -910,7 +1123,7 @@ public partial class MainWindow : Window
         if (!GestureRecognitionEnabled)
         {
             _gestureDefinitions = [];
-            _recognizer.SetDefinitions([]);
+            SetRecognizerDefinitions([]);
             RuntimeModeText.Text = "Gesture recognition disabled";
             GesturesList.Items.Clear();
             GestureCombo.Items.Clear();
@@ -924,13 +1137,14 @@ public partial class MainWindow : Window
         }
 
         _gestureDefinitions = _gestureStore.Load();
-        _recognizer.SetDefinitions(_gestureDefinitions);
+        SetRecognizerDefinitions(_gestureDefinitions);
         RuntimeModeText.Text = "Recorded custom gestures only";
 
         GesturesList.Items.Clear();
         foreach (var gesture in _gestureDefinitions.OrderBy(x => x.DisplayName))
         {
-            var state = gesture.Templates.Count >= RequiredTemplateCount ? "active" : "needs examples";
+            var activeTemplateCount = CountActiveTemplates(gesture);
+            var state = activeTemplateCount >= RequiredTemplateCount ? "active" : "needs examples";
             var avgMotion = gesture.Templates.Count == 0
                 ? 0
                 : gesture.Templates.Average(x => x.MotionSummary?.MotionScore ?? 0);
@@ -938,13 +1152,17 @@ public partial class MainWindow : Window
             GesturesList.Items.Add(new GestureListItem(
                 gesture.Id,
                 gesture.DisplayName,
-                $"{gesture.Templates.Count}/{RequiredTemplateCount} {state}  recordings {recordingCount}  motion {avgMotion:0.00}"));
+                $"{activeTemplateCount}/{RequiredTemplateCount} {state}  recordings {recordingCount}  motion {avgMotion:0.00}"));
         }
 
         GestureCombo.Items.Clear();
         foreach (var gesture in _gestureDefinitions.OrderBy(x => x.DisplayName))
         {
-            GestureCombo.Items.Add(new GestureChoice(gesture.Id, gesture.DisplayName));
+            var activeTemplateCount = CountActiveTemplates(gesture);
+            var status = activeTemplateCount >= RequiredTemplateCount
+                ? "active"
+                : $"{activeTemplateCount}/{RequiredTemplateCount}";
+            GestureCombo.Items.Add(new GestureChoice(gesture.Id, gesture.DisplayName, status));
         }
 
         if (GestureCombo.Items.Count > 0)
@@ -954,7 +1172,7 @@ public partial class MainWindow : Window
 
         if (!_isRecordingGesture)
         {
-            var activeCount = _gestureDefinitions.Count(x => x.Templates.Count >= RequiredTemplateCount);
+            var activeCount = _gestureDefinitions.Count(x => CountActiveTemplates(x) >= RequiredTemplateCount);
             RecordingCounterText.Text = "Accepted 0/3  Idle";
             RecordingStatusText.Text = $"{activeCount}/{_gestureDefinitions.Count} custom gestures active";
         }
@@ -966,8 +1184,15 @@ public partial class MainWindow : Window
     {
         var ids = _gestureDefinitions.Count == 0
             ? "-"
-            : string.Join(", ", _gestureDefinitions.Select(x => $"{x.Id}:{x.Templates.Count}"));
+            : string.Join(", ", _gestureDefinitions.Select(x => $"{x.Id}:{CountActiveTemplates(x)}/{x.Templates.Count}"));
         Log($"{prefix}: count={_gestureDefinitions.Count}; ids={ids}; path={_gestureStorePath}");
+    }
+
+    private static int CountActiveTemplates(GestureDefinition gesture)
+    {
+        return gesture.Templates.Count(template =>
+            GestureTemplateFactory.IsRecognizableOneHandTemplate(template)
+            || MultiHandGestureFeatureExtractor.IsDistinctTwoHandTemplate(template));
     }
 
     private void GesturesList_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -997,7 +1222,11 @@ public partial class MainWindow : Window
         foreach (var binding in _store.Load())
         {
             var value = string.Join(", ", binding.Action.Params.Select(x => $"{x.Key}={x.Value}"));
-            BindingsList.Items.Add($"{binding.GestureId}: {binding.Action.Type} ({value})");
+            BindingsList.Items.Add(new BindingListItem(
+                binding.GestureId,
+                binding.DisplayName,
+                binding.Action.Type,
+                value));
         }
     }
 
@@ -1225,6 +1454,7 @@ public partial class MainWindow : Window
     private void BeginRecordingTake(int takeIndex, DateTimeOffset now, string? statusPrefix)
     {
         _recordingSamples.Clear();
+        _recordingFrameSetSamples.Clear();
         _recordingTakeIndex = takeIndex;
         _recordingAttemptCount++;
         _recordingStartedAt = now;
@@ -1249,6 +1479,7 @@ public partial class MainWindow : Window
         _isRecordingGesture = false;
         _isCapturingGesture = false;
         _recordingSamples.Clear();
+        _recordingFrameSetSamples.Clear();
         _recordingCompletedTemplates.Clear();
         _recordingCompletedRecordings.Clear();
         _recordingGestureName = null;
@@ -1330,11 +1561,12 @@ public partial class MainWindow : Window
 
         _gestureStore.Save([]);
         _gestureDefinitions.Clear();
-        _recognizer.SetDefinitions([]);
-        _recognizer.Reset("Gestures flushed");
+        SetRecognizerDefinitions([]);
+        ResetRecognizers("Gestures flushed");
         _recordingCompletedTemplates.Clear();
         _recordingCompletedRecordings.Clear();
         _recordingSamples.Clear();
+        _recordingFrameSetSamples.Clear();
         _recordingGestureKind = null;
         StopGesturePlayback("Recorded custom gestures flushed.");
         RefreshGestures();
@@ -1364,6 +1596,7 @@ public partial class MainWindow : Window
         {
             _isCapturingGesture = true;
             _recordingSamples.Clear();
+            _recordingFrameSetSamples.Clear();
             RecordingProgressBar.Value = 0;
             RecordingWindowText.Text = "CAPTURING";
             StateText.Text = $"Capturing: {_recordingGestureName} take {_recordingTakeIndex}/{RequiredTemplateCount}";
@@ -1372,6 +1605,7 @@ public partial class MainWindow : Window
         }
 
         _recordingSamples.Add(sample);
+        AddSingleHandFallbackFrameSet(sample);
         var elapsed = sample.Timestamp - _recordingCaptureStartedAt;
         RecordingProgressBar.Value = 100 * Math.Clamp(
             elapsed.TotalMilliseconds / Math.Max(1, RecordingDuration.TotalMilliseconds),
@@ -1436,6 +1670,39 @@ public partial class MainWindow : Window
         FinishRecordingTake();
     }
 
+    private void CaptureRecordingFrameSet(GestureFrameSetSample frameSet)
+    {
+        UpdateRecordingClock(frameSet.Timestamp);
+        if (!_isRecordingGesture || _recordingTakeFailed || frameSet.Timestamp < _recordingCaptureStartedAt)
+        {
+            return;
+        }
+
+        if (!_isCapturingGesture)
+        {
+            _isCapturingGesture = true;
+            _recordingSamples.Clear();
+            _recordingFrameSetSamples.Clear();
+            RecordingProgressBar.Value = 0;
+            RecordingWindowText.Text = "CAPTURING";
+            StateText.Text = $"Capturing: {_recordingGestureName} take {_recordingTakeIndex}/{RequiredTemplateCount}";
+            OverlayStatusText.Text = "CAPTURING";
+            UpdateRecordingCounterText();
+        }
+
+        _recordingFrameSetSamples.Add(frameSet);
+    }
+
+    private void AddSingleHandFallbackFrameSet(GestureFrameSample sample)
+    {
+        if (_recordingFrameSetSamples.Count > 0)
+        {
+            return;
+        }
+
+        _recordingFrameSetSamples.Add(new GestureFrameSetSample(sample.Timestamp, [sample]));
+    }
+
     private void FinishRecordingTake()
     {
         if (!_isRecordingGesture || _recordingTakeFailed)
@@ -1444,7 +1711,13 @@ public partial class MainWindow : Window
         }
 
         _isCapturingGesture = false;
-        var creation = GestureTemplateFactory.TryCreate(_recordingSamples);
+        var twoHandFrameCount = MultiHandGestureFeatureExtractor.CountUsableTwoHandFrames(_recordingFrameSetSamples);
+        var useTwoHandRecording = MultiHandGestureFeatureExtractor.HasPredominantTwoHandCoverage(
+            _recordingFrameSetSamples,
+            Math.Max(_recordingSamples.Count, _recordingFrameSetSamples.Count));
+        var creation = useTwoHandRecording
+            ? MultiHandGestureFeatureExtractor.TryCreate(_recordingFrameSetSamples)
+            : GestureTemplateFactory.TryCreate(_recordingSamples);
         var template = creation.Template;
         if (template is null || _recordingGestureName is null)
         {
@@ -1460,6 +1733,7 @@ public partial class MainWindow : Window
             UpdateRecordingCounterText();
             Log($"Gesture recording take failed: {_recordingGestureName} take {_recordingTakeIndex}/{RequiredTemplateCount}. {reason} {FormatTemplateCreationCounts(creation)}");
             _recordingSamples.Clear();
+            _recordingFrameSetSamples.Clear();
             return;
         }
 
@@ -1469,14 +1743,16 @@ public partial class MainWindow : Window
             recordingId,
             _recordingTakeIndex,
             _recordingSamples,
+            _recordingFrameSetSamples,
             creation,
             accepted: true,
             reason: "Accepted");
         _recordingCompletedTemplates.Add(template with { SourceRecordingId = recordingId });
         _recordingCompletedRecordings.Add(recording);
         UpdateRecordingCounterText();
-        Log($"Captured gesture take: {_recordingGestureName} ({_recordingCompletedTemplates.Count}/{RequiredTemplateCount}) unified motion={template.MotionSummary?.MotionScore:0.000} rawFrames={recording.Frames.Count} {FormatTemplateCreationCounts(creation)}");
+        Log($"Captured gesture take: {_recordingGestureName} ({_recordingCompletedTemplates.Count}/{RequiredTemplateCount}) unified motion={template.MotionSummary?.MotionScore:0.000} rawFrames={recording.Frames.Count} twoHandFrames={twoHandFrameCount} twoHandMode={useTwoHandRecording} {FormatTemplateCreationCounts(creation)}");
         _recordingSamples.Clear();
+        _recordingFrameSetSamples.Clear();
 
         if (_recordingCompletedTemplates.Count < RequiredTemplateCount)
         {
@@ -1520,7 +1796,7 @@ public partial class MainWindow : Window
         {
             Recordings = recordings,
             UpdatedAt = DateTimeOffset.UtcNow,
-            SchemaVersion = 3
+            SchemaVersion = 4
         };
         var definitionIndex = definitions.FindIndex(x => StringComparer.OrdinalIgnoreCase.Equals(x.Id, definition.Id));
         if (definitionIndex >= 0)
@@ -1533,6 +1809,7 @@ public partial class MainWindow : Window
         _recordingCompletedTemplates.Clear();
         _recordingCompletedRecordings.Clear();
         _recordingSamples.Clear();
+        _recordingFrameSetSamples.Clear();
         _recordingGestureKind = null;
         _isRecordingGesture = false;
         _isCapturingGesture = false;
@@ -1574,6 +1851,7 @@ public partial class MainWindow : Window
         string recordingId,
         int takeIndex,
         IReadOnlyList<GestureFrameSample> samples,
+        IReadOnlyList<GestureFrameSetSample> frameSets,
         GestureTemplateCreationResult creation,
         bool accepted,
         string reason)
@@ -1633,7 +1911,74 @@ public partial class MainWindow : Window
                         features);
                 })
                 .ToList(),
-            featureTrack);
+            featureTrack,
+            CreateMultiHandRecordingFrames(frameSets));
+    }
+
+    private static List<GestureMultiHandRecordingFrame>? CreateMultiHandRecordingFrames(
+        IReadOnlyList<GestureFrameSetSample> frameSets)
+    {
+        var ordered = frameSets
+            .Where(x => x.Hands.Count >= 2)
+            .OrderBy(x => x.Timestamp)
+            .ToList();
+        if (ordered.Count == 0)
+        {
+            return null;
+        }
+
+        var firstTimestamp = ordered[0].Timestamp;
+        return ordered.Select(frameSet =>
+        {
+            var timeOffset = Math.Max(0, (frameSet.Timestamp - firstTimestamp).TotalMilliseconds);
+            return new GestureMultiHandRecordingFrame(
+                timeOffset,
+                OrderPairedHands(frameSet.Hands)
+                    .Select(hand => CreateRecordingFrame(timeOffset, hand))
+                    .ToList());
+        }).ToList();
+    }
+
+    private static IReadOnlyList<GestureFrameSample> OrderPairedHands(IReadOnlyList<GestureFrameSample> hands)
+    {
+        var selected = hands
+            .Where(x => x.Landmarks.Count >= 21)
+            .OrderByDescending(x => x.Confidence)
+            .Take(2)
+            .ToList();
+        if (selected.Count < 2)
+        {
+            return selected;
+        }
+
+        var handednessGap = MathF.Abs(selected[0].Handedness - selected[1].Handedness);
+        return handednessGap >= 0.20f
+            ? selected.OrderBy(x => x.Handedness).ToList()
+            : selected.OrderBy(x => ((x.Landmarks[0].X + x.Landmarks[9].X) / 2f)).ToList();
+    }
+
+    private static GestureRecordingFrame CreateRecordingFrame(double timeOffset, GestureFrameSample sample)
+    {
+        var fingerPose = sample.Landmarks.Count >= 21
+            ? GestureFeatureExtractor.AnalyzeFingerPose(sample.Landmarks)
+            : new GestureFingerPose([0, 0, 0, 0, 0], 0);
+        return new GestureRecordingFrame(
+            timeOffset,
+            sample.Confidence,
+            sample.Handedness,
+            sample.BoundingBox is null
+                ? null
+                : new GestureRecordingBox(
+                    sample.BoundingBox.X1,
+                    sample.BoundingBox.Y1,
+                    sample.BoundingBox.X2,
+                    sample.BoundingBox.Y2),
+            sample.Landmarks
+                .Take(21)
+                .Select(point => new GestureSkeletonPoint(point.X, point.Y, point.Z))
+                .ToList(),
+            fingerPose.Straightness,
+            fingerPose.StateMask);
     }
 
     private static string FormatTemplateCreationCounts(GestureTemplateCreationResult creation)
@@ -1726,14 +2071,21 @@ public partial class MainWindow : Window
     private readonly record struct ImageBounds(double X, double Y, double Width, double Height, double ScaleX, double ScaleY);
     private sealed record OverlayStyle(Brush Line, Brush PointFill, Brush Box);
 
-    private sealed record GestureChoice(string Id, string DisplayName)
+    private sealed record GestureChoice(string Id, string DisplayName, string Status = "")
     {
-        public override string ToString() => DisplayName;
+        public override string ToString() => string.IsNullOrWhiteSpace(Status)
+            ? DisplayName
+            : $"{DisplayName}  {Status}";
     }
 
     private sealed record GestureListItem(string Id, string DisplayName, string Status = "")
     {
         public override string ToString() => $"{DisplayName}  {Status}";
+    }
+
+    private sealed record BindingListItem(string GestureId, string DisplayName, string ActionType, string Value)
+    {
+        public override string ToString() => $"{GestureId}  ->  {ActionType}  {Value}";
     }
 
     private sealed record DebugTimelinePoint(
@@ -1829,7 +2181,7 @@ public partial class MainWindow : Window
 
         Point Map(GestureSkeletonPoint point)
         {
-            var x = pad + ((point.X - minX) / xSpan * Math.Max(1, width - (pad * 2)));
+            var x = width - pad - ((point.X - minX) / xSpan * Math.Max(1, width - (pad * 2)));
             var y = pad + ((point.Y - minY) / ySpan * Math.Max(1, height - (pad * 2)));
             return new Point(x, y);
         }
@@ -1957,11 +2309,13 @@ public partial class MainWindow : Window
                 $"topology change={topology.TopologyChangeScore:0.000} travel={topology.PalmTravel:0.000} angle={topology.PalmOrientationRangeRadians * 180 / MathF.PI:0.0}deg handed={topology.HandednessRange:0.000}");
             DebugScoresList.Items.Add(
                 $"palm turn={topology.PalmTurnScore:0.000} areaRange={topology.SignedPalmAreaRange:0.000} crossings={topology.SignedPalmAreaSignChanges} compressionDrop={topology.PalmCompressionDrop:0.000} depthMax={topology.PalmDepthRangeMax:0.000} fingerTransitions={topology.FingerStateTransitionCount} curlRange={topology.FingerStraightnessRangeMax:0.000}");
+            DebugScoresList.Items.Add(
+                $"hand side mean={topology.HandednessMean:0.000} sizeRange={topology.HandScaleRatioRange:0.000} sizeDelta={topology.HandScaleRatioDelta:0.000} bboxAreaDelta={topology.BoundingBoxAreaRatioDelta:0.000} translation=({topology.TranslationDeltaX:0.000},{topology.TranslationDeltaY:0.000}) dist={topology.TranslationDistance:0.000}");
         }
         if (snapshot.ScoreBreakdown is { } breakdown)
         {
             DebugScoresList.Items.Add(
-                $"score parts joint={breakdown.JointScore:0.000} bone={breakdown.BoneScore:0.000} curl={breakdown.CurlScore:0.000} finger={breakdown.FingerStateScore:0.000} spacing={breakdown.SpacingScore:0.000} motion={breakdown.MotionScore:0.000} palm={breakdown.PalmTurnScore:0.000} depth={breakdown.DepthScore:0.000}");
+                $"score parts joint={breakdown.JointScore:0.000} bone={breakdown.BoneScore:0.000} curl={breakdown.CurlScore:0.000} finger={breakdown.FingerStateScore:0.000} spacing={breakdown.SpacingScore:0.000} motion={breakdown.MotionScore:0.000} palm={breakdown.PalmTurnScore:0.000} depth={breakdown.DepthScore:0.000} hand={breakdown.HandednessScore:0.000} size={breakdown.SizeScore:0.000} trans={breakdown.TranslationScore:0.000}");
         }
         if (frame.Sample?.Landmarks is { Count: >= 21 } landmarks)
         {
@@ -2006,7 +2360,7 @@ public partial class MainWindow : Window
                 var warp = score.WarpRatio is null ? string.Empty : $" warp={score.WarpRatio:0.00}";
                 var parts = score.Breakdown is null
                     ? string.Empty
-                    : $" parts=j{score.Breakdown.JointScore:0.00}/b{score.Breakdown.BoneScore:0.00}/c{score.Breakdown.CurlScore:0.00}/f{score.Breakdown.FingerStateScore:0.00}/s{score.Breakdown.SpacingScore:0.00}/m{score.Breakdown.MotionScore:0.00}/p{score.Breakdown.PalmTurnScore:0.00}/z{score.Breakdown.DepthScore:0.00}";
+                    : $" parts=j{score.Breakdown.JointScore:0.00}/b{score.Breakdown.BoneScore:0.00}/c{score.Breakdown.CurlScore:0.00}/f{score.Breakdown.FingerStateScore:0.00}/s{score.Breakdown.SpacingScore:0.00}/m{score.Breakdown.MotionScore:0.00}/p{score.Breakdown.PalmTurnScore:0.00}/z{score.Breakdown.DepthScore:0.00}/h{score.Breakdown.HandednessScore:0.00}/sz{score.Breakdown.SizeScore:0.00}/t{score.Breakdown.TranslationScore:0.00}";
                 DebugScoresList.Items.Add(
                     TrimDebugLine($"{marker}{score.DisplayName} unified t{template} conf={score.Confidence:0.00} score={rawScore} threshold={snapshot.MatchThreshold:0.00}{warp}{parts} {score.Reason}", 112));
             }
@@ -2216,7 +2570,7 @@ public partial class MainWindow : Window
             : $"closest={closest.DisplayName} unified t{closest.TemplateIndex} conf={closest.Confidence:0.00} score={FormatDebugScore(closest.Score)} {closest.Reason}";
         var breakdown = snapshot.ScoreBreakdown is null
             ? string.Empty
-            : $" breakdown=j{snapshot.ScoreBreakdown.JointScore:0.000}/b{snapshot.ScoreBreakdown.BoneScore:0.000}/c{snapshot.ScoreBreakdown.CurlScore:0.000}/f{snapshot.ScoreBreakdown.FingerStateScore:0.000}/s{snapshot.ScoreBreakdown.SpacingScore:0.000}/m{snapshot.ScoreBreakdown.MotionScore:0.000}/p{snapshot.ScoreBreakdown.PalmTurnScore:0.000}/z{snapshot.ScoreBreakdown.DepthScore:0.000}";
+            : $" breakdown=j{snapshot.ScoreBreakdown.JointScore:0.000}/b{snapshot.ScoreBreakdown.BoneScore:0.000}/c{snapshot.ScoreBreakdown.CurlScore:0.000}/f{snapshot.ScoreBreakdown.FingerStateScore:0.000}/s{snapshot.ScoreBreakdown.SpacingScore:0.000}/m{snapshot.ScoreBreakdown.MotionScore:0.000}/p{snapshot.ScoreBreakdown.PalmTurnScore:0.000}/z{snapshot.ScoreBreakdown.DepthScore:0.000}/h{snapshot.ScoreBreakdown.HandednessScore:0.000}/sz{snapshot.ScoreBreakdown.SizeScore:0.000}/t{snapshot.ScoreBreakdown.TranslationScore:0.000}";
         var activeSegment = snapshot.ActiveSegmentStartMilliseconds is null
             ? "active=-"
             : $"active={snapshot.ActiveSegmentStartMilliseconds:0}-{snapshot.ActiveSegmentEndMilliseconds:0}ms";
@@ -2314,7 +2668,8 @@ public partial class MainWindow : Window
     private void DrawSelectedRawSkeleton(GestureDebugFrame frame)
     {
         DebugSkeletonCanvas.Children.Clear();
-        if (frame.Sample?.Landmarks is not { Count: >= 21 } landmarks)
+        var hands = HandsForDebugFrame(frame).ToList();
+        if (hands.Count == 0)
         {
             DebugSkeletonCanvas.Children.Add(new TextBlock
             {
@@ -2330,61 +2685,104 @@ public partial class MainWindow : Window
         var width = Math.Max(1, DebugSkeletonCanvas.ActualWidth > 1 ? DebugSkeletonCanvas.ActualWidth : 400);
         var height = Math.Max(1, DebugSkeletonCanvas.ActualHeight > 1 ? DebugSkeletonCanvas.ActualHeight : 114);
         var pad = 12d;
-        var minX = landmarks.Min(x => x.X);
-        var maxX = landmarks.Max(x => x.X);
-        var minY = landmarks.Min(x => x.Y);
-        var maxY = landmarks.Max(x => x.Y);
+        var allLandmarks = DebugWindowLandmarks(frame).ToList();
+        if (allLandmarks.Count == 0)
+        {
+            allLandmarks = hands.SelectMany(x => x.Landmarks).ToList();
+        }
+        var useCameraSpace = LooksLikeNormalizedCameraSpace(allLandmarks);
+        var minX = useCameraSpace ? 0 : allLandmarks.Min(x => x.X);
+        var maxX = useCameraSpace ? 1 : allLandmarks.Max(x => x.X);
+        var minY = useCameraSpace ? 0 : allLandmarks.Min(x => x.Y);
+        var maxY = useCameraSpace ? 1 : allLandmarks.Max(x => x.Y);
         var xSpan = Math.Max(0.001f, maxX - minX);
         var ySpan = Math.Max(0.001f, maxY - minY);
 
         Point Map(HandLandmark point)
         {
-            var x = pad + ((point.X - minX) / xSpan * Math.Max(1, width - (pad * 2)));
+            var x = width - pad - ((point.X - minX) / xSpan * Math.Max(1, width - (pad * 2)));
             var y = pad + ((point.Y - minY) / ySpan * Math.Max(1, height - (pad * 2)));
             return new Point(x, y);
         }
 
-        foreach (var (start, end) in HandConnections)
+        for (var handIndex = 0; handIndex < hands.Count; handIndex++)
         {
-            var a = Map(landmarks[start]);
-            var b = Map(landmarks[end]);
-            DebugSkeletonCanvas.Children.Add(new Line
+            var landmarks = hands[handIndex].Landmarks;
+            var brush = handIndex == 0 ? Brushes.Gold : Brushes.DeepSkyBlue;
+            foreach (var (start, end) in HandConnections)
             {
-                X1 = a.X,
-                Y1 = a.Y,
-                X2 = b.X,
-                Y2 = b.Y,
-                Stroke = Brushes.Gold,
-                StrokeThickness = 1.6,
-                StrokeStartLineCap = PenLineCap.Round,
-                StrokeEndLineCap = PenLineCap.Round
-            });
-        }
+                var a = Map(landmarks[start]);
+                var b = Map(landmarks[end]);
+                DebugSkeletonCanvas.Children.Add(new Line
+                {
+                    X1 = a.X,
+                    Y1 = a.Y,
+                    X2 = b.X,
+                    Y2 = b.Y,
+                    Stroke = brush,
+                    StrokeThickness = 1.6,
+                    StrokeStartLineCap = PenLineCap.Round,
+                    StrokeEndLineCap = PenLineCap.Round
+                });
+            }
 
-        for (var i = 0; i < Math.Min(21, landmarks.Count); i++)
-        {
-            var point = Map(landmarks[i]);
-            var radius = i == 0 ? 4.4 : 3.2;
-            var dot = new Ellipse
+            for (var i = 0; i < Math.Min(21, landmarks.Count); i++)
             {
-                Width = radius * 2,
-                Height = radius * 2,
-                Fill = i == 0 ? Brushes.DeepSkyBlue : Brushes.White,
-                Stroke = Brushes.Black,
-                StrokeThickness = 0.6
-            };
-            Canvas.SetLeft(dot, point.X - radius);
-            Canvas.SetTop(dot, point.Y - radius);
-            DebugSkeletonCanvas.Children.Add(dot);
+                var point = Map(landmarks[i]);
+                var radius = i == 0 ? 4.4 : 3.2;
+                var dot = new Ellipse
+                {
+                    Width = radius * 2,
+                    Height = radius * 2,
+                    Fill = i == 0 ? brush : Brushes.White,
+                    Stroke = Brushes.Black,
+                    StrokeThickness = 0.6
+                };
+                Canvas.SetLeft(dot, point.X - radius);
+                Canvas.SetTop(dot, point.Y - radius);
+                DebugSkeletonCanvas.Children.Add(dot);
+            }
         }
 
         DebugSkeletonCanvas.Children.Add(new TextBlock
         {
-            Text = $"raw skeleton | conf={frame.Sample.Confidence:0.00} | handedness={frame.Sample.Handedness:0.00}",
+            Text = $"raw skeleton | hands={hands.Count} | conf={frame.Sample?.Confidence.ToString("0.00") ?? "-"} | handedness={frame.Sample?.Handedness.ToString("0.00") ?? "-"}",
             Foreground = Brushes.LightGray,
             FontSize = 12,
             Margin = new Thickness(8, 4, 0, 0)
         });
+    }
+
+    private static IEnumerable<GestureFrameSample> HandsForDebugFrame(GestureDebugFrame frame)
+    {
+        if (frame.FrameSet?.Hands is { Count: > 0 } hands)
+        {
+            return hands.Where(x => x.Landmarks.Count >= 21);
+        }
+
+        return frame.Sample?.Landmarks is { Count: >= 21 } ? [frame.Sample] : [];
+    }
+
+    private static IEnumerable<HandLandmark> DebugWindowLandmarks(GestureDebugFrame frame)
+    {
+        if (frame.Snapshot.CandidateTemplate?.SkeletonFrames is { Count: > 0 } candidateFrames)
+        {
+            return candidateFrames
+                .SelectMany(x => x.Landmarks)
+                .Select(x => new HandLandmark(x.X, x.Y, x.Z));
+        }
+
+        return frame.FrameSet?.Hands is { Count: > 0 } hands
+            ? hands.SelectMany(x => x.Landmarks)
+            : [];
+    }
+
+    private static bool LooksLikeNormalizedCameraSpace(IReadOnlyList<HandLandmark> landmarks)
+    {
+        return landmarks.Count > 0
+            && landmarks.All(point =>
+                point.X >= -0.05f && point.X <= 1.05f
+                && point.Y >= -0.05f && point.Y <= 1.05f);
     }
 
     private static Brush DebugFrameBrush(GestureDebugFrame frame)
@@ -2610,7 +3008,7 @@ public partial class MainWindow : Window
 
         Point Map(GestureSkeletonPoint point)
         {
-            var x = left + pad + ((point.X - minX) / xSpan * Math.Max(1, width - (pad * 2)));
+            var x = left + width - pad - ((point.X - minX) / xSpan * Math.Max(1, width - (pad * 2)));
             var y = top + pad + ((point.Y - minY) / ySpan * Math.Max(1, height - (pad * 2)));
             return new Point(x, y);
         }
@@ -2965,7 +3363,7 @@ public partial class MainWindow : Window
     {
         var xSpan = Math.Max(0.001f, maxX - minX);
         var ySpan = Math.Max(0.001f, maxY - minY);
-        var x = pad + ((point.CenterX - minX) / xSpan * Math.Max(1, width - (pad * 2)));
+        var x = width - pad - ((point.CenterX - minX) / xSpan * Math.Max(1, width - (pad * 2)));
         var y = pad + ((maxY - point.CenterY) / ySpan * Math.Max(1, height - (pad * 2)));
         return new Point(x, y);
     }

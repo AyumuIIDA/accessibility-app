@@ -99,6 +99,27 @@ public sealed class GestureDebugSessionTests
     }
 
     [Fact]
+    public void AddHandFrame_CanCarryTwoHandFrameSetForDebugPlayback()
+    {
+        var session = new GestureDebugSession(TimeSpan.FromMinutes(5), 100);
+        var frameSet = GestureTemplateFactoryTests.CreateTwoHandPinchSamples(count: 1)[0];
+        var sample = frameSet.Hands[0];
+
+        var frame = session.AddHandFrame(
+            sample,
+            CreateSnapshot(sample.Timestamp, triggerState: "two-hand"),
+            recognition: null,
+            hasBoundAction: false,
+            source: "native-two-hand",
+            elapsedText: "8 ms",
+            frameSet);
+
+        Assert.NotNull(frame.FrameSet);
+        Assert.Equal(2, frame.FrameSet.Hands.Count);
+        Assert.Contains("native-two-hand", frame.Source);
+    }
+
+    [Fact]
     public void AppendJsonLine_WritesOneLinePerDebugFrame()
     {
         var session = new GestureDebugSession(TimeSpan.FromMinutes(5), 100);

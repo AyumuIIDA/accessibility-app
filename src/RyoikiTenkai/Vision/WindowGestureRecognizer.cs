@@ -10,6 +10,7 @@ internal sealed class WindowGestureRecognizer
     private const double MinimumCandidateDurationMilliseconds = 1400;
     private const float ConfidenceThreshold = 0.82f;
     private const float WarpRatioLimit = 2.8f;
+    private const float ReverseDtwMargin = 0.94f;
     private static readonly TimeSpan WindowDuration = TimeSpan.FromMilliseconds(2600);
     private static readonly TimeSpan Cooldown = TimeSpan.FromMilliseconds(1500);
     private static readonly int[] CandidateDurationsMilliseconds = [1400, 1700, 2100, 2500];
@@ -113,8 +114,8 @@ internal sealed class WindowGestureRecognizer
     {
         scores = [];
         candidateFailureReason = string.Empty;
-        var definitions = _definitions.Where(x => x.Templates.Count >= MinimumTemplateCount).ToList();
-        foreach (var inactive in _definitions.Where(x => x.Templates.Count < MinimumTemplateCount))
+        var definitions = _definitions.Where(x => x.Templates.Count(GestureTemplateFactory.IsRecognizableOneHandTemplate) >= MinimumTemplateCount).ToList();
+        foreach (var inactive in _definitions.Where(x => x.Templates.Count(GestureTemplateFactory.IsRecognizableOneHandTemplate) < MinimumTemplateCount))
         {
             scores.Add(CreateInactiveScore(inactive, $"Needs {MinimumTemplateCount} examples"));
         }
@@ -143,6 +144,11 @@ internal sealed class WindowGestureRecognizer
         {
             for (var templateIndex = 0; templateIndex < definition.Templates.Count; templateIndex++)
             {
+                if (!GestureTemplateFactory.IsRecognizableOneHandTemplate(definition.Templates[templateIndex]))
+                {
+                    continue;
+                }
+
                 var template = GestureTemplateFactory.NormalizeLegacyTemplate(definition.Templates[templateIndex], definition.Type);
                 var templateFrames = template.FeatureFrames is { Count: >= 3 } frames
                     ? frames
@@ -389,7 +395,7 @@ internal sealed class WindowGestureRecognizer
         var m = template.Count;
         if (n == 0 || m == 0)
         {
-            return new DtwResult(float.MaxValue, [], new GestureScoreBreakdown(0, 0, 0, 0, 0, 0, 0, 0, float.MaxValue));
+            return new DtwResult(float.MaxValue, [], EmptyBreakdown(float.MaxValue));
         }
 
         var radius = Math.Max(bandRadius, Math.Abs(n - m));
@@ -417,7 +423,7 @@ internal sealed class WindowGestureRecognizer
 
         if (!float.IsFinite(costs[n, m]))
         {
-            return new DtwResult(float.MaxValue, [], new GestureScoreBreakdown(0, 0, 0, 0, 0, 0, 0, 0, float.MaxValue));
+            return new DtwResult(float.MaxValue, [], EmptyBreakdown(float.MaxValue));
         }
 
         var path = new List<GestureDtwPoint>();
@@ -458,12 +464,37 @@ internal sealed class WindowGestureRecognizer
             return new GestureTemplateComparison(float.MaxValue, false, "Too few feature frames", null, [], null);
         }
 
+        var temporalDirectionDot = TemporalDirectionDot(candidateFrames, templateFrames);
+        if (temporalDirectionDot is < -0.18f)
+        {
+            return new GestureTemplateComparison(
+                float.MaxValue,
+                false,
+                $"Opposite time direction dot={temporalDirectionDot.Value:0.000}",
+                null,
+                [],
+                null);
+        }
+
         if (HasOppositeMotionDirection(candidateFrames, templateFrames))
         {
             return new GestureTemplateComparison(float.MaxValue, false, "Opposite motion direction", null, [], null);
         }
 
-        var dtw = BoundedDtw(candidateFrames, templateFrames, bandRadius: Math.Max(5, candidateFrames.Count / 4));
+        var bandRadius = Math.Max(5, candidateFrames.Count / 4);
+        var dtw = BoundedDtw(candidateFrames, templateFrames, bandRadius);
+        var reversedDtw = BoundedDtw(candidateFrames, ReverseFrames(templateFrames), bandRadius);
+        if (reversedDtw.Score <= dtw.Score * ReverseDtwMargin)
+        {
+            return new GestureTemplateComparison(
+                dtw.Score,
+                false,
+                $"Reversed time direction fits better forward={dtw.Score:0.000} reverse={reversedDtw.Score:0.000}",
+                null,
+                dtw.Path,
+                dtw.Breakdown);
+        }
+
         var warpRatio = dtw.Path.Count / (float)Math.Max(candidateFrames.Count, templateFrames.Count);
         if (warpRatio > WarpRatioLimit)
         {
@@ -486,6 +517,90 @@ internal sealed class WindowGestureRecognizer
             dtw.Breakdown);
     }
 
+    private static List<GestureFeatureFrame> ReverseFrames(IReadOnlyList<GestureFeatureFrame> frames)
+    {
+        var result = new List<GestureFeatureFrame>(frames.Count);
+        for (var i = frames.Count - 1; i >= 0; i--)
+        {
+            result.Add(frames[i]);
+        }
+
+        return result;
+    }
+
+    private static float? TemporalDirectionDot(
+        IReadOnlyList<GestureFeatureFrame> candidateFrames,
+        IReadOnlyList<GestureFeatureFrame> templateFrames)
+    {
+        var count = Math.Min(candidateFrames.Count, templateFrames.Count);
+        if (count < 3)
+        {
+            return null;
+        }
+
+        var dot = 0f;
+        var candidateEnergy = 0f;
+        var templateEnergy = 0f;
+        for (var i = 1; i < count; i++)
+        {
+            AccumulateDelta(candidateFrames[i].CenterX - candidateFrames[i - 1].CenterX, templateFrames[i].CenterX - templateFrames[i - 1].CenterX, 0.8f, ref dot, ref candidateEnergy, ref templateEnergy);
+            AccumulateDelta(candidateFrames[i].CenterY - candidateFrames[i - 1].CenterY, templateFrames[i].CenterY - templateFrames[i - 1].CenterY, 0.8f, ref dot, ref candidateEnergy, ref templateEnergy);
+            AccumulateDelta(AngleDelta(candidateFrames[i - 1].PalmOrientationRadians, candidateFrames[i].PalmOrientationRadians), AngleDelta(templateFrames[i - 1].PalmOrientationRadians, templateFrames[i].PalmOrientationRadians), 0.35f, ref dot, ref candidateEnergy, ref templateEnergy);
+            AccumulateDelta(GestureFeatureExtractor.ReadSignedPalmArea(candidateFrames[i]) - GestureFeatureExtractor.ReadSignedPalmArea(candidateFrames[i - 1]), GestureFeatureExtractor.ReadSignedPalmArea(templateFrames[i]) - GestureFeatureExtractor.ReadSignedPalmArea(templateFrames[i - 1]), 0.55f, ref dot, ref candidateEnergy, ref templateEnergy);
+            AccumulateDelta(GestureFeatureExtractor.ReadPalmCompression(candidateFrames[i]) - GestureFeatureExtractor.ReadPalmCompression(candidateFrames[i - 1]), GestureFeatureExtractor.ReadPalmCompression(templateFrames[i]) - GestureFeatureExtractor.ReadPalmCompression(templateFrames[i - 1]), 0.65f, ref dot, ref candidateEnergy, ref templateEnergy);
+            AccumulateDelta(GestureFeatureExtractor.ReadPalmDepthRange(candidateFrames[i]) - GestureFeatureExtractor.ReadPalmDepthRange(candidateFrames[i - 1]), GestureFeatureExtractor.ReadPalmDepthRange(templateFrames[i]) - GestureFeatureExtractor.ReadPalmDepthRange(templateFrames[i - 1]), 0.45f, ref dot, ref candidateEnergy, ref templateEnergy);
+            AccumulateDelta(GestureFeatureExtractor.ReadHandScaleRatio(candidateFrames[i]) - GestureFeatureExtractor.ReadHandScaleRatio(candidateFrames[i - 1]), GestureFeatureExtractor.ReadHandScaleRatio(templateFrames[i]) - GestureFeatureExtractor.ReadHandScaleRatio(templateFrames[i - 1]), 0.55f, ref dot, ref candidateEnergy, ref templateEnergy);
+
+            var candidateStraightness = candidateFrames[i].FingerStraightness ?? GestureFeatureExtractor.ReadFingerStraightness(candidateFrames[i].Values);
+            var previousCandidateStraightness = candidateFrames[i - 1].FingerStraightness ?? GestureFeatureExtractor.ReadFingerStraightness(candidateFrames[i - 1].Values);
+            var templateStraightness = templateFrames[i].FingerStraightness ?? GestureFeatureExtractor.ReadFingerStraightness(templateFrames[i].Values);
+            var previousTemplateStraightness = templateFrames[i - 1].FingerStraightness ?? GestureFeatureExtractor.ReadFingerStraightness(templateFrames[i - 1].Values);
+            var fingerCount = Math.Min(candidateStraightness.Count, templateStraightness.Count);
+            for (var finger = 0; finger < fingerCount; finger++)
+            {
+                AccumulateDelta(candidateStraightness[finger] - previousCandidateStraightness[finger], templateStraightness[finger] - previousTemplateStraightness[finger], 0.9f, ref dot, ref candidateEnergy, ref templateEnergy);
+            }
+        }
+
+        if (candidateEnergy < 0.02f || templateEnergy < 0.02f)
+        {
+            return null;
+        }
+
+        return dot / MathF.Sqrt(candidateEnergy * templateEnergy);
+    }
+
+    private static void AccumulateDelta(
+        float candidateDelta,
+        float templateDelta,
+        float weight,
+        ref float dot,
+        ref float candidateEnergy,
+        ref float templateEnergy)
+    {
+        var weightedCandidate = candidateDelta * weight;
+        var weightedTemplate = templateDelta * weight;
+        dot += weightedCandidate * weightedTemplate;
+        candidateEnergy += weightedCandidate * weightedCandidate;
+        templateEnergy += weightedTemplate * weightedTemplate;
+    }
+
+    private static float AngleDelta(float from, float to)
+    {
+        var delta = to - from;
+        while (delta > MathF.PI)
+        {
+            delta -= MathF.PI * 2;
+        }
+
+        while (delta < -MathF.PI)
+        {
+            delta += MathF.PI * 2;
+        }
+
+        return delta;
+    }
+
     private static bool HasOppositeMotionDirection(
         IReadOnlyList<GestureFeatureFrame> candidateFrames,
         IReadOnlyList<GestureFeatureFrame> templateFrames)
@@ -505,7 +620,7 @@ internal sealed class WindowGestureRecognizer
         return dot < -0.25f;
     }
 
-    private static string TopologyRejectionReason(
+    internal static string TopologyRejectionReason(
         GestureTopologySummary? candidate,
         GestureTopologySummary? template)
     {
@@ -541,6 +656,67 @@ internal sealed class WindowGestureRecognizer
             }
         }
 
+        if (template.FingerStateTransitionCount > 0
+            && template.StartFingerStateMask != template.EndFingerStateMask)
+        {
+            if (candidate.StartFingerStateMask == candidate.EndFingerStateMask)
+            {
+                return
+                    $"Finger final state did not change candidate {GestureFeatureExtractor.FormatFingerMask(candidate.StartFingerStateMask)}->{GestureFeatureExtractor.FormatFingerMask(candidate.EndFingerStateMask)} " +
+                    $"template {GestureFeatureExtractor.FormatFingerMask(template.StartFingerStateMask)}->{GestureFeatureExtractor.FormatFingerMask(template.EndFingerStateMask)}";
+            }
+
+            var strictStartDistance = FingerMaskDistance(candidate.StartFingerStateMask, template.StartFingerStateMask, strictFingerMask: 0b00011);
+            var strictEndDistance = FingerMaskDistance(candidate.EndFingerStateMask, template.EndFingerStateMask, strictFingerMask: 0b00011);
+            if (strictStartDistance > 0 || strictEndDistance > 0)
+            {
+                return
+                    $"Finger 0/1 state mismatch candidate {GestureFeatureExtractor.FormatFingerMask(candidate.StartFingerStateMask)}->{GestureFeatureExtractor.FormatFingerMask(candidate.EndFingerStateMask)} " +
+                    $"template {GestureFeatureExtractor.FormatFingerMask(template.StartFingerStateMask)}->{GestureFeatureExtractor.FormatFingerMask(template.EndFingerStateMask)}";
+            }
+
+            var startDistance = FingerMaskDistance(candidate.StartFingerStateMask, template.StartFingerStateMask, strictFingerMask: 0b11100);
+            var endDistance = FingerMaskDistance(candidate.EndFingerStateMask, template.EndFingerStateMask, strictFingerMask: 0b11100);
+            if (startDistance > 1 || endDistance > 1)
+            {
+                return
+                    $"Finger state mismatch candidate {GestureFeatureExtractor.FormatFingerMask(candidate.StartFingerStateMask)}->{GestureFeatureExtractor.FormatFingerMask(candidate.EndFingerStateMask)} " +
+                    $"template {GestureFeatureExtractor.FormatFingerMask(template.StartFingerStateMask)}->{GestureFeatureExtractor.FormatFingerMask(template.EndFingerStateMask)}";
+            }
+        }
+
+        if (template.HandScaleRatioRange >= GestureTemplateFactory.MinimumHandScaleRatioRange)
+        {
+            if (candidate.HandScaleRatioRange < template.HandScaleRatioRange * 0.55f)
+            {
+                return $"Hand size change too small {candidate.HandScaleRatioRange:0.000} < template {template.HandScaleRatioRange:0.000}";
+            }
+
+            if (MathF.Abs(template.HandScaleRatioDelta) >= GestureTemplateFactory.MinimumHandScaleRatioRange
+                && MathF.Sign(candidate.HandScaleRatioDelta) != MathF.Sign(template.HandScaleRatioDelta))
+            {
+                return $"Hand size moved opposite direction candidate {candidate.HandScaleRatioDelta:0.000} template {template.HandScaleRatioDelta:0.000}";
+            }
+        }
+
+        if (template.TranslationDistance >= GestureTemplateFactory.MinimumTranslationDistance)
+        {
+            if (candidate.TranslationDistance < template.TranslationDistance * 0.45f)
+            {
+                return $"Translation too small {candidate.TranslationDistance:0.000} < template {template.TranslationDistance:0.000}";
+            }
+
+            var dot = DirectionDot(
+                candidate.TranslationDeltaX,
+                candidate.TranslationDeltaY,
+                template.TranslationDeltaX,
+                template.TranslationDeltaY);
+            if (dot < -0.25f)
+            {
+                return $"Translation moved opposite direction dot={dot:0.000}";
+            }
+        }
+
         if (candidate.TopologyChangeScore < template.TopologyChangeScore * 0.55f)
         {
             return $"Topology change too small {candidate.TopologyChangeScore:0.000} < template {template.TopologyChangeScore:0.000}";
@@ -558,18 +734,25 @@ internal sealed class WindowGestureRecognizer
             return $"Palm angle change too small {candidate.PalmOrientationRangeRadians * 180 / MathF.PI:0.0} deg < template {template.PalmOrientationRangeRadians * 180 / MathF.PI:0.0} deg";
         }
 
-        if (template.HandednessRange >= GestureTemplateFactory.MinimumHandednessRange
-            && candidate.HandednessRange < template.HandednessRange * 0.50f)
-        {
-            return $"Handedness change too small {candidate.HandednessRange:0.000} < template {template.HandednessRange:0.000}";
-        }
-
         if (template.FingerStateTransitionCount > 0 && candidate.FingerStateTransitionCount == 0)
         {
             return "Finger topology did not change";
         }
 
         return string.Empty;
+    }
+
+    private static int FingerMaskDistance(int a, int b, int strictFingerMask)
+    {
+        var value = (a ^ b) & strictFingerMask;
+        var count = 0;
+        while (value != 0)
+        {
+            count += value & 1;
+            value >>= 1;
+        }
+
+        return count;
     }
 
     private static GestureScoreBreakdown FeatureFrameDistance(GestureFeatureFrame candidate, GestureFeatureFrame template)
@@ -590,19 +773,23 @@ internal sealed class WindowGestureRecognizer
         var spacing = ScalarDistance(candidate.Values, template.Values, spacingOffset, spacingLength);
         var palmTurn = PalmTurnDistance(candidate, template);
         var depth = MathF.Abs(GestureFeatureExtractor.ReadPalmDepthRange(candidate) - GestureFeatureExtractor.ReadPalmDepthRange(template));
-        var motionDx = candidate.CenterX - template.CenterX;
-        var motionDy = candidate.CenterY - template.CenterY;
+        var handedness = 0f;
+        var size = SizeDistance(candidate, template);
         var velocity = candidate.PalmVelocity - template.PalmVelocity;
-        var motion = MathF.Sqrt((motionDx * motionDx) + (motionDy * motionDy)) + (MathF.Abs(velocity) * 0.12f);
-        var total = (joint * 0.22f)
-            + (bone * 0.14f)
+        var translation = 0f;
+        var motion = MathF.Abs(velocity) * 0.12f;
+        var total = (joint * 0.18f)
+            + (bone * 0.12f)
             + (curl * 0.08f)
-            + (fingerState * 0.22f)
+            + (fingerState * 0.20f)
             + (spacing * 0.04f)
-            + (motion * 0.12f)
-            + (palmTurn * 0.14f)
-            + (depth * 0.04f);
-        return new GestureScoreBreakdown(joint, bone, curl, fingerState, spacing, motion, palmTurn, depth, total);
+            + (motion * 0.10f)
+            + (palmTurn * 0.12f)
+            + (depth * 0.04f)
+            + (handedness * 0.06f)
+            + (size * 0.04f)
+            + (translation * 0.02f);
+        return new GestureScoreBreakdown(joint, bone, curl, fingerState, spacing, motion, palmTurn, depth, handedness, size, translation, total);
     }
 
     private static GestureScoreBreakdown AverageBreakdown(
@@ -612,7 +799,7 @@ internal sealed class WindowGestureRecognizer
     {
         if (path.Count == 0)
         {
-            return new GestureScoreBreakdown(0, 0, 0, 0, 0, 0, 0, 0, float.MaxValue);
+            return EmptyBreakdown(float.MaxValue);
         }
 
         var joint = 0f;
@@ -623,6 +810,9 @@ internal sealed class WindowGestureRecognizer
         var motion = 0f;
         var palmTurn = 0f;
         var depth = 0f;
+        var handedness = 0f;
+        var size = 0f;
+        var translation = 0f;
         var total = 0f;
         foreach (var point in path)
         {
@@ -635,11 +825,26 @@ internal sealed class WindowGestureRecognizer
             motion += breakdown.MotionScore;
             palmTurn += breakdown.PalmTurnScore;
             depth += breakdown.DepthScore;
+            handedness += breakdown.HandednessScore;
+            size += breakdown.SizeScore;
+            translation += breakdown.TranslationScore;
             total += breakdown.TotalScore;
         }
 
         var count = path.Count;
-        return new GestureScoreBreakdown(joint / count, bone / count, curl / count, fingerState / count, spacing / count, motion / count, palmTurn / count, depth / count, total / count);
+        return new GestureScoreBreakdown(
+            joint / count,
+            bone / count,
+            curl / count,
+            fingerState / count,
+            spacing / count,
+            motion / count,
+            palmTurn / count,
+            depth / count,
+            handedness / count,
+            size / count,
+            translation / count,
+            total / count);
     }
 
     private static float PalmTurnDistance(GestureFeatureFrame candidate, GestureFeatureFrame template)
@@ -647,6 +852,30 @@ internal sealed class WindowGestureRecognizer
         var area = MathF.Abs(GestureFeatureExtractor.ReadSignedPalmArea(candidate) - GestureFeatureExtractor.ReadSignedPalmArea(template)) * 4f;
         var compression = MathF.Abs(GestureFeatureExtractor.ReadPalmCompression(candidate) - GestureFeatureExtractor.ReadPalmCompression(template));
         return (area * 0.55f) + (compression * 0.45f);
+    }
+
+    private static float SizeDistance(GestureFeatureFrame candidate, GestureFeatureFrame template)
+    {
+        var scale = MathF.Abs(GestureFeatureExtractor.ReadHandScaleRatio(candidate) - GestureFeatureExtractor.ReadHandScaleRatio(template));
+        var area = MathF.Abs(GestureFeatureExtractor.ReadBoundingBoxAreaRatio(candidate) - GestureFeatureExtractor.ReadBoundingBoxAreaRatio(template));
+        return scale + (Math.Clamp(area, 0, 3) * 0.35f);
+    }
+
+    private static float DirectionDot(float candidateX, float candidateY, float templateX, float templateY)
+    {
+        var candidateMagnitude = MathF.Sqrt((candidateX * candidateX) + (candidateY * candidateY));
+        var templateMagnitude = MathF.Sqrt((templateX * templateX) + (templateY * templateY));
+        if (candidateMagnitude < 0.001f || templateMagnitude < 0.001f)
+        {
+            return 1;
+        }
+
+        return ((candidateX * templateX) + (candidateY * templateY)) / Math.Max(0.001f, candidateMagnitude * templateMagnitude);
+    }
+
+    private static GestureScoreBreakdown EmptyBreakdown(float total)
+    {
+        return new GestureScoreBreakdown(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, total);
     }
 
     private static float PairDistance(float[] candidate, float[] template, int offset, int length)

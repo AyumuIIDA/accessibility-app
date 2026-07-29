@@ -70,7 +70,7 @@ internal sealed class GestureDefinitionStore
         {
             Templates = templates,
             Recordings = recordings,
-            SchemaVersion = Math.Max(gesture.SchemaVersion, 3)
+            SchemaVersion = Math.Max(gesture.SchemaVersion, 4)
         };
     }
 

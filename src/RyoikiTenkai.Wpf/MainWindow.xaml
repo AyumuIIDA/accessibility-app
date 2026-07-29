@@ -15,10 +15,48 @@
         <Style TargetType="TextBox">
             <Setter Property="MinHeight" Value="30" />
             <Setter Property="Margin" Value="0,4,0,10" />
+            <Setter Property="Background" Value="#0F1115" />
+            <Setter Property="Foreground" Value="#E7EAF0" />
+            <Setter Property="BorderBrush" Value="#303746" />
+            <Setter Property="CaretBrush" Value="#E7EAF0" />
         </Style>
         <Style TargetType="ComboBox">
             <Setter Property="MinHeight" Value="30" />
             <Setter Property="Margin" Value="0,4,0,10" />
+            <Setter Property="Background" Value="#0F1115" />
+            <Setter Property="Foreground" Value="#E7EAF0" />
+            <Setter Property="BorderBrush" Value="#303746" />
+        </Style>
+        <Style TargetType="ComboBoxItem">
+            <Setter Property="Background" Value="#0F1115" />
+            <Setter Property="Foreground" Value="#E7EAF0" />
+            <Setter Property="Padding" Value="8,5" />
+            <Style.Triggers>
+                <Trigger Property="IsHighlighted" Value="True">
+                    <Setter Property="Background" Value="#163A4F" />
+                    <Setter Property="Foreground" Value="#FFFFFF" />
+                </Trigger>
+                <Trigger Property="IsSelected" Value="True">
+                    <Setter Property="Background" Value="#1B516C" />
+                    <Setter Property="Foreground" Value="#FFFFFF" />
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+        <Style TargetType="ListBoxItem">
+            <Setter Property="Foreground" Value="#E7EAF0" />
+            <Setter Property="Background" Value="#0F1115" />
+            <Setter Property="Padding" Value="8,6" />
+            <Setter Property="Margin" Value="0,0,0,2" />
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="#202A36" />
+                    <Setter Property="Foreground" Value="#FFFFFF" />
+                </Trigger>
+                <Trigger Property="IsSelected" Value="True">
+                    <Setter Property="Background" Value="#1B516C" />
+                    <Setter Property="Foreground" Value="#FFFFFF" />
+                </Trigger>
+            </Style.Triggers>
         </Style>
         <Style TargetType="TextBlock">
             <Setter Property="Foreground" Value="#E7EAF0" />
@@ -72,6 +110,30 @@
                     <Border HorizontalAlignment="Left" VerticalAlignment="Top" Margin="14"
                             Padding="10,6" Background="#B0000000" CornerRadius="4">
                         <TextBlock x:Name="OverlayStatusText" Text="Stopped" FontSize="15" MaxWidth="520" TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" />
+                    </Border>
+                    <Border x:Name="GestureFoundToast"
+                            HorizontalAlignment="Center"
+                            VerticalAlignment="Top"
+                            Margin="14"
+                            Padding="16,10"
+                            Background="#E6171B22"
+                            BorderBrush="#66FFDD33"
+                            BorderThickness="1"
+                            CornerRadius="6"
+                            Visibility="Collapsed">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="FOUND" Foreground="#FFDD33" FontSize="13" FontWeight="Bold"
+                                       VerticalAlignment="Center" Margin="0,0,12,0" />
+                            <StackPanel>
+                                <TextBlock x:Name="GestureFoundNameText" Text="-" Foreground="#F2F4F8"
+                                           FontSize="20" FontWeight="SemiBold"
+                                           TextWrapping="NoWrap" TextTrimming="CharacterEllipsis"
+                                           MaxWidth="420" />
+                                <TextBlock x:Name="GestureFoundMetaText" Text="-" Foreground="#AAB3C2"
+                                           FontSize="12" TextWrapping="NoWrap" TextTrimming="CharacterEllipsis"
+                                           MaxWidth="420" />
+                            </StackPanel>
+                        </StackPanel>
                     </Border>
                 </Grid>
             </Border>
@@ -152,44 +214,74 @@
 
             <TabControl Grid.Row="2" Margin="0,12,0,0" Background="#171B22" Foreground="#E7EAF0">
                 <TabItem Header="Actions">
-                    <Grid Background="#171B22" Margin="14">
+                    <ScrollViewer Background="#171B22"
+                                  VerticalScrollBarVisibility="Auto"
+                                  HorizontalScrollBarVisibility="Disabled">
+                    <Grid Margin="14">
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto" />
-                            <RowDefinition Height="118" />
+                            <RowDefinition Height="112" />
                             <RowDefinition Height="Auto" />
-                            <RowDefinition Height="*" />
+                            <RowDefinition Height="86" />
+                            <RowDefinition Height="Auto" />
                             <RowDefinition Height="Auto" />
                         </Grid.RowDefinitions>
 
-                        <TextBlock Grid.Row="0" Text="Bindings" FontSize="18" FontWeight="SemiBold" />
-                        <ListBox x:Name="BindingsList" Grid.Row="1" Margin="0,8,0,12" Background="#0F1115" Foreground="#E7EAF0" />
-
-                        <TextBlock Grid.Row="2" Text="Action Log" FontSize="18" FontWeight="SemiBold" />
-                        <ListBox x:Name="ActionLogList" Grid.Row="3" Margin="0,8,0,12" Background="#0F1115" Foreground="#E7EAF0" />
-
-                        <StackPanel Grid.Row="4">
-                            <TextBlock Text="Register Action" FontSize="18" FontWeight="SemiBold" />
-
-                            <TextBlock Text="Gesture" Foreground="#9DA6B8" Margin="0,12,0,0" />
-                            <ComboBox x:Name="GestureCombo">
-                            </ComboBox>
-
-                            <TextBlock Text="Action" Foreground="#9DA6B8" />
-                            <ComboBox x:Name="ActionTypeCombo" SelectionChanged="ActionTypeCombo_SelectionChanged">
-                                <ComboBoxItem Content="Launch app" IsSelected="True" Tag="app.launch" />
-                                <ComboBoxItem Content="Hotkey" Tag="keyboard.hotkey" />
-                                <ComboBoxItem Content="Type text" Tag="keyboard.typeText" />
-                            </ComboBox>
-
-                            <TextBlock x:Name="ActionValueLabel" Text="Path" Foreground="#9DA6B8" />
-                            <TextBox x:Name="ActionValueText" Text="notepad.exe" />
-
-                            <StackPanel Orientation="Horizontal">
-                                <Button x:Name="SaveBindingButton" Content="Save Binding" Click="SaveBindingButton_Click" />
-                                <Button x:Name="ClearBindingsButton" Content="Clear Bindings" Click="ResetSampleButton_Click" />
+                        <DockPanel Grid.Row="0" Margin="0,0,0,8">
+                            <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                                <Button x:Name="TestBindingButton" Content="Test" Click="TestBindingButton_Click" MinWidth="56" />
+                                <Button x:Name="DeleteBindingButton" Content="Delete" Click="DeleteBindingButton_Click" MinWidth="64" />
+                                <Button x:Name="ClearBindingsButton" Content="Clear All" Click="ResetSampleButton_Click" MinWidth="70" />
                             </StackPanel>
-                        </StackPanel>
+                            <StackPanel>
+                                <TextBlock Text="Action Bindings" FontSize="18" FontWeight="SemiBold" />
+                                <TextBlock Text="Select a binding to test or delete it." Foreground="#9DA6B8" FontSize="12" />
+                            </StackPanel>
+                        </DockPanel>
+                        <ListBox x:Name="BindingsList" Grid.Row="1" Background="#0F1115" Foreground="#E7EAF0"
+                                 BorderBrush="#303746" />
+
+                        <TextBlock Grid.Row="2" Text="Action Log" FontSize="18" FontWeight="SemiBold" Margin="0,12,0,6" />
+                        <ListBox x:Name="ActionLogList" Grid.Row="3" Background="#0F1115" Foreground="#E7EAF0"
+                                 BorderBrush="#303746" />
+
+                        <TextBlock Grid.Row="4" Text="Create / Replace Binding" FontSize="18" FontWeight="SemiBold" Margin="0,12,0,8" />
+                        <Grid Grid.Row="5" Margin="0,0,0,8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="1.05*" />
+                                <ColumnDefinition Width="1*" />
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="148" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
+
+                            <TextBlock Grid.Row="0" Grid.Column="0" Text="Gesture" Foreground="#9DA6B8" />
+                            <TextBlock Grid.Row="0" Grid.Column="1" Text="Action" Foreground="#9DA6B8" Margin="10,0,0,0" />
+                            <ListBox x:Name="GestureCombo" Grid.Row="1" Grid.Column="0" MinHeight="148"
+                                     Background="#0F1115" Foreground="#E7EAF0" BorderBrush="#303746" />
+                            <ListBox x:Name="ActionTypeCombo" Grid.Row="1" Grid.Column="1" MinHeight="148"
+                                     Margin="10,0,0,0"
+                                     Background="#0F1115" Foreground="#E7EAF0" BorderBrush="#303746"
+                                     SelectionChanged="ActionTypeCombo_SelectionChanged">
+                                <ListBoxItem Content="Launch app" IsSelected="True" Tag="app.launch" />
+                                <ListBoxItem Content="Hotkey" Tag="keyboard.hotkey" />
+                                <ListBoxItem Content="Type text" Tag="keyboard.typeText" />
+                            </ListBox>
+
+                            <TextBlock x:Name="ActionValueLabel" Grid.Row="2" Grid.ColumnSpan="2"
+                                       Text="Path" Foreground="#9DA6B8" Margin="0,10,0,0" />
+                            <TextBox x:Name="ActionValueText" Grid.Row="3" Grid.ColumnSpan="2" Text="notepad.exe" />
+
+                            <StackPanel Grid.Row="4" Grid.ColumnSpan="2" Orientation="Horizontal" HorizontalAlignment="Right">
+                                <Button x:Name="SaveBindingButton" Content="Save Binding" Click="SaveBindingButton_Click" MinWidth="104" />
+                            </StackPanel>
+                        </Grid>
                     </Grid>
+                    </ScrollViewer>
                 </TabItem>
 
                 <TabItem Header="Debug Lab">

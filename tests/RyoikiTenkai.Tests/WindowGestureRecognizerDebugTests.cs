@@ -188,6 +188,74 @@ public sealed class WindowGestureRecognizerDebugTests
     }
 
     [Fact]
+    public void Recognize_OneHandTemplateToleratesHandednessJitter()
+    {
+        var template = GestureTemplateFactory.Create(GestureTemplateFactoryTests.CreateWaveSamples(handedness: 0.05f));
+        Assert.NotNull(template);
+        var recognizer = CreateRecognizer("wave", template);
+        var samples = GestureTemplateFactoryTests.CreateWaveSamples(count: 62)
+            .Select((sample, index) => sample with { Handedness = index % 2 == 0 ? 0.05f : 0.95f })
+            .ToList();
+
+        var result = Feed(recognizer, samples);
+
+        Assert.NotNull(result);
+        Assert.Equal("wave", result.GestureId);
+    }
+
+    [Fact]
+    public void MultiHandDebugSnapshot_MarksConfirmedWindowFramesAsAcceptedMatch()
+    {
+        var template = MultiHandGestureFeatureExtractor.TryCreate(GestureTemplateFactoryTests.CreateTwoHandPinchSamples()).Template;
+        Assert.NotNull(template);
+        var recognizer = CreateTwoHandRecognizer("pinch", template);
+
+        GestureRecognitionResult? result = null;
+        foreach (var sample in GestureTemplateFactoryTests.CreateTwoHandPinchSamples())
+        {
+            result = recognizer.Recognize(sample);
+            if (result is not null)
+            {
+                break;
+            }
+        }
+
+        var snapshot = recognizer.GetDebugSnapshot();
+
+        Assert.NotNull(result);
+        Assert.NotNull(snapshot.ConfirmedMatch);
+        Assert.NotNull(snapshot.WindowFrames);
+        Assert.NotEmpty(snapshot.WindowFrames);
+        Assert.Contains(snapshot.WindowFrames, x => x.IsAcceptedMatch);
+        Assert.True(snapshot.WindowFrames.Count(x => x.IsAcceptedMatch) > 1);
+    }
+
+    [Fact]
+    public void MultiHandRecognizer_SuppressesOverlappingDuplicateSegments()
+    {
+        var template = MultiHandGestureFeatureExtractor.TryCreate(GestureTemplateFactoryTests.CreateTwoHandPinchSamples()).Template;
+        Assert.NotNull(template);
+        var recognizer = CreateTwoHandRecognizer("pinch", template);
+        var samples = GestureTemplateFactoryTests.CreateTwoHandPinchSamples();
+        var last = samples[^1];
+        for (var i = 1; i <= 90; i++)
+        {
+            samples.Add(last with { Timestamp = last.Timestamp + TimeSpan.FromMilliseconds(i * 33) });
+        }
+
+        var matches = 0;
+        foreach (var sample in samples)
+        {
+            if (recognizer.Recognize(sample) is not null)
+            {
+                matches++;
+            }
+        }
+
+        Assert.Equal(1, matches);
+    }
+
+    [Fact]
     public void Reset_ClearsDebugWindowFrames()
     {
         var recognizer = new WindowGestureRecognizer();
@@ -338,6 +406,120 @@ public sealed class WindowGestureRecognizerDebugTests
     }
 
     [Fact]
+    public void Recognize_ApproachRequiresHandSizeGrowth()
+    {
+        var template = GestureTemplateFactory.Create(GestureTemplateFactoryTests.CreateApproachSamples());
+        Assert.NotNull(template);
+        var recognizer = CreateRecognizer("approach", template);
+
+        var result = Feed(recognizer, GestureTemplateFactoryTests.CreateApproachSamples(count: 64, startScale: 80, endScale: 145));
+
+        Assert.NotNull(result);
+        Assert.Equal("approach", result.GestureId);
+        Assert.True(recognizer.GetDebugSnapshot().CandidateTemplate?.Topology?.HandScaleRatioRange >= GestureTemplateFactory.MinimumHandScaleRatioRange);
+    }
+
+    [Fact]
+    public void Recognize_ApproachMatchesAcrossPositionAndStartingSize()
+    {
+        var template = GestureTemplateFactory.Create(GestureTemplateFactoryTests.CreateApproachSamples(shiftX: 80, startScale: 70, endScale: 130));
+        Assert.NotNull(template);
+        var recognizer = CreateRecognizer("approach", template);
+
+        var result = Feed(recognizer, GestureTemplateFactoryTests.CreateApproachSamples(count: 64, shiftX: 420, startScale: 110, endScale: 205));
+
+        Assert.NotNull(result);
+        Assert.Equal("approach", result.GestureId);
+    }
+
+    [Fact]
+    public void Recognize_TranslationMatchesAcrossStartingPosition()
+    {
+        var template = GestureTemplateFactory.Create(GestureTemplateFactoryTests.CreateTranslateSamples(startX: 60, deltaX: 90));
+        Assert.NotNull(template);
+        var recognizer = CreateRecognizer("translate", template);
+
+        var result = Feed(recognizer, GestureTemplateFactoryTests.CreateTranslateSamples(count: 64, startX: 420, deltaX: 90));
+
+        Assert.NotNull(result);
+        Assert.Equal("translate", result.GestureId);
+    }
+
+    [Fact]
+    public void Recognize_RetreatDoesNotMatchApproach()
+    {
+        var template = GestureTemplateFactory.Create(GestureTemplateFactoryTests.CreateApproachSamples(startScale: 80, endScale: 145));
+        Assert.NotNull(template);
+        var recognizer = CreateRecognizer("approach", template);
+
+        var result = Feed(recognizer, GestureTemplateFactoryTests.CreateApproachSamples(count: 64, startScale: 145, endScale: 80));
+
+        Assert.Null(result);
+        Assert.Null(recognizer.GetDebugSnapshot().BestGestureId);
+        Assert.Contains(recognizer.GetDebugSnapshot().Scores, score =>
+            score.Reason.Contains("Hand size", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Recognize_OneHandTemplateMatchesOppositeHandSide()
+    {
+        var template = GestureTemplateFactory.Create(GestureTemplateFactoryTests.CreateWaveSamples(handedness: 0.9f));
+        Assert.NotNull(template);
+        var recognizer = CreateRecognizer("right_wave", template);
+
+        var result = Feed(recognizer, GestureTemplateFactoryTests.CreateWaveSamples(count: 64, handedness: 0.05f));
+
+        Assert.NotNull(result);
+        Assert.Equal("right_wave", result.GestureId);
+    }
+
+    [Fact]
+    public void Recognize_TwoHandGestureMatchesPairedHands()
+    {
+        var template = MultiHandGestureFeatureExtractor.TryCreate(GestureTemplateFactoryTests.CreateTwoHandPinchSamples()).Template;
+        Assert.NotNull(template);
+        var recognizer = CreateTwoHandRecognizer("two_hand_pinch", template);
+
+        var result = Feed(recognizer, GestureTemplateFactoryTests.CreateTwoHandPinchSamples(count: 64));
+
+        Assert.NotNull(result);
+        Assert.Equal("two_hand_pinch", result.GestureId);
+        Assert.Equal("custom-two-hand", result.Source);
+        Assert.Equal(2, recognizer.GetDebugSnapshot().CandidateTemplate?.HandCount);
+    }
+
+    [Fact]
+    public void Recognize_TwoHandGestureRejectsOppositeDistanceDirection()
+    {
+        var template = MultiHandGestureFeatureExtractor.TryCreate(GestureTemplateFactoryTests.CreateTwoHandPinchSamples()).Template;
+        Assert.NotNull(template);
+        var recognizer = CreateTwoHandRecognizer("two_hand_pinch", template);
+
+        var result = Feed(recognizer, GestureTemplateFactoryTests.CreateTwoHandPinchSamples(count: 64, leftStartX: 115, rightStartX: 185, endGap: 180));
+
+        Assert.Null(result);
+        Assert.Null(recognizer.GetDebugSnapshot().BestGestureId);
+        Assert.Contains(recognizer.GetDebugSnapshot().Scores, score =>
+            score.Reason.Contains("opposite direction", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Recognize_TwoHandGestureRejectsReverseTimeOrder()
+    {
+        var template = MultiHandGestureFeatureExtractor.TryCreate(GestureTemplateFactoryTests.CreateTwoHandPinchSamples()).Template;
+        Assert.NotNull(template);
+        var recognizer = CreateTwoHandRecognizer("two_hand_pinch", template);
+
+        var result = Feed(recognizer, ReverseTime(GestureTemplateFactoryTests.CreateTwoHandPinchSamples(count: 64)));
+
+        Assert.Null(result);
+        Assert.Null(recognizer.GetDebugSnapshot().BestGestureId);
+        Assert.Contains(recognizer.GetDebugSnapshot().Scores, score =>
+            score.Reason.Contains("Reversed", StringComparison.OrdinalIgnoreCase)
+            || score.Reason.Contains("opposite direction", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
     public void Recognize_DynamicOppositeDirectionReturnsUnknown()
     {
         var template = GestureTemplateFactory.Create(GestureTemplateFactoryTests.CreateWaveSamples(direction: 1));
@@ -348,6 +530,136 @@ public sealed class WindowGestureRecognizerDebugTests
 
         Assert.Null(result);
         Assert.Null(recognizer.GetDebugSnapshot().BestGestureId);
+    }
+
+    [Fact]
+    public void Recognize_DynamicReverseTimeOrderReturnsUnknown()
+    {
+        var template = GestureTemplateFactory.Create(GestureTemplateFactoryTests.CreateGrabSamples());
+        Assert.NotNull(template);
+        var recognizer = CreateRecognizer("grab", template);
+
+        var result = Feed(recognizer, ReverseTime(GestureTemplateFactoryTests.CreateGrabSamples(count: 64)));
+
+        Assert.Null(result);
+        Assert.Null(recognizer.GetDebugSnapshot().BestGestureId);
+        Assert.Contains(recognizer.GetDebugSnapshot().Scores, score =>
+            score.Reason.Contains("Opposite time direction", StringComparison.OrdinalIgnoreCase)
+            || score.Reason.Contains("Reversed", StringComparison.OrdinalIgnoreCase)
+            || score.Reason.Contains("Finger", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void TopologyRejection_GrabRejectsPistolFingerState()
+    {
+        var candidate = new GestureTopologySummary(
+            PalmTravel: 0.036f,
+            PalmOrientationRangeRadians: 0.056f,
+            HandednessRange: 0.048f,
+            FingerStateTransitionCount: 4,
+            StartFingerStateMask: 15,
+            EndFingerStateMask: 15,
+            TopologyChangeScore: 1.086f,
+            PalmTurnScore: 0.126f,
+            FingerStraightnessRangeMax: 0.322f);
+        var grabTemplate = new GestureTopologySummary(
+            PalmTravel: 0.088f,
+            PalmOrientationRangeRadians: 0.082f,
+            HandednessRange: 0.060f,
+            FingerStateTransitionCount: 4,
+            StartFingerStateMask: 31,
+            EndFingerStateMask: 1,
+            TopologyChangeScore: 1.964f,
+            PalmTurnScore: 0.213f,
+            FingerStraightnessRangeMax: 1.0f);
+
+        var reason = WindowGestureRecognizer.TopologyRejectionReason(candidate, grabTemplate);
+
+        Assert.Contains("Finger final state did not change", reason);
+        Assert.Contains("11110->11110", reason);
+        Assert.Contains("11111->10000", reason);
+    }
+
+    [Fact]
+    public void TopologyRejection_FingerZeroAndOneMustMatchExactly()
+    {
+        var candidate = new GestureTopologySummary(
+            PalmTravel: 0.09f,
+            PalmOrientationRangeRadians: 0.08f,
+            HandednessRange: 0.05f,
+            FingerStateTransitionCount: 4,
+            StartFingerStateMask: 31,
+            EndFingerStateMask: 3,
+            TopologyChangeScore: 1.9f,
+            PalmTurnScore: 0.2f,
+            FingerStraightnessRangeMax: 1.0f);
+        var grabTemplate = new GestureTopologySummary(
+            PalmTravel: 0.09f,
+            PalmOrientationRangeRadians: 0.08f,
+            HandednessRange: 0.05f,
+            FingerStateTransitionCount: 4,
+            StartFingerStateMask: 31,
+            EndFingerStateMask: 1,
+            TopologyChangeScore: 1.9f,
+            PalmTurnScore: 0.2f,
+            FingerStraightnessRangeMax: 1.0f);
+
+        var reason = WindowGestureRecognizer.TopologyRejectionReason(candidate, grabTemplate);
+
+        Assert.Contains("Finger 0/1 state mismatch", reason);
+        Assert.Contains("11111->11000", reason);
+        Assert.Contains("11111->10000", reason);
+    }
+
+    [Fact]
+    public void Recognize_PalmTurnReverseTimeOrderReturnsUnknown()
+    {
+        var template = GestureTemplateFactory.Create(GestureTemplateFactoryTests.CreatePalmTurnSamples());
+        Assert.NotNull(template);
+        var recognizer = CreateRecognizer("palm_flip", template);
+
+        var result = Feed(recognizer, ReverseTime(GestureTemplateFactoryTests.CreatePalmTurnSamples(count: 64)));
+
+        Assert.Null(result);
+        Assert.Null(recognizer.GetDebugSnapshot().BestGestureId);
+        Assert.Contains(recognizer.GetDebugSnapshot().Scores, score =>
+            score.Reason.Contains("Opposite time direction", StringComparison.OrdinalIgnoreCase)
+            || score.Reason.Contains("Reversed", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Recognize_StaticActionlessTemplateIsInactive()
+    {
+        var topology = new GestureTopologySummary(
+            PalmTravel: 0.02f,
+            PalmOrientationRangeRadians: 0.02f,
+            HandednessRange: 0,
+            FingerStateTransitionCount: 0,
+            StartFingerStateMask: 3,
+            EndFingerStateMask: 3,
+            TopologyChangeScore: 0.95f,
+            PalmTurnScore: 0.20f,
+            FingerStraightnessRangeMax: 0,
+            HandScaleRatioRange: 0,
+            TranslationDistance: 0);
+        var holdSequence = GestureFeatureExtractor.Extract(GestureTemplateFactoryTests.CreateHoldSamples());
+        var template = new GestureTemplate(
+            Samples: [],
+            SourceFrameCount: 60,
+            DurationMilliseconds: 2000,
+            AverageConfidence: 0.95f,
+            Kind: GestureKind.Static,
+            FeatureFrames: GestureFeatureExtractor.BuildUnifiedSequence(holdSequence),
+            MotionSummary: new GestureMotionSummary(0.02f, 0, 0, 2000, 60),
+            Topology: topology);
+        var recognizer = CreateRecognizer("screenshot", template);
+
+        var result = Feed(recognizer, GestureTemplateFactoryTests.CreateHoldSamples(count: 64));
+
+        Assert.Null(result);
+        Assert.Null(recognizer.GetDebugSnapshot().BestGestureId);
+        Assert.Contains(recognizer.GetDebugSnapshot().Scores, score =>
+            score.GestureId == "screenshot" && score.Reason.Contains("Needs 3 examples", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
@@ -402,6 +714,20 @@ public sealed class WindowGestureRecognizerDebugTests
         return recognizer;
     }
 
+    private static MultiHandWindowGestureRecognizer CreateTwoHandRecognizer(string id, GestureTemplate template)
+    {
+        var recognizer = new MultiHandWindowGestureRecognizer();
+        recognizer.SetDefinitions([
+            new GestureDefinition(
+                Id: id,
+                DisplayName: id,
+                Type: "template",
+                Templates: [template, template, template],
+                CreatedAt: DateTimeOffset.UtcNow)
+        ]);
+        return recognizer;
+    }
+
     private static GestureRecognitionResult? Feed(
         WindowGestureRecognizer recognizer,
         IReadOnlyList<GestureFrameSample> samples)
@@ -417,6 +743,53 @@ public sealed class WindowGestureRecognizerDebugTests
         }
 
         return result;
+    }
+
+    private static GestureRecognitionResult? Feed(
+        MultiHandWindowGestureRecognizer recognizer,
+        IReadOnlyList<GestureFrameSetSample> samples)
+    {
+        GestureRecognitionResult? result = null;
+        foreach (var sample in samples)
+        {
+            result = recognizer.Recognize(sample);
+            if (result is not null)
+            {
+                return result;
+            }
+        }
+
+        return result;
+    }
+
+    private static List<GestureFrameSample> ReverseTime(IReadOnlyList<GestureFrameSample> samples)
+    {
+        if (samples.Count == 0)
+        {
+            return [];
+        }
+
+        var first = samples[0].Timestamp;
+        return samples
+            .AsEnumerable()
+            .Reverse()
+            .Select((sample, index) => sample with { Timestamp = first + TimeSpan.FromMilliseconds(index * 33) })
+            .ToList();
+    }
+
+    private static List<GestureFrameSetSample> ReverseTime(IReadOnlyList<GestureFrameSetSample> samples)
+    {
+        if (samples.Count == 0)
+        {
+            return [];
+        }
+
+        var first = samples[0].Timestamp;
+        return samples
+            .AsEnumerable()
+            .Reverse()
+            .Select((sample, index) => sample with { Timestamp = first + TimeSpan.FromMilliseconds(index * 33) })
+            .ToList();
     }
 
     private static List<GestureFrameSample> CreateFistHoldSamples(int count)

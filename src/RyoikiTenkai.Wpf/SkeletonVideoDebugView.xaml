@@ -106,7 +106,7 @@
                 <ScrollViewer x:Name="TimelineScrollViewer" Grid.Row="1" Margin="0,8,0,0"
                               HorizontalScrollBarVisibility="Auto"
                               VerticalScrollBarVisibility="Disabled">
-                    <local:SkeletonTimeline x:Name="Timeline" Height="54" />
+                    <local:SkeletonTimeline x:Name="Timeline" Height="78" />
                 </ScrollViewer>
             </Grid>
         </Border>

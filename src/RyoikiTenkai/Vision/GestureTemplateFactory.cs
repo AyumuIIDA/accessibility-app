@@ -5,8 +5,8 @@ namespace RyoikiTenkai.Vision;
 internal static class GestureTemplateFactory
 {
     private static readonly int[] LandmarkIds = [0, 4, 5, 8, 9, 12, 13, 16, 17, 20];
-    internal const int MinimumUsableSampleCount = 40;
-    internal const double MinimumSampleRateFps = 20;
+    internal const int MinimumUsableSampleCount = 32;
+    internal const double MinimumSampleRateFps = 16;
     internal const double MinimumDurationMilliseconds = 1900;
     internal const float MinimumTopologyChangeScore = 0.32f;
     internal const float MinimumPalmTravel = 0.22f;
@@ -15,6 +15,8 @@ internal static class GestureTemplateFactory
     internal const float MinimumPalmTurnScore = 0.55f;
     internal const float MinimumPalmCompressionDrop = 0.30f;
     internal const float MinimumFingerStraightnessRange = 0.30f;
+    internal const float MinimumHandScaleRatioRange = 0.22f;
+    internal const float MinimumTranslationDistance = 0.22f;
     private const float MinimumConfidence = 0.35f;
     private const int ResampledLength = 32;
 
@@ -75,11 +77,13 @@ internal static class GestureTemplateFactory
         }
         if (kind == GestureKind.Static
             && (topology.FingerStateTransitionCount > 0
-                || topology.FingerStraightnessRangeMax >= MinimumFingerStraightnessRange))
+                || topology.FingerStraightnessRangeMax >= MinimumFingerStraightnessRange
+                || topology.HandScaleRatioRange >= MinimumHandScaleRatioRange
+                || topology.TranslationDistance >= MinimumTranslationDistance))
         {
             kind = GestureKind.Dynamic;
         }
-        if (!HasMeaningfulTopologyChange(topology))
+        if (!IsRecognizableOneHandTemplate(kind, topology))
         {
             return new GestureTemplateCreationResult(
                 Template: null,
@@ -173,15 +177,28 @@ internal static class GestureTemplateFactory
         };
     }
 
-    private static bool HasMeaningfulTopologyChange(GestureTopologySummary topology)
+    internal static bool IsRecognizableOneHandTemplate(GestureTemplate template)
     {
-        return topology.TopologyChangeScore >= MinimumTopologyChangeScore
-            || topology.PalmTravel >= MinimumPalmTravel
+        return template.HandCount <= 1
+            && IsRecognizableOneHandTemplate(template.Kind, template.Topology);
+    }
+
+    private static bool IsRecognizableOneHandTemplate(GestureKind kind, GestureTopologySummary? topology)
+    {
+        return kind == GestureKind.Dynamic
+            && topology is not null
+            && HasMeaningfulActionSignal(topology);
+    }
+
+    private static bool HasMeaningfulActionSignal(GestureTopologySummary topology)
+    {
+        return topology.PalmTravel >= MinimumPalmTravel
             || topology.PalmOrientationRangeRadians >= MinimumPalmOrientationRangeRadians
-            || topology.HandednessRange >= MinimumHandednessRange
             || topology.PalmTurnScore >= MinimumPalmTurnScore
             || topology.FingerStraightnessRangeMax >= MinimumFingerStraightnessRange
-            || topology.FingerStateTransitionCount > 0;
+            || topology.FingerStateTransitionCount > 0
+            || topology.HandScaleRatioRange >= MinimumHandScaleRatioRange
+            || topology.TranslationDistance >= MinimumTranslationDistance;
     }
 
     private static string CreateTopologyFailureReason(GestureTopologySummary topology)
@@ -192,6 +209,7 @@ internal static class GestureTemplateFactory
             $"palm angle={topology.PalmOrientationRangeRadians * 180 / MathF.PI:0.0} deg, " +
             $"handedness range={topology.HandednessRange:0.000}, palm turn={topology.PalmTurnScore:0.000}, " +
             $"area crossings={topology.SignedPalmAreaSignChanges}, compression drop={topology.PalmCompressionDrop:0.000}, " +
+            $"size range={topology.HandScaleRatioRange:0.000}, translation={topology.TranslationDistance:0.000}, " +
             $"finger transitions={topology.FingerStateTransitionCount}, finger curl range={topology.FingerStraightnessRangeMax:0.000}. " +
             "Move/flip/change shape more during the capture window; for grab, start with an open palm and finish with a closed fist inside the capture window.";
     }
@@ -221,8 +239,9 @@ internal static class GestureTemplateFactory
 
         if (highConfidenceFrameCount < MinimumUsableSampleCount)
         {
-            return
-                $"Captured {validLandmarkFrameCount} landmark frame(s), but only {highConfidenceFrameCount} met confidence >= {MinimumConfidence:0.00}; need {MinimumUsableSampleCount} usable frames over about 2 seconds for resampling.";
+            return highConfidenceFrameCount == validLandmarkFrameCount
+                ? $"Captured {highConfidenceFrameCount} usable landmark frame(s); need {MinimumUsableSampleCount} usable frames over about 2 seconds for resampling."
+                : $"Captured {validLandmarkFrameCount} landmark frame(s), but only {highConfidenceFrameCount} met confidence >= {MinimumConfidence:0.00}; need {MinimumUsableSampleCount} usable frames over about 2 seconds for resampling.";
         }
 
         if (usableEffectiveFps < MinimumSampleRateFps)

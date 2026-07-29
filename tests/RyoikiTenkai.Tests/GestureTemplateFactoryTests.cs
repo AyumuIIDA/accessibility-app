@@ -128,12 +128,93 @@ public sealed class GestureTemplateFactoryTests
         Assert.True(template.Topology.FingerStraightnessRangeMax >= GestureTemplateFactory.MinimumFingerStraightnessRange);
     }
 
+    [Fact]
+    public void Create_ApproachAcceptsHandSizeTopology()
+    {
+        var template = GestureTemplateFactory.Create(CreateApproachSamples());
+
+        Assert.NotNull(template);
+        Assert.Equal(GestureKind.Dynamic, template.Kind);
+        Assert.NotNull(template.Topology);
+        Assert.True(template.Topology.HandScaleRatioRange >= GestureTemplateFactory.MinimumHandScaleRatioRange);
+        Assert.True(template.Topology.HandScaleRatioDelta > 0);
+    }
+
+    [Fact]
+    public void Create_TwoHandGestureStoresHandCountAndRelativeTopology()
+    {
+        var result = MultiHandGestureFeatureExtractor.TryCreate(CreateTwoHandPinchSamples());
+
+        Assert.NotNull(result.Template);
+        Assert.Equal(2, result.Template.HandCount);
+        Assert.NotNull(result.Template.MultiHandSummary);
+        Assert.True(result.Template.MultiHandSummary.RelativeDistanceRange >= GestureTemplateFactory.MinimumHandScaleRatioRange);
+        Assert.True(result.Template.MultiHandSummary.RelativeDistanceDelta < 0);
+    }
+
+    [Fact]
+    public void TwoHandCoverage_IgnoresStraySecondHandDuringOneHandRecording()
+    {
+        var oneHand = CreateWaveSamples();
+        var mixed = oneHand
+            .Select(sample => new GestureFrameSetSample(sample.Timestamp, [sample]))
+            .ToList();
+        mixed[10] = mixed[10] with
+        {
+            Hands =
+            [
+                mixed[10].Hands[0],
+                CreateSample(mixed[10].Timestamp, 280, 240, 80, 0.05f)
+            ]
+        };
+
+        Assert.False(MultiHandGestureFeatureExtractor.HasPredominantTwoHandCoverage(mixed, oneHand.Count));
+
+        var result = GestureTemplateFactory.TryCreate(oneHand);
+        Assert.NotNull(result.Template);
+        Assert.Equal(1, result.Template.HandCount);
+    }
+
+    [Fact]
+    public void TwoHandCoverage_RejectsDuplicateDetectionsOfSameHand()
+    {
+        var oneHand = CreateWaveSamples();
+        var duplicatePairs = oneHand
+            .Select(sample => new GestureFrameSetSample(
+                sample.Timestamp,
+                [
+                    sample,
+                    sample with { Confidence = 0.94f, Handedness = 0.02f }
+                ]))
+            .ToList();
+
+        Assert.Equal(0, MultiHandGestureFeatureExtractor.CountUsableTwoHandFrames(duplicatePairs));
+        Assert.False(MultiHandGestureFeatureExtractor.HasPredominantTwoHandCoverage(duplicatePairs, oneHand.Count));
+
+        var result = MultiHandGestureFeatureExtractor.TryCreate(duplicatePairs);
+        Assert.Null(result.Template);
+        Assert.Contains("two visible hands", result.FailureReason);
+    }
+
+    [Fact]
+    public void TwoHandCoverage_AcceptsMostlyTwoHandRecording()
+    {
+        var twoHand = CreateTwoHandPinchSamples();
+        for (var i = 0; i < 8; i++)
+        {
+            twoHand[i] = twoHand[i] with { Hands = [twoHand[i].Hands[0]] };
+        }
+
+        Assert.True(MultiHandGestureFeatureExtractor.HasPredominantTwoHandCoverage(twoHand, twoHand.Count));
+    }
+
     internal static List<GestureFrameSample> CreateWaveSamples(
         int count = 60,
         float shiftX = 100,
         float scale = 100,
         int direction = 1,
-        int intervalMilliseconds = 33)
+        int intervalMilliseconds = 33,
+        float handedness = 0)
     {
         var start = new DateTimeOffset(2026, 7, 17, 0, 0, 0, TimeSpan.Zero);
         var samples = new List<GestureFrameSample>();
@@ -147,10 +228,111 @@ public sealed class GestureTemplateFactoryTests
                 Landmarks: CreateHand(centerX, centerY, scale),
                 Confidence: 0.95f,
                 BoundingBox: null,
-                Handedness: 0));
+                Handedness: handedness));
         }
 
         return samples;
+    }
+
+    internal static List<GestureFrameSample> CreateApproachSamples(
+        int count = 62,
+        float shiftX = 100,
+        float startScale = 80,
+        float endScale = 145,
+        int intervalMilliseconds = 33)
+    {
+        var start = new DateTimeOffset(2026, 7, 17, 0, 0, 0, TimeSpan.Zero);
+        var samples = new List<GestureFrameSample>();
+        for (var i = 0; i < count; i++)
+        {
+            var progress = count == 1 ? 0 : i / (float)(count - 1);
+            var scale = startScale + ((endScale - startScale) * progress);
+            var landmarks = CreateHand(shiftX, 240, scale);
+            var minX = landmarks.Min(x => x.X);
+            var maxX = landmarks.Max(x => x.X);
+            var minY = landmarks.Min(x => x.Y);
+            var maxY = landmarks.Max(x => x.Y);
+            samples.Add(new GestureFrameSample(
+                Timestamp: start + TimeSpan.FromMilliseconds(i * intervalMilliseconds),
+                Landmarks: landmarks,
+                Confidence: 0.95f,
+                BoundingBox: new HandBox(minX, minY, maxX, maxY),
+                Handedness: 0.9f));
+        }
+
+        return samples;
+    }
+
+    internal static List<GestureFrameSample> CreateTranslateSamples(
+        int count = 62,
+        float startX = 80,
+        float deltaX = 90,
+        float centerY = 240,
+        float scale = 100,
+        int intervalMilliseconds = 33)
+    {
+        var start = new DateTimeOffset(2026, 7, 17, 0, 0, 0, TimeSpan.Zero);
+        var samples = new List<GestureFrameSample>();
+        for (var i = 0; i < count; i++)
+        {
+            var progress = count == 1 ? 0 : i / (float)(count - 1);
+            samples.Add(CreateSample(
+                start + TimeSpan.FromMilliseconds(i * intervalMilliseconds),
+                startX + (deltaX * progress),
+                centerY,
+                scale,
+                0.9f));
+        }
+
+        return samples;
+    }
+
+    internal static List<GestureFrameSetSample> CreateTwoHandPinchSamples(
+        int count = 62,
+        float leftStartX = 60,
+        float rightStartX = 240,
+        float endGap = 70,
+        float scale = 80,
+        int intervalMilliseconds = 33)
+    {
+        var start = new DateTimeOffset(2026, 7, 17, 0, 0, 0, TimeSpan.Zero);
+        var samples = new List<GestureFrameSetSample>();
+        var center = (leftStartX + rightStartX) / 2f;
+        for (var i = 0; i < count; i++)
+        {
+            var progress = count == 1 ? 0 : i / (float)(count - 1);
+            var gap = (rightStartX - leftStartX) + ((endGap - (rightStartX - leftStartX)) * progress);
+            var leftX = center - (gap / 2f);
+            var rightX = center + (gap / 2f);
+            samples.Add(new GestureFrameSetSample(
+                start + TimeSpan.FromMilliseconds(i * intervalMilliseconds),
+                [
+                    CreateSample(start + TimeSpan.FromMilliseconds(i * intervalMilliseconds), leftX, 240, scale, 0.05f),
+                    CreateSample(start + TimeSpan.FromMilliseconds(i * intervalMilliseconds), rightX, 240, scale, 0.95f)
+                ]));
+        }
+
+        return samples;
+    }
+
+    private static GestureFrameSample CreateSample(
+        DateTimeOffset timestamp,
+        float centerX,
+        float centerY,
+        float scale,
+        float handedness)
+    {
+        var landmarks = CreateHand(centerX, centerY, scale);
+        var minX = landmarks.Min(x => x.X);
+        var maxX = landmarks.Max(x => x.X);
+        var minY = landmarks.Min(x => x.Y);
+        var maxY = landmarks.Max(x => x.Y);
+        return new GestureFrameSample(
+            timestamp,
+            landmarks,
+            0.95f,
+            new HandBox(minX, minY, maxX, maxY),
+            handedness);
     }
 
     internal static List<GestureFrameSample> CreatePalmTurnSamples(

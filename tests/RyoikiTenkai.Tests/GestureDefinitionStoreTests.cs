@@ -92,7 +92,7 @@ public sealed class GestureDefinitionStoreTests
             var loaded = store.Load();
 
             var gesture = Assert.Single(loaded);
-            Assert.Equal(3, gesture.SchemaVersion);
+            Assert.Equal(4, gesture.SchemaVersion);
             var template = Assert.Single(gesture.Templates);
             Assert.NotNull(template.FeatureTrack);
             Assert.NotNull(template.Topology);

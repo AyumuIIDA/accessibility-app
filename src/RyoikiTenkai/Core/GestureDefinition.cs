@@ -21,7 +21,7 @@ internal sealed record GestureDefinition(
     List<GestureTemplate> Templates,
     DateTimeOffset CreatedAt,
     List<GestureRecording>? Recordings = null,
-    int SchemaVersion = 3,
+    int SchemaVersion = 4,
     DateTimeOffset? UpdatedAt = null);
 
 internal sealed record GestureRecording(
@@ -32,7 +32,8 @@ internal sealed record GestureRecording(
     float AverageConfidence,
     GestureRecordingQuality Quality,
     List<GestureRecordingFrame> Frames,
-    GestureFeatureTrack? FeatureTrack = null);
+    GestureFeatureTrack? FeatureTrack = null,
+    List<GestureMultiHandRecordingFrame>? MultiHandFrames = null);
 
 internal sealed record GestureRecordingQuality(
     bool Accepted,
@@ -72,7 +73,9 @@ internal sealed record GestureTemplate(
     GestureActiveSegment? ActiveSegment = null,
     string? SourceRecordingId = null,
     GestureTopologySummary? Topology = null,
-    GestureFeatureTrack? FeatureTrack = null);
+    GestureFeatureTrack? FeatureTrack = null,
+    int HandCount = 1,
+    GestureMultiHandFeatureSummary? MultiHandSummary = null);
 
 internal sealed record GestureTemplateSample(
     double TimeOffsetMilliseconds,
@@ -83,6 +86,20 @@ internal sealed record GestureTemplateSample(
 internal sealed record GestureSkeletonFrame(
     double TimeOffsetMilliseconds,
     List<GestureSkeletonPoint> Landmarks);
+
+internal sealed record GestureMultiHandRecordingFrame(
+    double TimeOffsetMilliseconds,
+    List<GestureRecordingFrame> Hands);
+
+internal sealed record GestureMultiHandFeatureSummary(
+    float RelativeTranslationDistance,
+    float RelativeDistanceRange,
+    float RelativeDistanceDelta,
+    float RelativeAngleRangeRadians,
+    float AverageLowHandedness,
+    float AverageHighHandedness,
+    float TopologyChangeScore,
+    float MeanRelativeDistance = 0);
 
 internal readonly record struct GestureSkeletonPoint(
     float X,
@@ -117,7 +134,14 @@ internal sealed record GestureFrameFeatures(
     float Handedness,
     float Confidence,
     List<float> FingerStraightness,
-    int FingerStateMask);
+    int FingerStateMask,
+    float HandScale = 0,
+    float HandScaleRatio = 1,
+    float BoundingBoxArea = 0,
+    float BoundingBoxAreaRatio = 1,
+    float TranslationX = 0,
+    float TranslationY = 0,
+    float TranslationDistance = 0);
 
 internal sealed record GestureFeatureSummary(
     float PalmTravel,
@@ -134,7 +158,15 @@ internal sealed record GestureFeatureSummary(
     float PalmDepthRangeMax,
     float PalmTurnScore,
     float FingerStraightnessRangeMax,
-    float TopologyChangeScore);
+    float TopologyChangeScore,
+    float HandednessMean = 0,
+    float HandScaleRatioRange = 0,
+    float HandScaleRatioDelta = 0,
+    float BoundingBoxAreaRatioRange = 0,
+    float BoundingBoxAreaRatioDelta = 0,
+    float TranslationDeltaX = 0,
+    float TranslationDeltaY = 0,
+    float TranslationDistance = 0);
 
 internal sealed record GestureFeatureSequence(
     List<GestureFeatureFrame> Frames,
@@ -169,7 +201,15 @@ internal sealed record GestureTopologySummary(
     float PalmCompressionDrop = 0,
     float PalmDepthRangeMax = 0,
     float PalmTurnScore = 0,
-    float FingerStraightnessRangeMax = 0);
+    float FingerStraightnessRangeMax = 0,
+    float HandednessMean = 0,
+    float HandScaleRatioRange = 0,
+    float HandScaleRatioDelta = 0,
+    float BoundingBoxAreaRatioRange = 0,
+    float BoundingBoxAreaRatioDelta = 0,
+    float TranslationDeltaX = 0,
+    float TranslationDeltaY = 0,
+    float TranslationDistance = 0);
 
 internal sealed record GestureScoreBreakdown(
     float JointScore,
@@ -180,6 +220,9 @@ internal sealed record GestureScoreBreakdown(
     float MotionScore,
     float PalmTurnScore,
     float DepthScore,
+    float HandednessScore,
+    float SizeScore,
+    float TranslationScore,
     float TotalScore);
 
 internal sealed record GestureFingerPose(

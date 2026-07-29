@@ -251,7 +251,7 @@ public partial class SkeletonVideoDebugView : UserControl
     {
         var selectedIndex = SelectedIndex();
         var selected = _selectedFrame;
-        Viewport.SetFrame(selected, CreateGhostTrail(selectedIndex));
+        Viewport.SetFrame(selected, CreateGhostTrail(selectedIndex), _frames);
         Timeline.SetZoom(_timelinePixelsPerFrame);
         Timeline.SetFrames(_frames, selectedIndex);
         ScrollSelectedTimelineFrameIntoView(selectedIndex);
@@ -326,7 +326,7 @@ public partial class SkeletonVideoDebugView : UserControl
             : string.Empty;
         FrameFactsText.Text = sample is null
             ? $"#{selectedIndex + 1} seq={frame.SequenceNumber} no-hand event\n{frame.Timestamp:HH:mm:ss.fff}"
-            : $"#{selectedIndex + 1} seq={frame.SequenceNumber} {frame.Timestamp:HH:mm:ss.fff}\nconfidence={sample.Confidence:0.000} handedness={sample.Handedness:0.000} source={frame.Source}{fingerText}{featureText}";
+            : $"#{selectedIndex + 1} seq={frame.SequenceNumber} {frame.Timestamp:HH:mm:ss.fff}\nconfidence={sample.Confidence:0.000} handedness={sample.Handedness:0.000} hands={frame.FrameSet?.Hands.Count ?? 1} source={frame.Source}{fingerText}{featureText}";
 
         var snapshot = frame.Snapshot;
         DecisionText.Text = snapshot.ConfirmedMatch is not null
@@ -350,6 +350,8 @@ public partial class SkeletonVideoDebugView : UserControl
                 $"topology change={topology.TopologyChangeScore:0.000} travel={topology.PalmTravel:0.000} angle={topology.PalmOrientationRangeRadians * 180 / MathF.PI:0.0}deg handed={topology.HandednessRange:0.000}");
             ScoresList.Items.Add(
                 $"palm turn={topology.PalmTurnScore:0.000} areaRange={topology.SignedPalmAreaRange:0.000} crossings={topology.SignedPalmAreaSignChanges} compressionDrop={topology.PalmCompressionDrop:0.000} depthMax={topology.PalmDepthRangeMax:0.000} fingerTransitions={topology.FingerStateTransitionCount} curlRange={topology.FingerStraightnessRangeMax:0.000}");
+            ScoresList.Items.Add(
+                $"hand side mean={topology.HandednessMean:0.000} sizeRange={topology.HandScaleRatioRange:0.000} sizeDelta={topology.HandScaleRatioDelta:0.000} bboxAreaDelta={topology.BoundingBoxAreaRatioDelta:0.000} translation=({topology.TranslationDeltaX:0.000},{topology.TranslationDeltaY:0.000}) dist={topology.TranslationDistance:0.000}");
         }
         if (snapshot.DtwWarpRatio is not null)
         {
@@ -358,7 +360,7 @@ public partial class SkeletonVideoDebugView : UserControl
         if (snapshot.ScoreBreakdown is { } breakdown)
         {
             ScoresList.Items.Add(
-                $"score parts joint={breakdown.JointScore:0.000} bone={breakdown.BoneScore:0.000} curl={breakdown.CurlScore:0.000} finger={breakdown.FingerStateScore:0.000} spacing={breakdown.SpacingScore:0.000} motion={breakdown.MotionScore:0.000} palm={breakdown.PalmTurnScore:0.000} depth={breakdown.DepthScore:0.000}");
+                $"score parts joint={breakdown.JointScore:0.000} bone={breakdown.BoneScore:0.000} curl={breakdown.CurlScore:0.000} finger={breakdown.FingerStateScore:0.000} spacing={breakdown.SpacingScore:0.000} motion={breakdown.MotionScore:0.000} palm={breakdown.PalmTurnScore:0.000} depth={breakdown.DepthScore:0.000} hand={breakdown.HandednessScore:0.000} size={breakdown.SizeScore:0.000} trans={breakdown.TranslationScore:0.000}");
         }
 
         foreach (var score in snapshot.Scores
@@ -370,7 +372,7 @@ public partial class SkeletonVideoDebugView : UserControl
             var template = score.TemplateIndex < 0 ? "-" : score.TemplateIndex.ToString();
             var parts = score.Breakdown is null
                 ? string.Empty
-                : $" parts j{score.Breakdown.JointScore:0.00}/b{score.Breakdown.BoneScore:0.00}/c{score.Breakdown.CurlScore:0.00}/f{score.Breakdown.FingerStateScore:0.00}/s{score.Breakdown.SpacingScore:0.00}/m{score.Breakdown.MotionScore:0.00}/p{score.Breakdown.PalmTurnScore:0.00}/z{score.Breakdown.DepthScore:0.00}";
+                : $" parts j{score.Breakdown.JointScore:0.00}/b{score.Breakdown.BoneScore:0.00}/c{score.Breakdown.CurlScore:0.00}/f{score.Breakdown.FingerStateScore:0.00}/s{score.Breakdown.SpacingScore:0.00}/m{score.Breakdown.MotionScore:0.00}/p{score.Breakdown.PalmTurnScore:0.00}/z{score.Breakdown.DepthScore:0.00}/h{score.Breakdown.HandednessScore:0.00}/sz{score.Breakdown.SizeScore:0.00}/t{score.Breakdown.TranslationScore:0.00}";
             ScoresList.Items.Add(
                 $"{marker}{score.DisplayName} unified t{template} conf={score.Confidence:0.00} score={FormatScore(score.Score)}{parts} {score.Reason}");
         }
@@ -392,7 +394,9 @@ public partial class SkeletonVideoDebugView : UserControl
 
         return
             $"palmArea={feature.SignedPalmArea:0.000} compression={feature.PalmCompression:0.000} " +
-            $"zRange={feature.PalmDepthRange:0.000} bboxAspect={feature.BoundingBoxAspect:0.00}";
+            $"zRange={feature.PalmDepthRange:0.000} bboxAspect={feature.BoundingBoxAspect:0.00} " +
+            $"scale={feature.HandScale:0.0} scaleRatio={feature.HandScaleRatio:0.000} bboxAreaRatio={feature.BoundingBoxAreaRatio:0.000} " +
+            $"translation=({feature.TranslationX:0.000},{feature.TranslationY:0.000})";
     }
 
     private static bool IsEventFrame(GestureDebugFrame frame)
@@ -429,14 +433,19 @@ public sealed class SkeletonViewport : FrameworkElement
 
     private GestureDebugFrame? _frame;
     private IReadOnlyList<GestureDebugFrame> _ghostTrail = [];
+    private IReadOnlyList<GestureDebugFrame> _sessionFrames = [];
     private IReadOnlyList<GestureSkeletonFrame> _candidateFitFrames = [];
     private IReadOnlyList<GestureSkeletonFrame> _templateFitFrames = [];
     private IReadOnlyList<GestureDtwPoint> _fitPath = [];
 
-    internal void SetFrame(GestureDebugFrame? frame, IReadOnlyList<GestureDebugFrame> ghostTrail)
+    internal void SetFrame(
+        GestureDebugFrame? frame,
+        IReadOnlyList<GestureDebugFrame> ghostTrail,
+        IReadOnlyList<GestureDebugFrame> sessionFrames)
     {
         _frame = frame;
         _ghostTrail = ghostTrail;
+        _sessionFrames = sessionFrames;
         _candidateFitFrames = frame?.Snapshot.CandidateTemplate?.SkeletonFrames ?? [];
         _templateFitFrames = frame?.Snapshot.BestTemplate?.SkeletonFrames ?? [];
         _fitPath = frame?.Snapshot.DtwPath ?? [];
@@ -448,28 +457,45 @@ public sealed class SkeletonViewport : FrameworkElement
         base.OnRender(drawingContext);
         var bounds = new Rect(0, 0, ActualWidth, ActualHeight);
         drawingContext.DrawRectangle(new SolidColorBrush(Color.FromRgb(5, 6, 8)), null, bounds);
-        if (_frame?.Sample?.Landmarks is not { Count: >= 21 } landmarks)
+        var selectedHands = HandsForFrame(_frame).ToList();
+        if (selectedHands.Count == 0)
         {
             DrawCenteredText(drawingContext, _frame?.NoHandReason ?? "No skeleton frame selected", bounds);
             return;
         }
 
-        var allLandmarks = _ghostTrail
-            .SelectMany(x => x.Sample?.Landmarks ?? [])
-            .Concat(landmarks)
+        var allLandmarks = _sessionFrames
+            .SelectMany(HandsForFrame)
+            .SelectMany(x => x.Landmarks)
+            .Concat(selectedHands.SelectMany(x => x.Landmarks))
             .ToList();
         var mapper = CreateMapper(allLandmarks, bounds);
         for (var i = 0; i < _ghostTrail.Count; i++)
         {
-            if (_ghostTrail[i].Sample?.Landmarks is { Count: >= 21 } ghost)
+            foreach (var ghost in HandsForFrame(_ghostTrail[i]))
             {
-                DrawSkeleton(drawingContext, ghost, mapper, 0.08 + (i / (double)Math.Max(1, _ghostTrail.Count)) * 0.22,
+                DrawSkeleton(drawingContext, ghost.Landmarks, mapper, 0.08 + (i / (double)Math.Max(1, _ghostTrail.Count)) * 0.22,
                     new SolidColorBrush(Color.FromRgb(74, 132, 205)), 1.4);
             }
         }
 
-        DrawSkeleton(drawingContext, landmarks, mapper, 1.0, Brushes.Gold, 3.0);
+        for (var i = 0; i < selectedHands.Count; i++)
+        {
+            var brush = i == 0 ? Brushes.Gold : Brushes.DeepSkyBlue;
+            DrawSkeleton(drawingContext, selectedHands[i].Landmarks, mapper, 1.0, brush, 3.0);
+        }
+
         DrawTemplateFitInset(drawingContext, bounds);
+    }
+
+    private static IEnumerable<GestureFrameSample> HandsForFrame(GestureDebugFrame? frame)
+    {
+        if (frame?.FrameSet?.Hands is { Count: > 0 } hands)
+        {
+            return hands.Where(x => x.Landmarks.Count >= 21);
+        }
+
+        return frame?.Sample?.Landmarks is { Count: >= 21 } ? [frame.Sample] : [];
     }
 
     private static void DrawSkeleton(
@@ -504,10 +530,11 @@ public sealed class SkeletonViewport : FrameworkElement
 
     private static Func<HandLandmark, Point> CreateMapper(IReadOnlyList<HandLandmark> landmarks, Rect bounds)
     {
-        var minX = landmarks.Min(x => x.X);
-        var maxX = landmarks.Max(x => x.X);
-        var minY = landmarks.Min(x => x.Y);
-        var maxY = landmarks.Max(x => x.Y);
+        var useCameraSpace = LooksLikeNormalizedCameraSpace(landmarks);
+        var minX = useCameraSpace ? 0 : landmarks.Min(x => x.X);
+        var maxX = useCameraSpace ? 1 : landmarks.Max(x => x.X);
+        var minY = useCameraSpace ? 0 : landmarks.Min(x => x.Y);
+        var maxY = useCameraSpace ? 1 : landmarks.Max(x => x.Y);
         var spanX = Math.Max(0.001f, maxX - minX);
         var spanY = Math.Max(0.001f, maxY - minY);
         var pad = Math.Min(bounds.Width, bounds.Height) * 0.08;
@@ -519,8 +546,16 @@ public sealed class SkeletonViewport : FrameworkElement
         var left = bounds.Left + (bounds.Width - drawnWidth) / 2;
         var top = bounds.Top + (bounds.Height - drawnHeight) / 2;
         return point => new Point(
-            left + ((point.X - minX) * scale),
+            left + drawnWidth - ((point.X - minX) * scale),
             top + ((point.Y - minY) * scale));
+    }
+
+    private static bool LooksLikeNormalizedCameraSpace(IReadOnlyList<HandLandmark> landmarks)
+    {
+        return landmarks.Count > 0
+            && landmarks.All(point =>
+                point.X >= -0.05f && point.X <= 1.05f
+                && point.Y >= -0.05f && point.Y <= 1.05f);
     }
 
     private static void DrawCenteredText(DrawingContext drawingContext, string text, Rect bounds)
@@ -635,7 +670,7 @@ public sealed class SkeletonViewport : FrameworkElement
         var left = bounds.Left + (bounds.Width - drawnWidth) / 2;
         var top = bounds.Top + (bounds.Height - drawnHeight) / 2;
         return point => new Point(
-            left + ((point.X - minX) * scale),
+            left + drawnWidth - ((point.X - minX) * scale),
             top + ((point.Y - minY) * scale));
     }
 
@@ -678,6 +713,7 @@ public sealed class SkeletonTimeline : FrameworkElement
 {
     private IReadOnlyList<GestureDebugFrame> _frames = [];
     private HashSet<long> _acceptedMatchSequenceNumbers = [];
+    private IReadOnlyList<TimelineMatchSegment> _matchSegments = [];
     private int _selectedIndex;
     private double _pixelsPerFrame = 2.0;
 
@@ -691,7 +727,12 @@ public sealed class SkeletonTimeline : FrameworkElement
     internal void SetFrames(IReadOnlyList<GestureDebugFrame> frames, int selectedIndex)
     {
         _frames = frames;
-        _acceptedMatchSequenceNumbers = BuildAcceptedMatchSet(frames);
+        _matchSegments = BuildMatchSegments(frames);
+        _acceptedMatchSequenceNumbers = _matchSegments
+            .SelectMany(x => Enumerable.Range(x.StartIndex, x.EndIndex - x.StartIndex + 1))
+            .Where(x => x >= 0 && x < frames.Count)
+            .Select(x => frames[x].SequenceNumber)
+            .ToHashSet();
         _selectedIndex = Math.Clamp(selectedIndex, 0, Math.Max(0, frames.Count - 1));
         Width = Math.Max(ActualWidth, _frames.Count * _pixelsPerFrame);
         InvalidateVisual();
@@ -714,9 +755,12 @@ public sealed class SkeletonTimeline : FrameworkElement
             return;
         }
 
-        var rowTop = 8d;
-        var rowHeight = Math.Max(16, bounds.Height - 18);
+        var segmentTop = 5d;
+        var segmentHeight = 22d;
+        var rowTop = 34d;
+        var rowHeight = Math.Max(16, bounds.Height - rowTop - 8);
         var frameWidth = Math.Max(1, _pixelsPerFrame);
+        DrawMatchSegments(drawingContext, bounds, frameWidth, segmentTop, segmentHeight);
         for (var i = 0; i < _frames.Count; i++)
         {
             var rect = new Rect(i * frameWidth, rowTop, Math.Max(1, frameWidth - 0.5), rowHeight);
@@ -738,20 +782,182 @@ public sealed class SkeletonTimeline : FrameworkElement
         FrameSelected?.Invoke(Math.Clamp(index, 0, _frames.Count - 1));
     }
 
+    private static IReadOnlyList<TimelineMatchSegment> BuildMatchSegments(IReadOnlyList<GestureDebugFrame> frames)
+    {
+        var result = new List<TimelineMatchSegment>();
+        var handFrames = frames
+            .Select((frame, index) => (frame, index))
+            .Where(x => x.frame.Kind == GestureDebugFrameKind.Hand)
+            .OrderBy(x => x.frame.Timestamp)
+            .ToList();
+        foreach (var confirmed in frames
+            .Select((frame, index) => (frame, index))
+            .Where(x => x.frame.Snapshot.ConfirmedMatch is not null))
+        {
+            var acceptedWindowFrames = confirmed.frame.Snapshot.WindowFrames?.Where(x => x.IsAcceptedMatch).ToList() ?? [];
+            if (acceptedWindowFrames.Count == 0)
+            {
+                result.Add(new TimelineMatchSegment(
+                    confirmed.index,
+                    confirmed.index,
+                    confirmed.frame.Snapshot.ConfirmedMatch!.DisplayName,
+                    confirmed.frame.Snapshot.ConfirmedMatch!.Confidence,
+                    confirmed.frame.Timestamp));
+                continue;
+            }
+
+            var oldestAccepted = acceptedWindowFrames.Max(x => x.AgeMilliseconds);
+            var newestAccepted = acceptedWindowFrames.Min(x => x.AgeMilliseconds);
+            var rangeStart = confirmed.frame.Timestamp - TimeSpan.FromMilliseconds(oldestAccepted + 90);
+            var rangeEnd = confirmed.frame.Timestamp - TimeSpan.FromMilliseconds(Math.Max(0, newestAccepted - 90));
+            var matchedFrames = handFrames
+                .Where(x => x.frame.Timestamp >= rangeStart && x.frame.Timestamp <= rangeEnd)
+                .ToList();
+            if (matchedFrames.Count == 0)
+            {
+                foreach (var windowFrame in acceptedWindowFrames)
+                {
+                    var timestamp = confirmed.frame.Timestamp - TimeSpan.FromMilliseconds(windowFrame.AgeMilliseconds);
+                    var nearest = handFrames
+                        .OrderBy(x => Math.Abs((x.frame.Timestamp - timestamp).TotalMilliseconds))
+                        .FirstOrDefault();
+                    if (nearest.frame is not null && Math.Abs((nearest.frame.Timestamp - timestamp).TotalMilliseconds) <= 90)
+                    {
+                        matchedFrames.Add(nearest);
+                    }
+                }
+            }
+
+            if (matchedFrames.Count == 0)
+            {
+                result.Add(new TimelineMatchSegment(
+                    confirmed.index,
+                    confirmed.index,
+                    confirmed.frame.Snapshot.ConfirmedMatch!.DisplayName,
+                    confirmed.frame.Snapshot.ConfirmedMatch!.Confidence,
+                    confirmed.frame.Timestamp));
+                continue;
+            }
+
+            result.Add(new TimelineMatchSegment(
+                matchedFrames.Min(x => x.index),
+                matchedFrames.Max(x => x.index),
+                confirmed.frame.Snapshot.ConfirmedMatch!.DisplayName,
+                confirmed.frame.Snapshot.ConfirmedMatch!.Confidence,
+                confirmed.frame.Timestamp));
+        }
+
+        return MergeAdjacentSegments(result);
+    }
+
+    private static IReadOnlyList<TimelineMatchSegment> MergeAdjacentSegments(IReadOnlyList<TimelineMatchSegment> segments)
+    {
+        var result = new List<TimelineMatchSegment>();
+        foreach (var segment in segments.OrderBy(x => x.StartIndex).ThenBy(x => x.EndIndex))
+        {
+            var previous = result.LastOrDefault();
+            if (previous is not null
+                && StringComparer.OrdinalIgnoreCase.Equals(previous.DisplayName, segment.DisplayName)
+                && segment.StartIndex <= previous.EndIndex + 3)
+            {
+                result[^1] = previous with
+                {
+                    EndIndex = Math.Max(previous.EndIndex, segment.EndIndex),
+                    Confidence = Math.Max(previous.Confidence, segment.Confidence),
+                    ConfirmedAt = segment.ConfirmedAt
+                };
+                continue;
+            }
+
+            result.Add(segment);
+        }
+
+        return result;
+    }
+
+    private void DrawMatchSegments(
+        DrawingContext drawingContext,
+        Rect bounds,
+        double frameWidth,
+        double top,
+        double height)
+    {
+        foreach (var segment in _matchSegments)
+        {
+            var x = segment.StartIndex * frameWidth;
+            var width = Math.Max(frameWidth, ((segment.EndIndex - segment.StartIndex) + 1) * frameWidth);
+            var rect = new Rect(x, top, width, height);
+            drawingContext.DrawRoundedRectangle(
+                new SolidColorBrush(Color.FromArgb(185, 28, 180, 70)),
+                new Pen(new SolidColorBrush(Color.FromRgb(115, 255, 145)), 1),
+                rect,
+                3,
+                3);
+
+            if (width < 44)
+            {
+                continue;
+            }
+
+            var text = $"{segment.DisplayName} {segment.Confidence:0.00}";
+            var formatted = new FormattedText(
+                text,
+                Thread.CurrentThread.CurrentCulture,
+                FlowDirection.LeftToRight,
+                new Typeface("Segoe UI Semibold"),
+                12,
+                Brushes.White,
+                VisualTreeHelper.GetDpi(Application.Current.MainWindow).PixelsPerDip)
+            {
+                MaxTextWidth = Math.Max(1, width - 8),
+                Trimming = TextTrimming.CharacterEllipsis
+            };
+            drawingContext.DrawText(formatted, new Point(rect.Left + 4, rect.Top + 3));
+        }
+
+        if (_matchSegments.Count == 0)
+        {
+            var formatted = new FormattedText(
+                "no confirmed gestures",
+                Thread.CurrentThread.CurrentCulture,
+                FlowDirection.LeftToRight,
+                new Typeface("Segoe UI"),
+                12,
+                new SolidColorBrush(Color.FromRgb(138, 148, 164)),
+                VisualTreeHelper.GetDpi(Application.Current.MainWindow).PixelsPerDip);
+            drawingContext.DrawText(formatted, new Point(6, top + 3));
+        }
+    }
+
     private static HashSet<long> BuildAcceptedMatchSet(IReadOnlyList<GestureDebugFrame> frames)
     {
         var result = new HashSet<long>();
+        var handFrames = frames
+            .Where(x => x.Kind == GestureDebugFrameKind.Hand)
+            .OrderBy(x => x.Timestamp)
+            .ToList();
         foreach (var confirmed in frames.Where(x => x.Snapshot.ConfirmedMatch is not null))
         {
             var acceptedWindowFrames = confirmed.Snapshot.WindowFrames?.Where(x => x.IsAcceptedMatch).ToList() ?? [];
+            if (acceptedWindowFrames.Count > 0)
+            {
+                var oldestAccepted = acceptedWindowFrames.Max(x => x.AgeMilliseconds);
+                var newestAccepted = acceptedWindowFrames.Min(x => x.AgeMilliseconds);
+                var rangeStart = confirmed.Timestamp - TimeSpan.FromMilliseconds(oldestAccepted + 90);
+                var rangeEnd = confirmed.Timestamp - TimeSpan.FromMilliseconds(Math.Max(0, newestAccepted - 90));
+                foreach (var frame in handFrames.Where(x => x.Timestamp >= rangeStart && x.Timestamp <= rangeEnd))
+                {
+                    result.Add(frame.SequenceNumber);
+                }
+            }
+
             foreach (var windowFrame in acceptedWindowFrames)
             {
                 var timestamp = confirmed.Timestamp - TimeSpan.FromMilliseconds(windowFrame.AgeMilliseconds);
-                var nearest = frames
-                    .Where(x => x.Kind == GestureDebugFrameKind.Hand)
+                var nearest = handFrames
                     .OrderBy(x => Math.Abs((x.Timestamp - timestamp).TotalMilliseconds))
                     .FirstOrDefault();
-                if (nearest is not null && Math.Abs((nearest.Timestamp - timestamp).TotalMilliseconds) <= 24)
+                if (nearest is not null && Math.Abs((nearest.Timestamp - timestamp).TotalMilliseconds) <= 90)
                 {
                     result.Add(nearest.SequenceNumber);
                 }
@@ -790,6 +996,13 @@ public sealed class SkeletonTimeline : FrameworkElement
 
         return Brushes.SteelBlue;
     }
+
+    private sealed record TimelineMatchSegment(
+        int StartIndex,
+        int EndIndex,
+        string DisplayName,
+        float Confidence,
+        DateTimeOffset ConfirmedAt);
 }
 
 public sealed class RecognizerWindowStrip : FrameworkElement
