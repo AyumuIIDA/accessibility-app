@@ -8,7 +8,7 @@ Current vertical slice:
 camera
   -> MediaPipe-style palm detector ONNX
   -> MediaPipe-style hand landmark ONNX
-  -> gesture classifier
+  -> static + time-window gesture recognizers
   -> WPF UI overlay
   -> Windows action execution
 ```
@@ -58,6 +58,9 @@ src/RyoikiTenkai.Native/
 ```
 
 ## First-Time Setup
+
+For a command-focused checklist for a fresh machine, see
+[`doc/new-computer-setup.md`](doc/new-computer-setup.md).
 
 Clone the repository, then run all commands below from its root. For example:
 
@@ -236,7 +239,9 @@ MediaPipe-like graph decodes palm anchors, creates a rotated hand ROI, projects 
 landmarks back to source coordinates, and reuses a landmark-derived ROI while tracking
 confidence remains above threshold. Palm bbox/keypoints and hand landmarks are exposed
 through ABI polling and rendered by the native HWND overlay. Direct2D/Direct3D
-rendering is the sole native display path; DirectML and QNN remain future phases.
+rendering is the sole native display path. The native model runners require ONNX
+Runtime QNN/HTP by default; when QNN is unavailable or rejects the model, native mode
+reports the blocking reason instead of silently falling back to CPU inference.
 Camera frame memory placement options and the criteria for moving capture from CPU
 buffers to DXGI surfaces are documented in
 [`doc/native-frame-memory-roadmap.md`](doc/native-frame-memory-roadmap.md).
@@ -357,11 +362,34 @@ build/RyoikiTenkai.Native.OpenCv/RyoikiTenkai.HandPerception.Tests.exe
 CMake resolves ONNX Runtime headers and the architecture-specific import library from
 the restored NuGet cache. Override `ONNXRUNTIME_ROOT` only when using a nonstandard
 package location; it must point to the `microsoft.ml.onnxruntime/1.27.0` package root.
+Set `QNN_RUNTIME_DIR` when configuring CMake if you have a Qualcomm/ONNX Runtime QNN
+runtime directory containing `QnnHtp.dll` and related provider DLLs:
 
-The next WPF build automatically copies an existing native DLL into `$(OutDir)`:
+```powershell
+cmake -S src/RyoikiTenkai.Native -B build/RyoikiTenkai.Native.OpenCv -G Ninja `
+  -DCMAKE_BUILD_TYPE=Debug `
+  -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
+  -DVCPKG_TARGET_TRIPLET=arm64-windows-static-md `
+  -DQNN_RUNTIME_DIR="C:\Path\To\QnnRuntime"
+```
+
+The next WPF build automatically copies existing native DLLs from the CMake output
+into `$(OutDir)`, including `RyoikiTenkai.Native.dll`, `onnxruntime.dll`, and any QNN
+DLLs copied by CMake:
 
 ```powershell
 dotnet build src/RyoikiTenkai.Wpf/RyoikiTenkai.Wpf.csproj --no-restore
+```
+
+On machines with Smart App Control or WDAC enabled, the native development DLL must
+be signed or Windows can block it with `0x800711C7` before the NPU runtime starts.
+The WPF project signs the copied native DLL by default when `signtool.exe` and a
+certificate named `RyoikiTenkai Local Dev Code Signing` are available. Disable this
+only in an environment that can load unsigned local native DLLs:
+
+```powershell
+dotnet build src/RyoikiTenkai.Wpf/RyoikiTenkai.Wpf.csproj `
+  --no-restore -p:BuildNativeRuntime=true -p:SignNativeRuntime=false
 ```
 
 To configure, build, and copy native code through one MSBuild invocation, run this from
@@ -369,7 +397,7 @@ the ARM64 developer shell:
 
 ```powershell
 dotnet build src/RyoikiTenkai.Wpf/RyoikiTenkai.Wpf.csproj `
-  --no-restore -p:BuildNativeRuntime=true
+  --no-restore -p:BuildNativeRuntime=true -p:QnnRuntimeDir="C:\Path\To\QnnRuntime"
 ```
 
 This target fails before CMake runs when the Visual Studio target architecture is not
@@ -386,9 +414,10 @@ if ($nativeBuild -and $nativeBuild.Path.StartsWith((Resolve-Path .).Path)) {
 }
 ```
 
-Run WPF and enable the `Native runtime` checkbox before pressing Start.
+Run WPF and press Start. The `Native runtime` checkbox is enabled by default.
 
-If the DLL is not present, WPF logs that the native runtime is unavailable and falls back to the managed C# camera pipeline.
+If the DLL is not present or is blocked, WPF logs that the native runtime is
+unavailable and does not silently start the managed CPU inference path.
 
 If loading fails with `0x800711C7`, Windows Application Control rejected the unsigned
 development DLL. Use the organization-approved development signing process or an
@@ -414,6 +443,16 @@ Gesture/action bindings are stored next to the running app:
 src/RyoikiTenkai.Wpf/bin/arm64/Debug/net10.0-windows10.0.26100.0/bindings.json
 src/RyoikiTenkai/bin/arm64/Debug/net10.0-windows10.0.26100.0/bindings.json
 ```
+
+Custom recorded gesture templates are stored next to the WPF app:
+
+```text
+src/RyoikiTenkai.Wpf/bin/Debug/net10.0-windows10.0.26100.0/gestures.json
+```
+
+In the WPF UI, start the camera, enter a gesture name, and use `Record Example` three times. Each recording captures about 1.5 seconds of one-hand landmarks, normalizes the motion, and enables the gesture for action binding after three examples.
+
+The WPF `Debug Lab` tab shows how gesture classification is being decided. It visualizes the normalized candidate motion path, overlays the best matching recorded templates, lists per-template score/confidence values, and shows raw normalized vector rows. The ONNX models do not expose latent embeddings in this app; the debug view shows the actual vectors and scores used by the custom gesture classifier.
 
 Delete WPF bindings and let the app recreate the default sample:
 
@@ -470,9 +509,16 @@ Open a new PowerShell session after setting persistent environment variables.
 
 ## Current Runtime Notes
 
-- Inference uses `Microsoft.ML.OnnxRuntime`.
-- The current execution provider is CPU.
-- NPU/QNN execution is not wired yet.
+- Managed fallback inference uses `Microsoft.ML.OnnxRuntime`; native inference uses
+  Windows ML ONNX Runtime with QNN/HTP registration.
+- The managed WPF camera path uses CPU ONNX Runtime sessions.
+- The native runtime requires QNN/HTP by default. Set
+  `RYOIKI_EXECUTION_PROVIDER=cpu` only when intentionally debugging the CPU path.
+- The WPF native status line and log show selected providers, fallback/blocking
+  reasons, camera size/subtype, graph timing, frame age, frame/tensor byte counts,
+  dropped frames, and process working-set memory.
+- If QNN/HTP rejects a model, native mode fails closed instead of silently running
+  neural inference on CPU.
 - The WPF camera path uses Windows `MediaFrameReader`.
 - Display frames and model frames are separated:
   - display: high-resolution camera frame

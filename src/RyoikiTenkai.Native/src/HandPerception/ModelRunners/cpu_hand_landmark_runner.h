@@ -19,11 +19,17 @@ public:
         const std::filesystem::path& modelPath,
         const HandLandmarkModelContract& contract,
         std::string& error);
+    static std::unique_ptr<CpuHandLandmarkRunner> create(
+        const std::filesystem::path& modelPath,
+        const HandLandmarkModelContract& contract,
+        const ModelRunnerExecutionSettings& settings,
+        std::string& error);
 
     ~CpuHandLandmarkRunner() override;
 
     [[nodiscard]] ExecutionProvider executionProvider() const noexcept override;
     [[nodiscard]] std::string_view providerName() const noexcept override;
+    [[nodiscard]] std::string_view fallbackReason() const noexcept override;
     bool run(
         const buffers::FloatTensorBuffer& input,
         HandLandmarkRawOutput& output,

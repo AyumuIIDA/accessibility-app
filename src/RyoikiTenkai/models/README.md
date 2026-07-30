@@ -11,6 +11,6 @@ The intended pipeline follows MediaPipe Hands:
 
 1. palm detector / BlazePalm detects a hand ROI from the camera frame
 2. hand landmark model predicts 21 hand landmarks from that ROI
-3. `MediaPipeLandmarkGestureModel` maps landmarks to gesture ids such as `open_palm`, `fist`, and `pinch`
+3. recorded custom gesture recognition consumes landmark windows
 
-The current code has the pipeline boundary and landmark-based gesture classifier in place. The concrete model runner still needs to be wired through ONNX Runtime / Windows ML or a verified MediaPipe .NET binding.
+The WPF prototype uses recorded custom gesture templates only. Built-in static gesture ids are intentionally not part of the recognition path.

@@ -1,0 +1,26 @@
+<!-- Copyright (c) Microsoft Corporation. All rights reserved. -->
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Import Project="$(MSBuildThisFileDirectory)..\Microsoft.Windows.AI.MachineLearning.props"/>
+  <PropertyGroup>
+    <_WindowsMLLocalNativePath>$(MSBuildThisFileDirectory)..\..\runtimes\win-$(Platform.ToLower())\native</_WindowsMLLocalNativePath>
+    <!-- Flag to enable direct inclusion of ONNX headers without prefix -->
+    <WinMLEnableDefaultOrtHeaderIncludePath Condition="'$(WinMLEnableDefaultOrtHeaderIncludePath)' == ''">false</WinMLEnableDefaultOrtHeaderIncludePath>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>
+        %(AdditionalIncludeDirectories);
+        $(MSBuildThisFileDirectory)..\..\include
+      </AdditionalIncludeDirectories>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <!-- Add additional include path for direct ONNX header inclusion when flag is enabled -->
+  <ItemDefinitionGroup Condition="'$(WinMLEnableDefaultOrtHeaderIncludePath)' == 'true'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>
+        %(AdditionalIncludeDirectories);
+        $(MSBuildThisFileDirectory)..\..\include\winml
+      </AdditionalIncludeDirectories>
+    </ClCompile>
+  </ItemDefinitionGroup>
+</Project>

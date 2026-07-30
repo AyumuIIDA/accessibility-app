@@ -6,7 +6,8 @@ namespace RyoikiTenkai.Wpf.Native;
 internal static partial class NativeVisionInterop
 {
     public const string LibraryName = "RyoikiTenkai.Native";
-    public const uint AbiVersion = 4;
+    public const uint AbiVersion = 7;
+    public const int MaxHands = 2;
 
     [LibraryImport(LibraryName, EntryPoint = "ryoiki_get_abi_version")]
     public static partial uint GetAbiVersion();
@@ -59,7 +60,7 @@ internal static partial class NativeVisionInterop
 }
 
 [StructLayout(LayoutKind.Sequential)]
-internal struct NativeVisionMetrics
+internal unsafe struct NativeVisionMetrics
 {
     public uint AbiVersion;
     public uint StructSize;
@@ -83,6 +84,76 @@ internal struct NativeVisionMetrics
     public double NativeOverheadMs;
     public ulong FramePoolDroppedFrames;
     public ulong PerceptionDroppedFrames;
+    public uint CaptureWidth;
+    public uint CaptureHeight;
+    public uint UprightWidth;
+    public uint UprightHeight;
+    public ulong FrameBytes;
+    public ulong TensorInputBytes;
+    public double GraphTotalMs;
+    public double PerceptionFrameAgeMs;
+    public double RenderFrameAgeMs;
+    public fixed byte CameraSubtypeBytes[32];
+    public fixed byte PalmProviderBytes[64];
+    public fixed byte HandProviderBytes[64];
+    public fixed byte ProviderFallbackReasonBytes[256];
+
+    public string CameraSubtype
+    {
+        get
+        {
+            fixed (byte* buffer = CameraSubtypeBytes)
+            {
+                return DecodeUtf8(buffer, 32);
+            }
+        }
+    }
+
+    public string PalmProvider
+    {
+        get
+        {
+            fixed (byte* buffer = PalmProviderBytes)
+            {
+                return DecodeUtf8(buffer, 64);
+            }
+        }
+    }
+
+    public string HandProvider
+    {
+        get
+        {
+            fixed (byte* buffer = HandProviderBytes)
+            {
+                return DecodeUtf8(buffer, 64);
+            }
+        }
+    }
+
+    public string ProviderFallbackReason
+    {
+        get
+        {
+            fixed (byte* buffer = ProviderFallbackReasonBytes)
+            {
+                return DecodeUtf8(buffer, 256);
+            }
+        }
+    }
+
+    private static string DecodeUtf8(byte* buffer, int bufferLength)
+    {
+        var length = 0;
+        while (length < bufferLength && buffer[length] != 0)
+        {
+            length++;
+        }
+
+        return length == 0
+            ? string.Empty
+            : Encoding.UTF8.GetString(buffer, length);
+    }
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -100,12 +171,27 @@ internal unsafe struct NativePalmResult
 [StructLayout(LayoutKind.Sequential)]
 internal unsafe struct NativeHandResult
 {
+    private const int NativeMaxHands = 2;
+
     public uint AbiVersion;
     public uint StructSize;
     public ulong FrameId;
     public int HandCount;
-    public float Confidence;
-    public float Handedness;
-    public fixed float Bbox[4];
-    public fixed float Landmarks[21 * 3];
+    public fixed float Confidence[NativeMaxHands];
+    public fixed float Handedness[NativeMaxHands];
+    public fixed float Bbox[NativeMaxHands * 4];
+    public fixed float Landmarks[NativeMaxHands * 21 * 3];
+
+    public float GetConfidence(int index)
+    {
+        if (index < 0 || index >= NativeMaxHands)
+        {
+            return 0;
+        }
+
+        fixed (float* confidence = Confidence)
+        {
+            return confidence[index];
+        }
+    }
 }

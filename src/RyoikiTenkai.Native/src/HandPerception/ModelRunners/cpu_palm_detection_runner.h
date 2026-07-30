@@ -14,11 +14,16 @@ public:
     static std::unique_ptr<CpuPalmDetectionRunner> create(
         const std::filesystem::path& modelPath,
         std::string& error);
+    static std::unique_ptr<CpuPalmDetectionRunner> create(
+        const std::filesystem::path& modelPath,
+        const ModelRunnerExecutionSettings& settings,
+        std::string& error);
 
     ~CpuPalmDetectionRunner() override;
 
     [[nodiscard]] ExecutionProvider executionProvider() const noexcept override;
     [[nodiscard]] std::string_view providerName() const noexcept override;
+    [[nodiscard]] std::string_view fallbackReason() const noexcept override;
     bool run(
         const buffers::FloatTensorBuffer& input,
         PalmDetectionRawOutput& output,

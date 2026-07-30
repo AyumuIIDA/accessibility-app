@@ -1,10 +1,12 @@
 #include "HandPerception/ModelRunners/cpu_hand_landmark_runner.h"
+#include "HandPerception/ModelRunners/qnn_execution_provider.h"
 
 #include <onnxruntime_cxx_api.h>
 
 #include <array>
 #include <chrono>
 #include <filesystem>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -16,13 +18,32 @@ namespace
 constexpr std::array<std::int64_t, 4> kInputShape{1, 224, 224, 3};
 constexpr std::array<std::int64_t, 2> kLandmarkShape{1, 63};
 constexpr std::array<std::int64_t, 2> kScalarShape{1, 1};
+
+std::filesystem::path qnnHtpBackendPath()
+{
+    const auto currentPath = std::filesystem::current_path() / "QnnHtp.dll";
+    if (std::filesystem::is_regular_file(currentPath))
+    {
+        return currentPath;
+    }
+
+    return "QnnHtp.dll";
+}
+
+std::string describeOrtException(const Ort::Exception& exception)
+{
+    std::ostringstream stream;
+    stream << exception.what() << " (ORT code " << exception.GetOrtErrorCode() << ")";
+    return stream.str();
+}
 }
 
 struct CpuHandLandmarkRunner::Impl
 {
     Impl(
         const std::filesystem::path& modelPath,
-        const HandLandmarkModelContract& contract)
+        const HandLandmarkModelContract& contract,
+        const ModelRunnerExecutionSettings& settings)
         : environment{ORT_LOGGING_LEVEL_WARNING, "RyoikiTenkai"}
     {
         if (!std::filesystem::is_regular_file(modelPath))
@@ -30,9 +51,7 @@ struct CpuHandLandmarkRunner::Impl
             throw std::runtime_error{"Hand landmark model was not found: " + modelPath.string()};
         }
 
-        sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-        sessionOptions.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
-        session = std::make_unique<Ort::Session>(environment, modelPath.c_str(), sessionOptions);
+        createSession(modelPath, settings);
 
         const auto requiredInputShape = std::vector<std::int64_t>{
             kInputShape.begin(), kInputShape.end()};
@@ -96,9 +115,75 @@ struct CpuHandLandmarkRunner::Impl
         };
     }
 
+    void configureBaseSessionOptions()
+    {
+        sessionOptions = Ort::SessionOptions{};
+        sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+        sessionOptions.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+    }
+
+    void createSession(
+        const std::filesystem::path& modelPath,
+        const ModelRunnerExecutionSettings& settings)
+    {
+        if (settings.preferQnnHtp)
+        {
+            std::string qnnRegistrationError;
+            try
+            {
+                configureBaseSessionOptions();
+                if (!tryAppendWindowsMlQnnHtp(
+                        environment,
+                        sessionOptions,
+                        providerName,
+                        qnnRegistrationError))
+                {
+                    const auto backendPath = qnnHtpBackendPath().string();
+                    sessionOptions.AppendExecutionProvider(
+                        "QNN",
+                        {{"backend_path", backendPath}});
+                    providerName = "QNNExecutionProvider(HTP)";
+                    if (!qnnRegistrationError.empty())
+                    {
+                        providerName += " after WindowsML registration failed";
+                    }
+                }
+                session = std::make_unique<Ort::Session>(environment, modelPath.c_str(), sessionOptions);
+                provider = ExecutionProvider::QnnHtp;
+                fallbackReason.clear();
+                return;
+            }
+            catch (const Ort::Exception& exception)
+            {
+                fallbackReason = settings.requireQnnHtp
+                    ? "QNN hand session unavailable; NPU is required. "
+                    : "QNN hand session unavailable; using CPU. ";
+                fallbackReason += describeOrtException(exception);
+                if (!qnnRegistrationError.empty())
+                {
+                    fallbackReason += " Windows ML QNN path also failed: "
+                        + qnnRegistrationError;
+                }
+                if (settings.requireQnnHtp)
+                {
+                    throw std::runtime_error{fallbackReason};
+                }
+                session.reset();
+            }
+        }
+
+        configureBaseSessionOptions();
+        session = std::make_unique<Ort::Session>(environment, modelPath.c_str(), sessionOptions);
+        provider = ExecutionProvider::Cpu;
+        providerName = "CPUExecutionProvider";
+    }
+
     Ort::Env environment;
     Ort::SessionOptions sessionOptions;
     std::unique_ptr<Ort::Session> session;
+    ExecutionProvider provider{ExecutionProvider::Cpu};
+    std::string providerName{"CPUExecutionProvider"};
+    std::string fallbackReason;
     std::string inputNameStorage;
     std::array<std::string, 4> outputNames{};
 };
@@ -115,15 +200,24 @@ std::unique_ptr<CpuHandLandmarkRunner> CpuHandLandmarkRunner::create(
     const HandLandmarkModelContract& contract,
     std::string& error)
 {
+    return create(modelPath, contract, {}, error);
+}
+
+std::unique_ptr<CpuHandLandmarkRunner> CpuHandLandmarkRunner::create(
+    const std::filesystem::path& modelPath,
+    const HandLandmarkModelContract& contract,
+    const ModelRunnerExecutionSettings& settings,
+    std::string& error)
+{
     try
     {
         error.clear();
         return std::unique_ptr<CpuHandLandmarkRunner>{
-            new CpuHandLandmarkRunner{std::make_unique<Impl>(modelPath, contract)}};
+            new CpuHandLandmarkRunner{std::make_unique<Impl>(modelPath, contract, settings)}};
     }
     catch (const Ort::Exception& exception)
     {
-        error = "ONNX Runtime hand session creation failed: " + std::string{exception.what()};
+        error = "ONNX Runtime hand session creation failed: " + describeOrtException(exception);
         return {};
     }
     catch (const std::exception& exception)
@@ -142,12 +236,17 @@ CpuHandLandmarkRunner::~CpuHandLandmarkRunner() = default;
 
 ExecutionProvider CpuHandLandmarkRunner::executionProvider() const noexcept
 {
-    return ExecutionProvider::Cpu;
+    return impl_->provider;
 }
 
 std::string_view CpuHandLandmarkRunner::providerName() const noexcept
 {
-    return "CPUExecutionProvider";
+    return impl_->providerName;
+}
+
+std::string_view CpuHandLandmarkRunner::fallbackReason() const noexcept
+{
+    return impl_->fallbackReason;
 }
 
 bool CpuHandLandmarkRunner::run(

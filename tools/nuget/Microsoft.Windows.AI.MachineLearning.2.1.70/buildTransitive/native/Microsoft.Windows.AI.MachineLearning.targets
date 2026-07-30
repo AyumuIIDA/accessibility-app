@@ -1,0 +1,57 @@
+<!-- Copyright (c) Microsoft Corporation. All rights reserved. -->
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="uap10.0">
+    <Reference Include="$(MSBuildThisFileDirectory)..\..\metadata\Microsoft.Windows.AI.MachineLearning.winmd">
+      <Implementation>Microsoft.Windows.AI.MachineLearning.dll</Implementation>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- Link to ONNX Runtime import libraries when _WindowsAppSDKML is not set or WindowsMLNativeLinkOnnxRuntime is explicitly enabled -->
+  <ItemDefinitionGroup Condition="'$(_WindowsAppSDKML)' != 'true' or '$(WindowsMLNativeLinkOnnxRuntime)' == 'true'">
+    <Link>
+      <AdditionalDependencies>$(MSBuildThisFileDirectory)..\..\lib\native\$(Platform)\onnxruntime.lib;$(MSBuildThisFileDirectory)..\..\lib\native\$(Platform)\Microsoft.Windows.AI.MachineLearning.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <!-- Copy runtime DLLs from NuGet package to output directory when _WindowsAppSDKML is not set or
+       WindowsAppSDKMLDeploymentMode is SelfContained. -->
+  <ItemGroup Condition="'$(_WindowsAppSDKML)' != 'true' or '$(WindowsAppSDKMLDeploymentMode)' == 'SelfContained'">
+    <None Include="$(_WindowsMLLocalNativePath)\onnxruntime.dll"
+          Condition="Exists('$(_WindowsMLLocalNativePath)\onnxruntime.dll')">
+      <Link>onnxruntime.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </None>
+    <None Include="$(_WindowsMLLocalNativePath)\DirectML.dll"
+          Condition="Exists('$(_WindowsMLLocalNativePath)\DirectML.dll')">
+      <Link>DirectML.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </None>
+    <None Include="$(_WindowsMLLocalNativePath)\Microsoft.Windows.AI.MachineLearning.dll"
+          Condition="Exists('$(_WindowsMLLocalNativePath)\Microsoft.Windows.AI.MachineLearning.dll')">
+      <Link>Microsoft.Windows.AI.MachineLearning.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </None>
+  </ItemGroup>
+
+  <!-- Error if WindowsAppSDK is referenced without Microsoft.WindowsAppSDK.ML in framework-dependent mode -->
+  <Target Name="_ValidateMLWindowsAppSDKIntegrationNative"
+          BeforeTargets="Build"
+          Condition="'$(_WindowsAppSDKML)' != 'true' and '$(MicrosoftWindowsAppSDKPackageDir)' != '' and '$(WindowsAppSDKSelfContained)' != 'true'">
+    <Error Text="Framework-dependent apps using WindowsAppSDK must reference Microsoft.WindowsAppSDK.ML instead of Microsoft.Windows.AI.MachineLearning." />
+  </Target>
+
+  <!-- OS version check: Microsoft.Windows.AI.MachineLearning requires Win10 19H1+ -->
+  <Target Name="_ValidateMLPlatformVersionNative"
+          BeforeTargets="Build"
+          Condition="'$(_WindowsAppSDKML)' != 'true'">
+    <Error Text="Microsoft.Windows.AI.MachineLearning requires TargetPlatformVersion Windows 10 19H1 (build 18362) or later. For Windows 10 versions prior to 19H1 (build 18362), install Microsoft.WindowsAppSDK.ML which provides framework-based deployment with WinRT activation via appxfragment."
+           Condition="'$(TargetPlatformVersion)' != '' and $([MSBuild]::VersionLessThan('$(TargetPlatformVersion)', '10.0.18362.0'))" />
+    <Error Text="Microsoft.Windows.AI.MachineLearning requires WindowsTargetPlatformMinVersion Windows 10 19H1 (build 18362) or later. For Windows 10 versions prior to 19H1 (build 18362), install Microsoft.WindowsAppSDK.ML which provides framework-based deployment with WinRT activation via appxfragment."
+           Condition="'$(WindowsTargetPlatformMinVersion)' != '' and $([MSBuild]::VersionLessThan('$(WindowsTargetPlatformMinVersion)', '10.0.18362.0'))" />
+  </Target>
+
+</Project>

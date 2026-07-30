@@ -1,0 +1,22 @@
+<!-- Copyright (c) Microsoft Corporation. All rights reserved. -->
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!-- Error if WindowsAppSDK is referenced without Microsoft.WindowsAppSDK.ML in framework-dependent mode -->
+  <Target Name="_ValidateMLWindowsAppSDKIntegration"
+          BeforeTargets="Build"
+          Condition="'$(_WindowsAppSDKML)' != 'true' and '$(MicrosoftWindowsAppSDKPackageDir)' != '' and '$(WindowsAppSDKSelfContained)' != 'true'">
+    <Error Text="Framework-dependent apps using WindowsAppSDK must reference Microsoft.WindowsAppSDK.ML instead of Microsoft.Windows.AI.MachineLearning." />
+  </Target>
+
+  <!-- OS version check: Microsoft.Windows.AI.MachineLearning requires Win10 19H1+ -->
+  <Target Name="_ValidateMLPlatformVersion"
+          BeforeTargets="Build"
+          Condition="'$(_WindowsAppSDKML)' != 'true'">
+    <Error Text="Microsoft.Windows.AI.MachineLearning requires TargetPlatformVersion Windows 10 19H1 (build 18362) or later. For Windows 10 versions prior to 19H1 (build 18362), install Microsoft.WindowsAppSDK.ML which provides framework-based deployment with WinRT activation via appxfragment."
+           Condition="'$(TargetPlatformVersion)' != '' and $([MSBuild]::VersionLessThan('$(TargetPlatformVersion)', '10.0.18362.0'))" />
+    <Error Text="Microsoft.Windows.AI.MachineLearning requires WindowsTargetPlatformMinVersion Windows 10 19H1 (build 18362) or later. For Windows 10 versions prior to 19H1 (build 18362), install Microsoft.WindowsAppSDK.ML which provides framework-based deployment with WinRT activation via appxfragment."
+           Condition="'$(WindowsTargetPlatformMinVersion)' != '' and $([MSBuild]::VersionLessThan('$(WindowsTargetPlatformMinVersion)', '10.0.18362.0'))" />
+    <Error Text="Microsoft.Windows.AI.MachineLearning requires SupportedOSPlatformVersion Windows 10 19H1 (build 18362) or later. For Windows 10 versions prior to 19H1 (build 18362), install Microsoft.WindowsAppSDK.ML which provides framework-based deployment with WinRT activation via appxfragment."
+           Condition="'$(SupportedOSPlatformVersion)' != '' and $([MSBuild]::VersionLessThan('$(SupportedOSPlatformVersion)', '10.0.18362.0'))" />
+  </Target>
+
+</Project>
