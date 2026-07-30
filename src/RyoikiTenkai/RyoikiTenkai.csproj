@@ -1,7 +1,7 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
+    <OutputType>Library</OutputType>
     <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
@@ -13,16 +13,11 @@
     </Content>
   </ItemGroup>
 
-  <PropertyGroup>
-    <NativeInferenceBackend Condition="'$(NativeInferenceBackend)' == ''">qnn</NativeInferenceBackend>
-  </PropertyGroup>
-
-  <ItemGroup Condition="'$(NativeInferenceBackend)' == 'qnn'">
-    <PackageReference Include="Microsoft.ML.OnnxRuntime.QNN" Version="1.24.4" />
-  </ItemGroup>
-
-  <ItemGroup Condition="'$(NativeInferenceBackend)' == 'directml'">
-    <PackageReference Include="Microsoft.ML.OnnxRuntime.DirectML" Version="1.24.4" />
+  <ItemGroup>
+    <Compile Remove="App\**\*.cs" />
+    <Compile Remove="GestureSources\**\*.cs" />
+    <Compile Remove="Vision\**\*.cs" />
+    <Compile Remove="Program.cs" />
   </ItemGroup>
 
 </Project>

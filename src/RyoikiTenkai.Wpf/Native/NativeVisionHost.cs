@@ -99,6 +99,33 @@ internal sealed partial class NativeVisionHost : HwndHost
             && result.StructSize == Marshal.SizeOf<NativeHandResult>();
     }
 
+    public bool TryGetStates(out NativeHandStateSnapshot snapshot)
+    {
+        snapshot = default;
+        var success = _nativeAvailable
+            && _nativeHandle != IntPtr.Zero
+            && NativeVisionInterop.GetLatestStates(_nativeHandle, out snapshot) != 0;
+        return success
+            && snapshot.AbiVersion == NativeVisionInterop.AbiVersion
+            && snapshot.StructSize == Marshal.SizeOf<NativeHandStateSnapshot>();
+    }
+
+    public bool TryReadHandEvents(
+        ulong afterSequence,
+        out NativeHandEventBatch batch)
+    {
+        batch = default;
+        var success = _nativeAvailable
+            && _nativeHandle != IntPtr.Zero
+            && NativeVisionInterop.ReadHandEvents(
+                _nativeHandle,
+                afterSequence,
+                out batch) != 0;
+        return success
+            && batch.AbiVersion == NativeVisionInterop.AbiVersion
+            && batch.StructSize == Marshal.SizeOf<NativeHandEventBatch>();
+    }
+
     public bool TryGetPalm(out NativePalmResult result)
     {
         result = default;
@@ -108,6 +135,46 @@ internal sealed partial class NativeVisionHost : HwndHost
         return success
             && result.AbiVersion == NativeVisionInterop.AbiVersion
             && result.StructSize == Marshal.SizeOf<NativePalmResult>();
+    }
+
+    public bool ConfigureCadHandInteraction(
+        CadViewportHost cadViewport,
+        NativeCadHandInteractionMode mode,
+        NativeHandPresentationMode presentation,
+        float rotationSensitivity)
+    {
+        return _nativeAvailable
+            && _nativeHandle != IntPtr.Zero
+            && cadViewport.NativeHandle != IntPtr.Zero
+            && NativeVisionInterop.ConfigureCadHandInteraction(
+                _nativeHandle,
+                cadViewport.NativeHandle,
+                (int)mode,
+                (int)presentation,
+                rotationSensitivity) != 0;
+    }
+
+    public bool SetHandPresentationMode(
+        NativeHandPresentationMode presentation)
+    {
+        return _nativeAvailable
+            && _nativeHandle != IntPtr.Zero
+            && NativeVisionInterop.SetHandPresentationMode(
+                _nativeHandle,
+                (int)presentation) != 0;
+    }
+
+    public bool TryGetCadHandInteraction(out NativeCadHandInteractionResult result)
+    {
+        result = default;
+        var success = _nativeAvailable
+            && _nativeHandle != IntPtr.Zero
+            && NativeVisionInterop.GetCadHandInteraction(
+                _nativeHandle,
+                out result) != 0;
+        return success
+            && result.AbiVersion == NativeVisionInterop.AbiVersion
+            && result.StructSize == Marshal.SizeOf<NativeCadHandInteractionResult>();
     }
 
     public string GetLastErrorMessage()

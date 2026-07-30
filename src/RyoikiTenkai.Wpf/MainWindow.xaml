@@ -39,11 +39,8 @@
 
             <DockPanel Grid.Row="0" Margin="0,0,0,12">
                 <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
-                    <CheckBox x:Name="UseNativeRuntimeCheckBox"
-                              Content="Native runtime"
-                              Foreground="#E7EAF0"
-                              VerticalAlignment="Center"
-                              Margin="0,0,12,0" />
+                    <Button x:Name="OpenCadViewerButton" Content="Open 3D Viewer"
+                            Click="OpenCadViewerButton_Click" />
                     <Button x:Name="StartButton" Content="Start" Click="StartButton_Click" />
                     <Button x:Name="StopButton" Content="Stop" Click="StopButton_Click" IsEnabled="False" />
                 </StackPanel>
@@ -56,16 +53,6 @@
 
             <Border Grid.Row="1" Background="#050608" BorderBrush="#2B313D" BorderThickness="1" CornerRadius="8">
                 <Grid x:Name="PreviewHost" ClipToBounds="True">
-                    <Image x:Name="CameraImage" Stretch="Uniform" RenderTransformOrigin="0.5,0.5">
-                        <Image.RenderTransform>
-                            <ScaleTransform ScaleX="-1" />
-                        </Image.RenderTransform>
-                    </Image>
-                    <Canvas x:Name="OverlayCanvas" IsHitTestVisible="False" RenderTransformOrigin="0.5,0.5">
-                        <Canvas.RenderTransform>
-                            <ScaleTransform ScaleX="-1" />
-                        </Canvas.RenderTransform>
-                    </Canvas>
                     <native:NativeVisionHost x:Name="NativeVisionHostControl" Visibility="Collapsed" />
                     <Border HorizontalAlignment="Left" VerticalAlignment="Top" Margin="14"
                             Padding="10,6" Background="#B0000000" CornerRadius="4">
@@ -102,7 +89,7 @@
                 <Border Grid.Column="3" Background="#171B22" Padding="12" CornerRadius="6">
                     <StackPanel>
                         <TextBlock Text="Runtime" Foreground="#9DA6B8" />
-                        <TextBlock Text="ONNX Runtime CPU" FontSize="22" FontWeight="SemiBold" />
+                        <TextBlock Text="C++ Native" FontSize="22" FontWeight="SemiBold" />
                     </StackPanel>
                 </Border>
             </Grid>
