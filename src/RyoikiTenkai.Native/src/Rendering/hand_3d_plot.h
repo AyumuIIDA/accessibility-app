@@ -2,6 +2,7 @@
 
 #include "Geometry/geometry_types.h"
 #include "HandPerception/MediaPipeGraph/hand_landmark_graph.h"
+#include "Presentation/hand_presentation_transform.h"
 
 #include <array>
 #include <cstdint>
@@ -24,7 +25,8 @@ struct Hand3dView
     float yawRadians{0.0F};
     float pitchRadians{0.0F};
     float halfExtent{0.12F};
-    bool mirrorHorizontally{true};
+    presentation::HandPresentationMode presentationMode{
+        presentation::HandPresentationMode::MirrorDirect};
 };
 
 struct ProjectedHandPoint
@@ -43,6 +45,9 @@ struct Hand3dProjection
     bool hasPalmDirection{false};
     bool valid{false};
 };
+
+[[nodiscard]] hand_perception::Landmark3f calculatePalmNormal(
+    const hand_perception::HandLandmarkResult& hand) noexcept;
 
 [[nodiscard]] ProjectedHandPoint projectHand3dPoint(
     const hand_perception::Landmark3f& pointRelativeToWrist,

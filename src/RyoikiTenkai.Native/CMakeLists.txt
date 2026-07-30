@@ -82,12 +82,23 @@ add_library(RyoikiTenkai.VisionCore STATIC
     src/Geometry/geometry_types.cpp
     src/Geometry/d3d11_hand_geometry_processor.cpp
     src/Geometry/hand_geometry_processor.cpp
+    src/Features/Cad/cad_hand_binding.cpp
     src/HandPerception/MediaPipeGraph/hand_landmark_graph.cpp
     src/HandPerception/MediaPipeGraph/hand_landmarks_to_roi.cpp
     src/HandPerception/MediaPipeGraph/hand_perception_graph.cpp
     src/HandPerception/MediaPipeGraph/palm_detection_graph.cpp
     src/HandPerception/MediaPipeGraph/palm_detection_postprocessor.cpp
     src/HandPerception/MediaPipeGraph/palm_detection_to_roi.cpp
+    src/HandInput/Measurements/hand_measurement_extractor.cpp
+    src/HandInput/Measurements/palm_basis_rotation_tracker.cpp
+    src/HandInput/Measurements/palm_rotation_eskf.cpp
+    src/HandInput/Measurements/weighted_palm_rotation_tracker.cpp
+    src/HandInput/Publication/latest_hand_state_slot.cpp
+    src/HandInput/Publication/ordered_hand_event_ring.cpp
+    src/HandInput/Recognition/domain_expansion_state_recognizer.cpp
+    src/HandInput/Recognition/open_palm_state_recognizer.cpp
+    src/HandInput/Recognition/swipe_event_recognizer.cpp
+    src/HandInput/Recognition/timed_state_stabilizer.cpp
     src/HandPerception/ModelRunners/ort_hand_landmark_runner.cpp
     src/HandPerception/ModelRunners/ort_palm_detection_runner.cpp
     src/HandPerception/ModelRunners/ort_session_configuration.cpp
@@ -97,6 +108,7 @@ add_library(RyoikiTenkai.VisionCore STATIC
     src/HandPerception/ModelRunners/palm_detection_runner.cpp
     src/Pipeline/latest_frame_slot.cpp
     src/Pipeline/perception_mailbox.cpp
+    src/Presentation/hand_presentation_transform.cpp
     src/Rendering/frame_transforms.cpp
     src/Rendering/hand_3d_plot.cpp
     src/Rendering/latest_render_packet_slot.cpp
@@ -136,7 +148,10 @@ target_link_libraries(RyoikiTenkai.VisionCore PUBLIC
 )
 
 add_library(RyoikiTenkai.Native SHARED
+    src/cad_runtime.cpp
     src/camera_capture.cpp
+    src/Rendering/cad_renderer.cpp
+    src/Rendering/cad_render_stage.cpp
     src/Rendering/d3d11_d2d_renderer.cpp
     src/Rendering/native_render_stage.cpp
     src/ryoiki_native.cpp
@@ -159,6 +174,7 @@ target_link_libraries(RyoikiTenkai.Native PRIVATE
     mfuuid
     ole32
     d2d1
+    dwrite
     d3d11
     dxgi
 )

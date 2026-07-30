@@ -29,6 +29,9 @@ bool NativeRenderStage::start(
         latestFrame_.reset();
         latestPerception_ = {};
         latestPerceptionFrameId_ = 0;
+        latestDomainSignState_ = {};
+        latestOpenPalmState_ = {};
+        latestEvent_ = {};
         pendingResize_.reset();
         pendingHand3dView_.reset();
         redrawRequested_ = false;
@@ -70,6 +73,9 @@ void NativeRenderStage::stop()
     latestFrame_.reset();
     latestPerception_ = {};
     latestPerceptionFrameId_ = 0;
+    latestDomainSignState_ = {};
+    latestOpenPalmState_ = {};
+    latestEvent_ = {};
     pendingResize_.reset();
     pendingHand3dView_.reset();
     presentationCallback_ = {};
@@ -88,6 +94,16 @@ void NativeRenderStage::publish(RenderPacket packet)
         latestFrame_ = packet.frame;
         latestPerception_ = packet.perception;
         latestPerceptionFrameId_ = packet.perceptionFrameId;
+        latestDomainSignState_ = packet.domainSignState;
+        latestOpenPalmState_ = packet.openPalmState;
+        if (packet.latestEvent.id != 0)
+        {
+            latestEvent_ = packet.latestEvent;
+        }
+        else
+        {
+            packet.latestEvent = latestEvent_;
+        }
         latestPacket_ = std::move(packet);
     }
     condition_.notify_one();
@@ -104,14 +120,22 @@ void NativeRenderStage::publishFrame(
         }
         latestFrame_ = std::move(frame);
         latestPacket_ = RenderPacket{
-            latestFrame_, latestPerception_, latestPerceptionFrameId_};
+            latestFrame_,
+            latestPerception_,
+            latestPerceptionFrameId_,
+            latestDomainSignState_,
+            latestOpenPalmState_,
+            latestEvent_};
     }
     condition_.notify_one();
 }
 
 void NativeRenderStage::publishPerception(
     hand_perception::HandPerceptionResult perception,
-    const std::uint64_t sourceFrameId)
+    const std::uint64_t sourceFrameId,
+    const hand_input::recognition::HandStateResult domainSignState,
+    const hand_input::recognition::HandStateResult openPalmState,
+    const hand_input::recognition::HandEvent latestEvent)
 {
     {
         std::lock_guard lock{mutex_};
@@ -121,10 +145,18 @@ void NativeRenderStage::publishPerception(
         }
         latestPerception_ = std::move(perception);
         latestPerceptionFrameId_ = sourceFrameId;
+        latestDomainSignState_ = domainSignState;
+        latestOpenPalmState_ = openPalmState;
+        if (latestEvent.id != 0) latestEvent_ = latestEvent;
         if (latestFrame_ != nullptr)
         {
             latestPacket_ = RenderPacket{
-                latestFrame_, latestPerception_, latestPerceptionFrameId_};
+                latestFrame_,
+                latestPerception_,
+                latestPerceptionFrameId_,
+                latestDomainSignState_,
+                latestOpenPalmState_,
+                latestEvent_};
         }
     }
     condition_.notify_one();

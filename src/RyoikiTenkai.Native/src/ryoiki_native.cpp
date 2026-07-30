@@ -1,10 +1,21 @@
 #include "ryoiki_native.h"
 #include "Buffers/frame_pool.h"
 #include "Geometry/d3d11_hand_geometry_processor.h"
+#include "Features/Cad/cad_interaction_endpoint.h"
 #include "HandPerception/MediaPipeGraph/hand_perception_graph.h"
 #include "HandPerception/ModelRunners/ort_hand_landmark_runner.h"
 #include "HandPerception/ModelRunners/ort_palm_detection_runner.h"
+#include "HandInput/Measurements/hand_measurement_extractor.h"
+#include "HandInput/Measurements/palm_basis_rotation_tracker.h"
+#include "HandInput/Measurements/palm_rotation_eskf.h"
+#include "HandInput/Measurements/weighted_palm_rotation_tracker.h"
+#include "HandInput/Publication/latest_hand_state_slot.h"
+#include "HandInput/Publication/ordered_hand_event_ring.h"
+#include "HandInput/Recognition/domain_expansion_state_recognizer.h"
+#include "HandInput/Recognition/open_palm_state_recognizer.h"
+#include "HandInput/Recognition/swipe_event_recognizer.h"
 #include "Pipeline/perception_mailbox.h"
+#include "Rendering/hand_3d_plot.h"
 #include "Rendering/native_render_stage.h"
 #if defined(RYOIKI_ORT_DIRECTML)
 #include "Geometry/d3d12_hand_geometry_processor.h"
@@ -23,6 +34,7 @@
 #include <cwctype>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <mutex>
 #include <optional>
@@ -33,7 +45,9 @@
 
 static_assert(sizeof(RyoikiMetrics) == 240);
 static_assert(sizeof(RyoikiPalmResult) == 96);
-static_assert(sizeof(RyoikiHandResult) == 296);
+static_assert(sizeof(RyoikiHandResult) == 720);
+static_assert(sizeof(RyoikiCadHandInteractionResult) == 56);
+static_assert(sizeof(RyoikiHandEventBatch) == 1312);
 
 namespace
 {
@@ -175,6 +189,57 @@ void copyString(const std::string& source, char* buffer, const std::int32_t buff
     std::memcpy(buffer, source.data(), copy_length);
     buffer[copy_length] = '\0';
 }
+
+std::array<float, 9> relativeRotationDifference(
+    const std::array<float, 9>& reference,
+    const std::array<float, 9>& comparison) noexcept
+{
+    std::array<float, 9> result{};
+    for (std::size_t column = 0; column < 3; ++column)
+    {
+        for (std::size_t row = 0; row < 3; ++row)
+        {
+            for (std::size_t inner = 0; inner < 3; ++inner)
+            {
+                result[column * 3 + row] +=
+                    reference[row * 3 + inner] * comparison[column * 3 + inner];
+            }
+        }
+    }
+    return result;
+}
+
+std::array<float, 3> rotationVectorDegrees(
+    const std::array<float, 9>& rotation) noexcept
+{
+    constexpr float kRadiansToDegrees = 180.0F / 3.14159265358979323846F;
+    const float cosine = std::clamp(
+        (rotation[0] + rotation[4] + rotation[8] - 1.0F) * 0.5F, -1.0F, 1.0F);
+    const float angle = std::acos(cosine);
+    const std::array<float, 3> skew{
+        rotation[5] - rotation[7],
+        rotation[6] - rotation[2],
+        rotation[1] - rotation[3]};
+    float scale = 0.5F;
+    if (angle >= 1.0e-4F)
+    {
+        const float sine = std::sin(angle);
+        if (std::abs(sine) <= 1.0e-5F) return {0.0F, 0.0F, angle * kRadiansToDegrees};
+        scale = angle / (2.0F * sine);
+    }
+    return {
+        skew[0] * scale * kRadiansToDegrees,
+        skew[1] * scale * kRadiansToDegrees,
+        skew[2] * scale * kRadiansToDegrees};
+}
+
+float rotationAngleDegrees(const std::array<float, 9>& rotation) noexcept
+{
+    constexpr float kRadiansToDegrees = 180.0F / 3.14159265358979323846F;
+    return std::acos(std::clamp(
+        (rotation[0] + rotation[4] + rotation[8] - 1.0F) * 0.5F, -1.0F, 1.0F))
+        * kRadiansToDegrees;
+}
 }
 
 struct RyoikiHandle
@@ -196,12 +261,27 @@ struct RyoikiHandle
     std::thread perceptionWorker;
     mutable std::mutex stateMutex;
     mutable std::mutex captureMutex;
+    mutable std::mutex cadInteractionMutex;
+    ryoiki::features::cad::HandInteractionMode cadInteractionMode{
+        ryoiki::features::cad::HandInteractionMode::None};
     RyoikiMetrics metrics{};
     RyoikiPalmResult palm{};
     RyoikiHandResult hand{};
     ryoiki::buffers::FramePool framePool{4};
     ryoiki::buffers::FramePool renderFramePool{4};
     ryoiki::pipeline::PerceptionMailbox perceptionMailbox;
+    ryoiki::hand_input::measurements::HandMeasurementExtractor handMeasurementExtractor;
+    ryoiki::hand_input::measurements::WeightedPalmRotationTracker palmRotationTracker;
+    ryoiki::hand_input::measurements::WeightedPalmRotationTracker
+        incrementalPalmRotationTracker;
+    ryoiki::hand_input::measurements::PalmRotationEskf palmRotationEskf;
+    ryoiki::hand_input::recognition::DomainExpansionStateRecognizer domainSignRecognizer;
+    ryoiki::hand_input::recognition::OpenPalmStateRecognizer openPalmRecognizer;
+    ryoiki::hand_input::publication::LatestHandStateSlot handStateSlot;
+    ryoiki::hand_input::recognition::SwipeEventRecognizer swipeRecognizer;
+    ryoiki::hand_input::publication::OrderedHandEventRing handEventRing;
+    std::shared_ptr<ryoiki::features::cad::CadInteractionEndpoint> cadInteraction;
+    std::atomic<bool> capturePalmRotationReference{false};
     ryoiki::rendering::NativeRenderStage renderStage;
     std::shared_ptr<ryoiki::runtime::D3d11Device> d3dDevice;
     CameraCapture* activeCapture{nullptr};
@@ -211,6 +291,8 @@ struct RyoikiHandle
     std::uint64_t lastPresentedFrameId{0};
     bool asynchronousGpuRendering{false};
     ryoiki::rendering::Hand3dView hand3dView{};
+    std::atomic<ryoiki::presentation::HandPresentationMode> handPresentationMode{
+        ryoiki::presentation::HandPresentationMode::MirrorDirect};
     POINT lastHand3dDragPoint{};
     bool hand3dDragging{false};
 
@@ -329,7 +411,9 @@ bool resetHand3dView(
     {
         return false;
     }
+    const auto presentationMode = handle.handPresentationMode.load();
     handle.hand3dView = {};
+    handle.hand3dView.presentationMode = presentationMode;
     handle.renderStage.updateHand3dView(handle.hand3dView);
     return true;
 }
@@ -793,6 +877,52 @@ void runPerceptionLoop(RyoikiHandle& handle)
     const std::string providerLog = "Hand perception runners selected: "
         + graph.providerSummary() + "\n";
     OutputDebugStringA(providerLog.c_str());
+    wchar_t palmRotationFilterValue[16]{};
+    const DWORD palmRotationFilterLength = GetEnvironmentVariableW(
+        L"RYOIKI_PALM_ROTATION_FILTER",
+        palmRotationFilterValue,
+        static_cast<DWORD>(std::size(palmRotationFilterValue)));
+    const bool usePalmRotationEskf =
+        palmRotationFilterLength == 0
+        || palmRotationFilterLength >= std::size(palmRotationFilterValue)
+        || _wcsicmp(palmRotationFilterValue, L"raw") != 0;
+    OutputDebugStringA(usePalmRotationEskf
+        ? "Palm rotation temporal filter: eskf\n"
+        : "Palm rotation temporal filter: raw\n");
+    std::ofstream rotationComparisonCsv;
+    const DWORD comparisonPathLength = GetEnvironmentVariableW(
+        L"RYOIKI_ROTATION_COMPARISON_CSV", nullptr, 0);
+    if (comparisonPathLength > 1)
+    {
+        std::vector<wchar_t> comparisonPath(comparisonPathLength);
+        if (GetEnvironmentVariableW(
+                L"RYOIKI_ROTATION_COMPARISON_CSV",
+                comparisonPath.data(),
+                comparisonPathLength) > 0)
+        {
+            rotationComparisonCsv.open(
+                std::filesystem::path{comparisonPath.data()},
+                std::ios::out | std::ios::trunc);
+            if (rotationComparisonCsv)
+            {
+                rotationComparisonCsv
+                    << "frame_id,timestamp_us,tracking_quality,six_valid,basis_valid,"
+                       "six_fit_error,six_angle_deg,basis_angle_deg,difference_angle_deg,"
+                       "difference_x_deg,difference_y_deg,difference_z_deg\n";
+                OutputDebugStringA("Palm rotation comparison CSV enabled.\n");
+            }
+            else
+            {
+                OutputDebugStringA("Palm rotation comparison CSV could not be opened.\n");
+            }
+        }
+    }
+    ryoiki::hand_input::measurements::WeightedPalmRotationTracker
+        comparisonSixPointTracker;
+    ryoiki::hand_input::measurements::PalmBasisRotationTracker
+        comparisonPalmBasisTracker;
+    bool hasComparisonReference = false;
+    std::size_t comparisonRows = 0;
 
     while (handle.running.load())
     {
@@ -867,6 +997,113 @@ void runPerceptionLoop(RyoikiHandle& handle)
             : 1.0 / std::chrono::duration<double>(completed - lastPerceptionAt).count();
         lastPerceptionAt = completed;
         const auto perceptionDrops = handle.perceptionMailbox.droppedFrames();
+        const auto domainSign = ryoiki::hand_input::recognition::recognizeDomainExpansionState(
+            perceptionResult.hand);
+        const auto domainState = handle.domainSignRecognizer.process(
+            domainSign,
+            perceptionResult.hand.detected ? perceptionResult.hand.confidence : 0.0F,
+            frame->frameId(),
+            frame->captureTimestampUs());
+        const auto measurementFrame = handle.handMeasurementExtractor.extract(
+            perceptionResult.hand,
+            frame->frameId(),
+            frame->captureTimestampUs(),
+            frame->uprightWidth(),
+            frame->uprightHeight());
+        const auto& handMeasurements = measurementFrame.hand;
+        const auto& screenPalm = measurementFrame.screenPalm;
+        if (handle.capturePalmRotationReference.exchange(false))
+        {
+            static_cast<void>(
+                handle.palmRotationTracker.captureReference(perceptionResult.hand));
+            static_cast<void>(
+                handle.incrementalPalmRotationTracker.captureReference(
+                    perceptionResult.hand));
+            handle.palmRotationEskf.reset();
+        }
+        const auto absolutePalmRotation =
+            handle.palmRotationTracker.estimate(perceptionResult.hand);
+        const auto incrementalPalmRotation =
+            handle.incrementalPalmRotationTracker.estimate(perceptionResult.hand);
+        static_cast<void>(
+            handle.incrementalPalmRotationTracker.captureReference(
+                perceptionResult.hand));
+        const auto palmRotation = usePalmRotationEskf
+            ? handle.palmRotationEskf.update(
+                absolutePalmRotation,
+                incrementalPalmRotation,
+                frame->captureTimestampUs())
+            : absolutePalmRotation;
+        if (rotationComparisonCsv)
+        {
+            if (!hasComparisonReference
+                && handMeasurements.present
+                && handMeasurements.quality
+                    == ryoiki::hand_input::measurements::HandMeasurementQuality::Valid)
+            {
+                hasComparisonReference =
+                    comparisonSixPointTracker.captureReference(perceptionResult.hand)
+                    && comparisonPalmBasisTracker.captureReference(handMeasurements);
+            }
+            if (hasComparisonReference)
+            {
+                const auto sixPoint =
+                    comparisonSixPointTracker.estimate(perceptionResult.hand);
+                const auto palmBasis =
+                    comparisonPalmBasisTracker.estimate(handMeasurements);
+                std::array<float, 3> differenceVector{};
+                float differenceAngle = 0.0F;
+                if (sixPoint.valid && palmBasis.valid)
+                {
+                    const auto difference = relativeRotationDifference(
+                        sixPoint.rotation, palmBasis.rotation);
+                    differenceVector = rotationVectorDegrees(difference);
+                    differenceAngle = rotationAngleDegrees(difference);
+                }
+                rotationComparisonCsv
+                    << frame->frameId() << ','
+                    << frame->captureTimestampUs() << ','
+                    << perceptionResult.hand.confidence << ','
+                    << (sixPoint.valid ? 1 : 0) << ','
+                    << (palmBasis.valid ? 1 : 0) << ','
+                    << sixPoint.fitError << ','
+                    << (sixPoint.valid ? rotationAngleDegrees(sixPoint.rotation) : 0.0F)
+                    << ','
+                    << (palmBasis.valid ? rotationAngleDegrees(palmBasis.rotation) : 0.0F)
+                    << ','
+                    << differenceAngle << ','
+                    << differenceVector[0] << ','
+                    << differenceVector[1] << ','
+                    << differenceVector[2] << '\n';
+                ++comparisonRows;
+                if (comparisonRows % 120 == 0) rotationComparisonCsv.flush();
+            }
+        }
+        const auto openPalm =
+            ryoiki::hand_input::recognition::recognizeOpenPalmState(
+                handMeasurements);
+        const auto openPalmState = handle.openPalmRecognizer.process(
+            openPalm,
+            handMeasurements.trackingQuality,
+            frame->frameId(),
+            frame->captureTimestampUs());
+        const auto swipeEvent = handle.swipeRecognizer.process(
+            measurementFrame,
+            openPalm.detected,
+            openPalm.confidence);
+        if (swipeEvent.has_value())
+        {
+            handle.handEventRing.publish(*swipeEvent);
+        }
+        const auto latestSwipeEvent = swipeEvent.value_or(
+            ryoiki::hand_input::recognition::HandEvent{});
+        ryoiki::hand_input::publication::HandStateSnapshot stateSnapshot{};
+        stateSnapshot.frameId = frame->frameId();
+        stateSnapshot.timestampUs = frame->captureTimestampUs();
+        stateSnapshot.count = 2;
+        stateSnapshot.states[0] = domainState;
+        stateSnapshot.states[1] = openPalmState;
+        handle.handStateSlot.publish(stateSnapshot);
         {
             std::lock_guard lock{handle.stateMutex};
             handle.metrics.perception_fps = perceptionFps;
@@ -903,14 +1140,81 @@ void runPerceptionLoop(RyoikiHandle& handle)
             }
 
             handle.hand.frame_id = frame->frameId();
+            handle.hand.capture_timestamp_us = frame->captureTimestampUs();
             handle.hand.hand_count = perceptionResult.hand.detected ? 1 : 0;
             handle.hand.confidence = perceptionResult.hand.confidence;
             handle.hand.handedness = perceptionResult.hand.detected
                 ? perceptionResult.hand.handedness : -1.0F;
             std::memset(handle.hand.bbox, 0, sizeof(handle.hand.bbox));
             std::memset(handle.hand.landmarks, 0, sizeof(handle.hand.landmarks));
+            std::memset(handle.hand.world_landmarks, 0, sizeof(handle.hand.world_landmarks));
+            std::memset(handle.hand.palm_normal, 0, sizeof(handle.hand.palm_normal));
+            std::memset(
+                handle.hand.palm_rotation_basis,
+                0,
+                sizeof(handle.hand.palm_rotation_basis));
+            std::memset(handle.hand.palm_center, 0, sizeof(handle.hand.palm_center));
+            handle.hand.palm_scale = 0.0F;
+            handle.hand.palm_pose_valid = 0;
+            std::memset(
+                handle.hand.screen_palm_center,
+                0,
+                sizeof(handle.hand.screen_palm_center));
+            handle.hand.screen_palm_scale = 0.0F;
+            handle.hand.screen_palm_valid = screenPalm.valid ? 1 : 0;
+            if (screenPalm.valid)
+            {
+                handle.hand.screen_palm_center[0] = screenPalm.centerX;
+                handle.hand.screen_palm_center[1] = screenPalm.centerY;
+                handle.hand.screen_palm_scale = screenPalm.scale;
+            }
+            std::memset(
+                handle.hand.palm_relative_rotation,
+                0,
+                sizeof(handle.hand.palm_relative_rotation));
+            handle.hand.palm_rotation_fit_error = palmRotation.fitError;
+            handle.hand.palm_relative_rotation_valid = palmRotation.valid ? 1 : 0;
+            if (palmRotation.valid)
+            {
+                std::copy(
+                    palmRotation.rotation.begin(),
+                    palmRotation.rotation.end(),
+                    handle.hand.palm_relative_rotation);
+            }
+            handle.hand.domain_sign_confidence = domainSign.confidence;
+            handle.hand.domain_sign_detected = domainSign.detected ? 1 : 0;
+            handle.hand.domain_sign_features[0] = domainSign.features.indexExtended;
+            handle.hand.domain_sign_features[1] = domainSign.features.middleWrap;
+            handle.hand.domain_sign_features[2] = domainSign.features.middleCurled;
+            handle.hand.domain_sign_features[3] = domainSign.features.ringCurled;
+            handle.hand.domain_sign_features[4] = domainSign.features.pinkyCurled;
+            handle.hand.domain_sign_features[5] = domainSign.features.thumbTucked;
             if (perceptionResult.hand.detected)
             {
+                if (handMeasurements.quality
+                    == ryoiki::hand_input::measurements::HandMeasurementQuality::Valid)
+                {
+                    const std::array axes{
+                        handMeasurements.palmXAxis,
+                        handMeasurements.palmYAxis,
+                        handMeasurements.palmZAxis};
+                    for (std::size_t column = 0; column < axes.size(); ++column)
+                    {
+                        handle.hand.palm_rotation_basis[column * 3] = axes[column].x;
+                        handle.hand.palm_rotation_basis[column * 3 + 1] = axes[column].y;
+                        handle.hand.palm_rotation_basis[column * 3 + 2] = axes[column].z;
+                    }
+                    handle.hand.palm_center[0] = handMeasurements.palmPosition.x;
+                    handle.hand.palm_center[1] = handMeasurements.palmPosition.y;
+                    handle.hand.palm_center[2] = handMeasurements.palmPosition.z;
+                    handle.hand.palm_scale = handMeasurements.palmScale;
+                    handle.hand.palm_pose_valid = 1;
+                }
+                const auto palmNormal = ryoiki::rendering::calculatePalmNormal(
+                    perceptionResult.hand);
+                handle.hand.palm_normal[0] = palmNormal.x;
+                handle.hand.palm_normal[1] = palmNormal.y;
+                handle.hand.palm_normal[2] = palmNormal.z;
                 handle.hand.bbox[0] = std::clamp(
                     perceptionResult.hand.box.left * inverseWidth, 0.0F, 1.0F);
                 handle.hand.bbox[1] = std::clamp(
@@ -927,17 +1231,55 @@ void runPerceptionLoop(RyoikiHandle& handle)
                     handle.hand.landmarks[index * 3 + 1] = std::clamp(
                         landmark.y * inverseHeight, 0.0F, 1.0F);
                     handle.hand.landmarks[index * 3 + 2] = landmark.z * inverseWidth;
+                    const auto& worldLandmark = perceptionResult.hand.worldLandmarks[index];
+                    handle.hand.world_landmarks[index * 3] = worldLandmark.x;
+                    handle.hand.world_landmarks[index * 3 + 1] = worldLandmark.y;
+                    handle.hand.world_landmarks[index * 3 + 2] = worldLandmark.z;
                 }
             }
         }
 
+        std::shared_ptr<ryoiki::features::cad::CadInteractionEndpoint>
+            cadInteraction;
+        {
+            std::lock_guard lock{handle.cadInteractionMutex};
+            cadInteraction = handle.cadInteraction;
+        }
+        if (cadInteraction != nullptr)
+        {
+            ryoiki::features::cad::CadHandInput input{};
+            input.frameId = frame->frameId();
+            input.captureTimestampUs = frame->captureTimestampUs();
+            input.trackingQuality = perceptionResult.hand.confidence;
+            input.screenCenterX = screenPalm.centerX;
+            input.screenCenterY = screenPalm.centerY;
+            input.screenScale = screenPalm.scale;
+            input.relativeRotation = palmRotation.rotation;
+            input.rotationFitError = palmRotation.fitError;
+            input.handPresent = perceptionResult.hand.detected;
+            input.screenPalmValid = screenPalm.valid;
+            input.relativeRotationValid = palmRotation.valid;
+            cadInteraction->process(input);
+        }
+
         if (handle.asynchronousGpuRendering)
         {
-            handle.renderStage.publishPerception(perceptionResult, frame->frameId());
+            handle.renderStage.publishPerception(
+                perceptionResult,
+                frame->frameId(),
+                domainState,
+                openPalmState,
+                latestSwipeEvent);
         }
         else
         {
-            handle.renderStage.publish({frame, perceptionResult, frame->frameId()});
+            handle.renderStage.publish({
+                frame,
+                perceptionResult,
+                frame->frameId(),
+                domainState,
+                openPalmState,
+                latestSwipeEvent});
         }
     }
 }
@@ -1038,6 +1380,11 @@ RYOIKI_EXPORT std::int32_t ryoiki_start(RyoikiHandle* handle)
         handle->framePool.resetStatistics();
         handle->renderFramePool.resetStatistics();
         handle->perceptionMailbox.reset();
+        handle->domainSignRecognizer.reset();
+        handle->openPalmRecognizer.reset();
+        handle->handStateSlot.reset();
+        handle->swipeRecognizer.reset();
+        handle->handEventRing.reset();
 
         RECT childRect{};
         GetClientRect(handle->childHwnd, &childRect);
@@ -1134,6 +1481,20 @@ RYOIKI_EXPORT std::int32_t ryoiki_start(RyoikiHandle* handle)
             handle->perceptionWorker.join();
         }
         handle->renderStage.stop();
+        std::shared_ptr<ryoiki::features::cad::CadInteractionEndpoint> endpoint;
+        {
+            std::lock_guard lock{handle->cadInteractionMutex};
+            endpoint = handle->cadInteraction;
+            handle->cadInteractionMode =
+                ryoiki::features::cad::HandInteractionMode::None;
+        }
+        if (endpoint != nullptr)
+        {
+            static_cast<void>(endpoint->configure(
+                ryoiki::features::cad::HandInteractionMode::None,
+                ryoiki::presentation::HandPresentationMode::MirrorDirect,
+                1.0F));
+        }
         handle->setError(exception.what());
         return kRyoikiStatusFailure;
     }
@@ -1273,6 +1634,190 @@ RYOIKI_EXPORT std::int32_t ryoiki_get_latest_palm(
     {
         return kRyoikiStatusFailure;
     }
+}
+
+RYOIKI_EXPORT std::int32_t ryoiki_get_latest_states(
+    RyoikiHandle* handle,
+    RyoikiHandStateSnapshot* out_snapshot)
+{
+    if (handle == nullptr || out_snapshot == nullptr)
+    {
+        return kRyoikiStatusFailure;
+    }
+
+    try
+    {
+        const auto latest = handle->handStateSlot.latest();
+        RyoikiHandStateSnapshot result{};
+        result.abi_version = kRyoikiAbiVersion;
+        result.struct_size = static_cast<std::uint32_t>(sizeof(RyoikiHandStateSnapshot));
+        result.frame_id = latest.frameId;
+        result.timestamp_us = latest.timestampUs;
+        result.count = static_cast<std::uint32_t>(
+            (std::min)(latest.count, ryoiki::hand_input::publication::kMaxHandStates));
+        for (std::size_t index = 0; index < result.count; ++index)
+        {
+            const auto& source = latest.states[index];
+            auto& destination = result.states[index];
+            destination.id = source.id;
+            destination.phase = static_cast<std::uint32_t>(source.phase);
+            destination.transition = static_cast<std::uint32_t>(source.transition);
+            destination.flags = static_cast<std::uint32_t>(source.flags);
+            destination.confidence = source.confidence;
+            destination.input_quality = source.inputQuality;
+            destination.began_frame_id = source.beganFrameId;
+            destination.current_frame_id = source.currentFrameId;
+            destination.timestamp_us = source.timestampUs;
+        }
+        *out_snapshot = result;
+        return kRyoikiStatusSuccess;
+    }
+    catch (...)
+    {
+        return kRyoikiStatusFailure;
+    }
+}
+
+RYOIKI_EXPORT std::int32_t ryoiki_read_hand_events(
+    RyoikiHandle* handle,
+    const std::uint64_t afterSequence,
+    RyoikiHandEventBatch* outBatch)
+{
+    if (handle == nullptr || outBatch == nullptr)
+    {
+        return kRyoikiStatusFailure;
+    }
+    try
+    {
+        const auto source = handle->handEventRing.readAfter(afterSequence);
+        RyoikiHandEventBatch result{};
+        result.abi_version = kRyoikiAbiVersion;
+        result.struct_size =
+            static_cast<std::uint32_t>(sizeof(RyoikiHandEventBatch));
+        result.next_sequence = source.nextSequence;
+        result.dropped_count = source.droppedCount;
+        result.count = static_cast<std::uint32_t>(source.count);
+        for (std::size_t index = 0; index < source.count; ++index)
+        {
+            const auto& event = source.events[index];
+            auto& destination = result.events[index];
+            destination.sequence = event.sequence;
+            destination.id = event.id;
+            destination.confidence = event.confidence;
+            destination.input_quality = event.inputQuality;
+            destination.displacement_x = event.displacementX;
+            destination.displacement_y = event.displacementY;
+            destination.began_frame_id = event.beganFrameId;
+            destination.ended_frame_id = event.endedFrameId;
+            destination.began_timestamp_us = event.beganTimestampUs;
+            destination.ended_timestamp_us = event.endedTimestampUs;
+            destination.duration_us = event.durationUs;
+        }
+        *outBatch = result;
+        return kRyoikiStatusSuccess;
+    }
+    catch (...)
+    {
+        return kRyoikiStatusFailure;
+    }
+}
+
+RYOIKI_EXPORT std::int32_t ryoiki_capture_palm_rotation_reference(
+    RyoikiHandle* handle)
+{
+    if (handle == nullptr || !handle->running.load())
+    {
+        return kRyoikiStatusFailure;
+    }
+    {
+        std::lock_guard lock{handle->stateMutex};
+        handle->hand.palm_relative_rotation_valid = 0;
+        handle->hand.palm_rotation_fit_error = 0.0F;
+        std::memset(
+            handle->hand.palm_relative_rotation,
+            0,
+            sizeof(handle->hand.palm_relative_rotation));
+    }
+    handle->capturePalmRotationReference.store(true);
+    return kRyoikiStatusSuccess;
+}
+
+RYOIKI_EXPORT std::int32_t ryoiki_set_hand_presentation_mode(
+    RyoikiHandle* handle,
+    const std::int32_t presentationMode)
+{
+    if (handle == nullptr
+        || presentationMode < RYOIKI_HAND_PRESENTATION_MIRROR_DIRECT
+        || presentationMode > RYOIKI_HAND_PRESENTATION_PHYSICAL)
+    {
+        return kRyoikiStatusFailure;
+    }
+    const auto mode =
+        static_cast<ryoiki::presentation::HandPresentationMode>(presentationMode);
+    handle->handPresentationMode.store(mode);
+    handle->hand3dView.presentationMode = mode;
+    handle->renderStage.updateHand3dView(handle->hand3dView);
+    return kRyoikiStatusSuccess;
+}
+
+RYOIKI_EXPORT std::int32_t ryoiki_configure_cad_hand_interaction(
+    RyoikiHandle* visionHandle,
+    RyoikiCadHandle* cadHandle,
+    const std::int32_t interactionMode,
+    const std::int32_t presentationMode,
+    const float rotationSensitivity)
+{
+    if (visionHandle == nullptr || cadHandle == nullptr
+        || !std::isfinite(rotationSensitivity)
+        || interactionMode < 0 || interactionMode > 3
+        || presentationMode < 0 || presentationMode > 1)
+    {
+        return kRyoikiStatusFailure;
+    }
+    if (ryoiki_set_hand_presentation_mode(
+            visionHandle, presentationMode) == kRyoikiStatusFailure)
+    {
+        return kRyoikiStatusFailure;
+    }
+    const auto endpoint = ryoikiCadInteractionEndpoint(cadHandle);
+    if (endpoint == nullptr) return kRyoikiStatusFailure;
+    const auto mode =
+        static_cast<ryoiki::features::cad::HandInteractionMode>(interactionMode);
+    if (!endpoint->configure(
+            mode,
+            static_cast<ryoiki::presentation::HandPresentationMode>(
+                presentationMode),
+            rotationSensitivity))
+    {
+        return kRyoikiStatusFailure;
+    }
+    {
+        std::lock_guard lock{visionHandle->cadInteractionMutex};
+        if (mode == ryoiki::features::cad::HandInteractionMode::Rotate
+            && visionHandle->cadInteractionMode != mode)
+        {
+            visionHandle->capturePalmRotationReference.store(true);
+        }
+        visionHandle->cadInteraction = endpoint;
+        visionHandle->cadInteractionMode = mode;
+    }
+    return kRyoikiStatusSuccess;
+}
+
+RYOIKI_EXPORT std::int32_t ryoiki_get_cad_hand_interaction(
+    RyoikiHandle* visionHandle,
+    RyoikiCadHandInteractionResult* outResult)
+{
+    if (visionHandle == nullptr || outResult == nullptr)
+        return kRyoikiStatusFailure;
+    std::shared_ptr<ryoiki::features::cad::CadInteractionEndpoint> endpoint;
+    {
+        std::lock_guard lock{visionHandle->cadInteractionMutex};
+        endpoint = visionHandle->cadInteraction;
+    }
+    return endpoint != nullptr && endpoint->copyLatest(*outResult)
+        ? kRyoikiStatusSuccess
+        : kRyoikiStatusFailure;
 }
 
 RYOIKI_EXPORT std::int32_t ryoiki_get_last_error(

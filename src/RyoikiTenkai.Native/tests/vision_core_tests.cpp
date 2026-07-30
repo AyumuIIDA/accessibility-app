@@ -655,7 +655,11 @@ void testSplitViewportAndHand3dProjection()
     hand.worldLandmarks[8].x += 0.06F;
 
     const PlotViewport plot{720.0F, 10.0F, 1000.0F, 510.0F};
-    const Hand3dView frontView{0.0F, 0.0F, 0.12F, true};
+    const Hand3dView frontView{
+        0.0F,
+        0.0F,
+        0.12F,
+        ryoiki::presentation::HandPresentationMode::MirrorDirect};
     const auto projection = ryoiki::rendering::projectHand3d(hand, plot, frontView);
     require(projection.valid, "Valid world landmarks did not produce a 3D projection.");
     requireNear(projection.points[0].position.x, 860.0F, 0.0001F,
@@ -664,6 +668,16 @@ void testSplitViewportAndHand3dProjection()
         "The wrist was not vertically centered in the 3D viewport.");
     require(projection.points[8].position.x < projection.points[0].position.x,
         "Front-camera mirroring was not applied to positive hand X.");
+    const Hand3dView physicalView{
+        0.0F,
+        0.0F,
+        0.12F,
+        ryoiki::presentation::HandPresentationMode::Physical};
+    const auto physicalProjection =
+        ryoiki::rendering::projectHand3d(hand, plot, physicalView);
+    require(physicalProjection.points[8].position.x
+            > physicalProjection.points[0].position.x,
+        "Physical presentation did not preserve positive hand X.");
 
     hand.worldLandmarks[8] = hand.worldLandmarks[0];
     hand.worldLandmarks[8].y += 0.06F;
@@ -678,7 +692,18 @@ void testSplitViewportAndHand3dProjection()
     orientedHand.worldLandmarks[9] = {0.0F, -0.07F, 0.0F};
     orientedHand.worldLandmarks[13] = {-0.02F, -0.06F, 0.0F};
     orientedHand.worldLandmarks[17] = {-0.04F, -0.05F, 0.0F};
-    const Hand3dView sideView{1.5707963F, 0.0F, 0.12F, true};
+    const auto palmNormal = ryoiki::rendering::calculatePalmNormal(orientedHand);
+    requireNear(palmNormal.x, 0.0F, 0.0001F,
+        "Palm normal X did not match the displayed direction basis.");
+    requireNear(palmNormal.y, 0.0F, 0.0001F,
+        "Palm normal Y did not match the displayed direction basis.");
+    requireNear(palmNormal.z, -1.0F, 0.0001F,
+        "Palm normal Z did not match the displayed direction basis.");
+    const Hand3dView sideView{
+        1.5707963F,
+        0.0F,
+        0.12F,
+        ryoiki::presentation::HandPresentationMode::MirrorDirect};
     const auto orientedProjection = ryoiki::rendering::projectHand3d(
         orientedHand, plot, sideView);
     require(orientedProjection.hasPalmDirection,

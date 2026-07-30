@@ -43,6 +43,20 @@ hand_perception::Landmark3f cross(
 }
 }
 
+hand_perception::Landmark3f calculatePalmNormal(
+    const hand_perception::HandLandmarkResult& hand) noexcept
+{
+    if (!hand.detected)
+    {
+        return {};
+    }
+    const auto palmAcross = normalize(subtract(
+        hand.worldLandmarks[5], hand.worldLandmarks[17]));
+    const auto wristToMiddle = normalize(subtract(
+        hand.worldLandmarks[9], hand.worldLandmarks[0]));
+    return normalize(cross(palmAcross, wristToMiddle));
+}
+
 ProjectedHandPoint projectHand3dPoint(
     const hand_perception::Landmark3f& point,
     const PlotViewport& viewport,
@@ -59,9 +73,13 @@ ProjectedHandPoint projectHand3dPoint(
     // storage right and +Y points down. Convert them to a Y-up plot space and
     // apply the same front-camera mirror used by the camera viewport before
     // applying the user-facing plot rotation.
-    const float plotX = view.mirrorHorizontally ? -point.x : point.x;
-    const float plotY = -point.y;
-    const float plotZ = point.z;
+    const auto presentationTransform =
+        presentation::HandPresentationTransform::fromMode(view.presentationMode);
+    const auto presented = presentationTransform.transformPoint(
+        {point.x, point.y, point.z});
+    const float plotX = presented.x;
+    const float plotY = -presented.y;
+    const float plotZ = presented.z;
     const float yawCosine = std::cos(view.yawRadians);
     const float yawSine = std::sin(view.yawRadians);
     const float pitchCosine = std::cos(view.pitchRadians);
@@ -118,11 +136,7 @@ Hand3dProjection projectHand3d(
     palmCenter.y *= inversePalmPointCount;
     palmCenter.z *= inversePalmPointCount;
 
-    const auto palmAcross = normalize(subtract(
-        hand.worldLandmarks[5], hand.worldLandmarks[17]));
-    const auto wristToMiddle = normalize(subtract(
-        hand.worldLandmarks[9], hand.worldLandmarks[0]));
-    const auto palmNormal = normalize(cross(palmAcross, wristToMiddle));
+    const auto palmNormal = calculatePalmNormal(hand);
     constexpr float kPalmDirectionLength = 0.07F;
     const hand_perception::Landmark3f palmDirectionTip{
         palmCenter.x + palmNormal.x * kPalmDirectionLength,

@@ -6,12 +6,14 @@
 #include <d2d1_1.h>
 #include <d2d1_1helper.h>
 #include <d3d11.h>
+#include <dwrite.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cwchar>
 #include <optional>
 #include <sstream>
 
@@ -143,6 +145,12 @@ private:
         gpuCopyTexture_.Reset();
         palmBrush_.Reset();
         handBrush_.Reset();
+        candidateBrush_.Reset();
+        activeBrush_.Reset();
+        labelBackgroundBrush_.Reset();
+        labelTextBrush_.Reset();
+        textFormat_.Reset();
+        dwriteFactory_.Reset();
         plotGridBrush_.Reset();
         plotXAxisBrush_.Reset();
         plotYAxisBrush_.Reset();
@@ -245,11 +253,65 @@ private:
             return false;
         }
 
+        result = DWriteCreateFactory(
+            DWRITE_FACTORY_TYPE_SHARED,
+            __uuidof(IDWriteFactory),
+            reinterpret_cast<IUnknown**>(dwriteFactory_.GetAddressOf()));
+        if (FAILED(result))
+        {
+            error = hresultMessage("DWriteCreateFactory", result);
+            return false;
+        }
+        result = dwriteFactory_->CreateTextFormat(
+            L"Segoe UI",
+            nullptr,
+            DWRITE_FONT_WEIGHT_SEMI_BOLD,
+            DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            16.0F,
+            L"en-us",
+            &textFormat_);
+        if (FAILED(result))
+        {
+            error = hresultMessage("Create Domain Sign text format", result);
+            return false;
+        }
+        textFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        textFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
         result = d2dContext_->CreateSolidColorBrush(
             D2D1::ColorF(0.0F, 1.0F, 0.70F), &palmBrush_);
         if (FAILED(result))
         {
             error = hresultMessage("Create palm brush", result);
+            return false;
+        }
+        result = d2dContext_->CreateSolidColorBrush(
+            D2D1::ColorF(1.0F, 0.58F, 0.08F), &candidateBrush_);
+        if (FAILED(result))
+        {
+            error = hresultMessage("Create candidate State brush", result);
+            return false;
+        }
+        result = d2dContext_->CreateSolidColorBrush(
+            D2D1::ColorF(0.20F, 0.92F, 1.0F), &activeBrush_);
+        if (FAILED(result))
+        {
+            error = hresultMessage("Create active State brush", result);
+            return false;
+        }
+        result = d2dContext_->CreateSolidColorBrush(
+            D2D1::ColorF(0.03F, 0.05F, 0.09F, 0.88F), &labelBackgroundBrush_);
+        if (FAILED(result))
+        {
+            error = hresultMessage("Create State label background brush", result);
+            return false;
+        }
+        result = d2dContext_->CreateSolidColorBrush(
+            D2D1::ColorF(0.97F, 0.99F, 1.0F), &labelTextBrush_);
+        if (FAILED(result))
+        {
+            error = hresultMessage("Create State label text brush", result);
             return false;
         }
         result = d2dContext_->CreateSolidColorBrush(
@@ -631,19 +693,58 @@ private:
             return transforms.uprightToViewport.transform(
                 {hand.landmarks[index].x, hand.landmarks[index].y});
         };
+        using hand_input::recognition::HandStatePhase;
+        hand_input::recognition::HandStateResult eventDisplay{};
+        const bool eventVisible = packet.latestEvent.id != 0
+            && packet.frame != nullptr
+            && packet.frame->captureTimestampUs()
+                >= packet.latestEvent.endedTimestampUs
+            && packet.frame->captureTimestampUs()
+                    - packet.latestEvent.endedTimestampUs
+                <= 600'000;
+        if (eventVisible)
+        {
+            eventDisplay.phase = HandStatePhase::Active;
+            eventDisplay.confidence = packet.latestEvent.confidence;
+        }
+        const bool domainVisible =
+            packet.domainSignState.phase == HandStatePhase::Candidate
+            || packet.domainSignState.phase == HandStatePhase::Active;
+        const auto& displayState = eventVisible
+            ? eventDisplay
+            : domainVisible
+                ? packet.domainSignState
+                : packet.openPalmState;
+        const wchar_t* stateName = eventVisible
+            ? packet.latestEvent.id
+                    == hand_input::recognition::kSwipeLeftEventId
+                ? L"SWIPE LEFT"
+                : L"SWIPE RIGHT"
+            : domainVisible
+                ? L"DOMAIN SIGN"
+                : L"OPEN PALM";
+        ID2D1SolidColorBrush* overlayBrush = handBrush_.Get();
+        if (displayState.phase == HandStatePhase::Candidate)
+        {
+            overlayBrush = candidateBrush_.Get();
+        }
+        else if (displayState.phase == HandStatePhase::Active)
+        {
+            overlayBrush = activeBrush_.Get();
+        }
         for (const auto& connection : kHandConnections)
         {
             d2dContext_->DrawLine(
                 toD2dPoint(mapLandmark(connection[0])),
                 toD2dPoint(mapLandmark(connection[1])),
-                handBrush_.Get(),
+                overlayBrush,
                 2.0F);
         }
         for (int index = 0; index < 21; ++index)
         {
             d2dContext_->FillEllipse(
                 D2D1::Ellipse(toD2dPoint(mapLandmark(index)), 3.5F, 3.5F),
-                handBrush_.Get());
+                overlayBrush);
         }
 
         const auto topLeft = transforms.uprightToViewport.transform(
@@ -656,8 +757,75 @@ private:
                 (std::min)(topLeft.y, bottomRight.y),
                 (std::max)(topLeft.x, bottomRight.x),
                 (std::max)(topLeft.y, bottomRight.y)),
-            handBrush_.Get(),
+            overlayBrush,
             1.5F);
+        drawStateLabel(
+            displayState,
+            stateName,
+            topLeft,
+            bottomRight,
+            overlayBrush);
+    }
+
+    void drawStateLabel(
+        const hand_input::recognition::HandStateResult& state,
+        const wchar_t* stateName,
+        const geometry::Point2f topLeft,
+        const geometry::Point2f bottomRight,
+        ID2D1SolidColorBrush* stateBrush)
+    {
+        using hand_input::recognition::HandStatePhase;
+        const auto phase = state.phase;
+        if (phase != HandStatePhase::Candidate && phase != HandStatePhase::Active)
+        {
+            return;
+        }
+
+        const float roiLeft = (std::min)(topLeft.x, bottomRight.x);
+        const float roiRight = (std::max)(topLeft.x, bottomRight.x);
+        constexpr float kLabelWidth = 250.0F;
+        constexpr float kLabelHeight = 30.0F;
+        const auto cameraViewport = createCameraViewport();
+        const float cameraRight = static_cast<float>(
+            cameraViewport.left + cameraViewport.width);
+        const float center = 0.5F * (roiLeft + roiRight);
+        const float left = std::clamp(
+            center - 0.5F * kLabelWidth,
+            6.0F,
+            (std::max)(6.0F, cameraRight - kLabelWidth - 6.0F));
+        const float roiTop = (std::min)(topLeft.y, bottomRight.y);
+        const float desiredTop = roiTop >= kLabelHeight + 10.0F
+            ? roiTop - kLabelHeight - 6.0F
+            : (std::max)(6.0F, (std::max)(topLeft.y, bottomRight.y) + 6.0F);
+        const float top = std::clamp(
+            desiredTop,
+            6.0F,
+            (std::max)(6.0F, static_cast<float>(height_) - kLabelHeight - 6.0F));
+        const auto rect = D2D1::RoundedRect(
+            D2D1::RectF(left, top, left + kLabelWidth, top + kLabelHeight),
+            5.0F,
+            5.0F);
+        d2dContext_->FillRoundedRectangle(rect, labelBackgroundBrush_.Get());
+        d2dContext_->DrawRoundedRectangle(rect, stateBrush, 2.0F);
+
+        wchar_t label[64]{};
+        const wchar_t* phaseText = phase == HandStatePhase::Active
+            ? L"ACTIVE"
+            : L"CHECKING";
+        _snwprintf_s(
+            label,
+            _TRUNCATE,
+            L"%s  %s  %.0f%%",
+            stateName,
+            phaseText,
+            static_cast<double>(state.confidence * 100.0F));
+        d2dContext_->DrawText(
+            label,
+            static_cast<UINT32>(std::wcslen(label)),
+            textFormat_.Get(),
+            rect.rect,
+            labelTextBrush_.Get(),
+            D2D1_DRAW_TEXT_OPTIONS_CLIP);
     }
 
     [[nodiscard]] ViewportRect createCameraViewport() const noexcept
@@ -824,11 +992,17 @@ private:
     ComPtr<ID3D11Texture2D> gpuCopyTexture_;
     ComPtr<ID2D1SolidColorBrush> palmBrush_;
     ComPtr<ID2D1SolidColorBrush> handBrush_;
+    ComPtr<ID2D1SolidColorBrush> candidateBrush_;
+    ComPtr<ID2D1SolidColorBrush> activeBrush_;
+    ComPtr<ID2D1SolidColorBrush> labelBackgroundBrush_;
+    ComPtr<ID2D1SolidColorBrush> labelTextBrush_;
     ComPtr<ID2D1SolidColorBrush> plotGridBrush_;
     ComPtr<ID2D1SolidColorBrush> plotXAxisBrush_;
     ComPtr<ID2D1SolidColorBrush> plotYAxisBrush_;
     ComPtr<ID2D1SolidColorBrush> plotZAxisBrush_;
     ComPtr<ID2D1SolidColorBrush> palmDirectionBrush_;
+    ComPtr<IDWriteFactory> dwriteFactory_;
+    ComPtr<IDWriteTextFormat> textFormat_;
 };
 
 D3d11D2dRenderer::D3d11D2dRenderer() : impl_{std::make_unique<Impl>()} {}
