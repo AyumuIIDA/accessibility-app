@@ -270,6 +270,8 @@
                                 <ListBoxItem Content="Launch app" IsSelected="True" Tag="app.launch" />
                                 <ListBoxItem Content="Hotkey" Tag="keyboard.hotkey" />
                                 <ListBoxItem Content="Type text" Tag="keyboard.typeText" />
+                                <ListBoxItem Content="Grab screenshot" Tag="handoff.grabScreenshot" />
+                                <ListBoxItem Content="Release here" Tag="handoff.releaseHere" />
                             </ListBox>
 
                             <TextBlock x:Name="ActionValueLabel" Grid.Row="2" Grid.ColumnSpan="2"

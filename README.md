@@ -59,6 +59,9 @@ src/RyoikiTenkai.Native/
 
 ## First-Time Setup
 
+For a command-focused checklist for a fresh machine, see
+[`doc/new-computer-setup.md`](doc/new-computer-setup.md).
+
 Clone the repository, then run all commands below from its root. For example:
 
 ```powershell

@@ -53,7 +53,8 @@ public partial class MainWindow : Window
 
     private readonly BindingStore _store;
     private readonly GestureDefinitionStore _gestureStore;
-    private readonly ActionExecutor _executor = new();
+    private readonly HandoffService _handoffService;
+    private readonly ActionExecutor _executor;
     private readonly WindowGestureRecognizer _recognizer = new();
     private readonly WindowGestureRecognizer _lowHandednessRecognizer = new();
     private readonly WindowGestureRecognizer _highHandednessRecognizer = new();
@@ -112,6 +113,8 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
 
+        _handoffService = new HandoffService(new WpfHandoffPayloadProvider(), Log);
+        _executor = new ActionExecutor(_handoffService);
         _store = new BindingStore(System.IO.Path.Combine(AppContext.BaseDirectory, "bindings.json"));
         _gestureStorePath = System.IO.Path.Combine(AppContext.BaseDirectory, "gestures.json");
         _gestureStore = new GestureDefinitionStore(_gestureStorePath);
@@ -172,13 +175,8 @@ public partial class MainWindow : Window
                 return;
             }
 
-            Log("Native runtime is required for NPU mode; managed CPU fallback was not started.");
-            StateText.Text = "Native runtime unavailable";
-            OverlayStatusText.Text = "NPU unavailable";
-            RuntimeProviderText.Text = "Native blocked";
-            StartButton.IsEnabled = true;
-            StopButton.IsEnabled = false;
-            return;
+            Log("Native runtime unavailable; falling back to managed CPU camera/inference path.");
+            UseNativeRuntimeCheckBox.IsChecked = false;
         }
 
         Log("Managed CPU camera/inference path selected intentionally; this path is slower and does not use the NPU.");
@@ -816,8 +814,12 @@ public partial class MainWindow : Window
         try
         {
             Log($"Execute: {binding.DisplayName}");
-            await Task.Run(() => _executor.Execute(binding.Action));
+            await _executor.ExecuteAsync(binding.Action, CancellationToken.None);
             StateText.Text = $"Executed: {recognition.DisplayName}";
+        }
+        catch (Exception ex)
+        {
+            Log("Execute failed: " + ex.Message);
         }
         finally
         {
@@ -977,23 +979,30 @@ public partial class MainWindow : Window
 
         var actionType = actionItem.Tag?.ToString() ?? string.Empty;
         var value = ActionValueText.Text.Trim();
-        if (string.IsNullOrWhiteSpace(value))
+        var requiresValue = actionType is "app.launch" or "keyboard.hotkey" or "keyboard.typeText";
+        if (requiresValue && string.IsNullOrWhiteSpace(value))
         {
             Log("Action value is empty.");
             return;
         }
 
+        var actionParams = new Dictionary<string, string>();
         var paramName = actionType switch
         {
             "app.launch" => "path",
             "keyboard.hotkey" => "hotkey",
             "keyboard.typeText" => "text",
-            _ => "value"
+            _ => string.Empty
         };
+        if (!string.IsNullOrEmpty(paramName))
+        {
+            actionParams[paramName] = value;
+        }
+
         var binding = new GestureBinding(
             GestureId: gestureId,
             DisplayName: $"{selectedGesture.DisplayName} -> {actionItem.Content}",
-            Action: new ActionSpec(actionType, new Dictionary<string, string> { [paramName] = value }));
+            Action: new ActionSpec(actionType, actionParams));
 
         var bindings = _store.Load();
         bindings.RemoveAll(x => StringComparer.OrdinalIgnoreCase.Equals(x.GestureId, gestureId));
@@ -1044,7 +1053,7 @@ public partial class MainWindow : Window
         try
         {
             Log($"Test binding: {binding.DisplayName}");
-            await Task.Run(() => _executor.Execute(binding.Action));
+            await _executor.ExecuteAsync(binding.Action, CancellationToken.None);
         }
         catch (Exception ex)
         {
@@ -1078,6 +1087,8 @@ public partial class MainWindow : Window
             "app.launch" => "Path",
             "keyboard.hotkey" => "Hotkey",
             "keyboard.typeText" => "Text",
+            "handoff.grabScreenshot" => "Value",
+            "handoff.releaseHere" => "Value",
             _ => "Value"
         };
         ActionValueText.Text = actionType switch
@@ -1085,8 +1096,11 @@ public partial class MainWindow : Window
             "app.launch" => "notepad.exe",
             "keyboard.hotkey" => "ctrl+s",
             "keyboard.typeText" => "Hello from RyoikiTenkai",
+            "handoff.grabScreenshot" => "",
+            "handoff.releaseHere" => "",
             _ => ""
         };
+        ActionValueText.IsEnabled = actionType is not ("handoff.grabScreenshot" or "handoff.releaseHere");
     }
 
     private void ApplyGestureRecognitionMode()
@@ -2065,6 +2079,7 @@ public partial class MainWindow : Window
         _gesturePlaybackTimer.Stop();
         _cameraLoopCts?.Cancel();
         await DisposeRuntimeAsync();
+        await _handoffService.DisposeAsync();
         base.OnClosed(e);
     }
 

@@ -29,6 +29,12 @@
       <Link>models\%(RecursiveDir)%(Filename)%(Extension)</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
+    <Content Include="$(NativeRuntimeBuildDir)\*.dll"
+             Condition="Exists('$(NativeRuntimeBuildDir)\RyoikiTenkai.Native.dll')">
+      <Link>%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
   </ItemGroup>
 
   <Target Name="BuildNativeRuntimeWithCMake"

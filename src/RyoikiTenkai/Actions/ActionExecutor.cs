@@ -5,7 +5,44 @@ namespace RyoikiTenkai.Actions;
 
 internal sealed class ActionExecutor
 {
+    private readonly HandoffService? _handoffService;
+
+    public ActionExecutor(HandoffService? handoffService = null)
+    {
+        _handoffService = handoffService;
+    }
+
     public void Execute(ActionSpec action)
+    {
+        ExecuteSynchronous(action);
+    }
+
+    public async Task ExecuteAsync(ActionSpec action, CancellationToken cancellationToken)
+    {
+        switch (action.Type)
+        {
+            case "app.launch":
+                await Task.Run(() => Launch(action), cancellationToken).ConfigureAwait(false);
+                break;
+            case "keyboard.typeText":
+                await Task.Run(() => TypeText(action), cancellationToken).ConfigureAwait(false);
+                break;
+            case "keyboard.hotkey":
+                await Task.Run(() => Hotkey(action), cancellationToken).ConfigureAwait(false);
+                break;
+            case "handoff.grabScreenshot":
+                await GrabScreenshotAsync(cancellationToken);
+                break;
+            case "handoff.releaseHere":
+                await ReleaseHereAsync(cancellationToken);
+                break;
+            default:
+                await Task.Run(() => ExecuteSynchronous(action), cancellationToken).ConfigureAwait(false);
+                break;
+        }
+    }
+
+    private void ExecuteSynchronous(ActionSpec action)
     {
         switch (action.Type)
         {
@@ -74,5 +111,27 @@ internal sealed class ActionExecutor
         {
             Console.WriteLine(error);
         }
+    }
+
+    private async Task GrabScreenshotAsync(CancellationToken cancellationToken)
+    {
+        if (_handoffService is null)
+        {
+            Console.WriteLine("handoff.grabScreenshot requires a handoff service.");
+            return;
+        }
+
+        await _handoffService.GrabScreenshotAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task ReleaseHereAsync(CancellationToken cancellationToken)
+    {
+        if (_handoffService is null)
+        {
+            Console.WriteLine("handoff.releaseHere requires a handoff service.");
+            return;
+        }
+
+        await _handoffService.ReleaseHereAsync(cancellationToken).ConfigureAwait(false);
     }
 }
