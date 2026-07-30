@@ -82,11 +82,27 @@ Prefer this boundary:
 CameraStage
   -> HandPerceptionStage
        MediaPipe-like graph inside
-  -> LandmarkPatternStage
+  -> HandObservation
+  -> HandMeasurementStage
+  -> optional RecognitionStage
+  -> Interaction/Binding
   -> Overlay/Action stages
 ```
 
 Avoid splitting the MediaPipe graph into external app-level stages in a way that breaks ROI loopback consistency.
+
+The source of truth for the boundary between perception technology and application
+features is:
+
+```text
+doc/hand-input-architecture.md
+```
+
+Use its `Observation -> Measurement -> Recognition -> Interaction -> Command`
+model. Measurements are typed facts such as palm rotation or pinch distance.
+Persistent States and one-shot Events are optional interpretations. Application
+intent, capture, and feature mapping do not belong in perception or measurement
+code.
 
 ### Frame + Metadata, not image mutation everywhere
 
@@ -138,25 +154,33 @@ The MediaPipe-like graph should call model runners through interfaces and should
 
 ## Code Organization Direction
 
-Prefer this layout as the project evolves:
+Prefer this layout as the project evolves. Do not move existing files or create
+empty directories solely to match it:
 
 ```text
-src/RyoikiTenkai/
-  Vision/
-    Pipeline/
-    Buffers/
-    HandPerception/
-    HandPerception/MediaPipeGraph/
-    Geometry/
-    Runtime/
-    Patterns/
+src/RyoikiTenkai.Native/src/
+  Buffers/
+  Geometry/
+  HandPerception/
+    MediaPipeGraph/
+    ModelRunners/
+  HandInput/
+    Observation/
+    Measurements/
+    Recognition/
+    Publication/
+  Pipeline/
+  Rendering/
+  Runtime/
 
 src/RyoikiTenkai.Wpf/
-  UI shell, host controls, metrics, logs
-
-src/RyoikiTenkai.Native/
-  C++ native runtime DLL
+  Native/
+  Interaction/
+  Features/
 ```
+
+Concrete target paths and migration rules are in
+`doc/hand-input-architecture.md`.
 
 Do not create broad abstractions before there is a real second implementation. The first abstractions that are justified are:
 
