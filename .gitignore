@@ -15,3 +15,4 @@ tmp/qnn-*/
 tmp/*-inference-metrics.csv
 src/RyoikiTenkai/models/*_qdq.onnx
 .tmp-*
+gesture-recordings/
