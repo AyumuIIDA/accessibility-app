@@ -1,8 +1,16 @@
 # Native Vision Runtime Contract
 
-This document defines the version 5 contract between the WPF host and
+This document defines the version 18 contract between the WPF host and
 `RyoikiTenkai.Native.dll`. The public declarations are in
 `src/RyoikiTenkai.Native/include/ryoiki_native.h`.
+
+The downstream boundary from hand perception to application features is specified
+in [hand-input-architecture.md](hand-input-architecture.md). Recognition is an
+optional interpretation layer within that architecture and is specified in
+[gesture-recognition-framework.md](gesture-recognition-framework.md). Version 15
+publishes generic latest State snapshots while retaining the gesture-specific
+Domain Sign fields for compatibility comparison. Ordered Event publication remains
+future work.
 
 ## Native pipeline layers
 
@@ -53,9 +61,16 @@ CameraCapture
   no GDI, DIB, OpenCV, or WPF image writer.
   Redraw and resize reuse the uploaded camera bitmap when `frame_id` is unchanged.
   A new frame, camera-bitmap recreation, or device-resource recreation invalidates the
-  upload cache.
+  upload cache. The render packet also carries the Domain Sign State produced from
+  that perception frame. Candidate and Active States color the hand ROI/skeleton and
+  draw a DirectWrite label next to the ROI; inactive State draws no recognition
+  label. Recognition diagnostics are not rendered in the separate CAD viewport.
 - `ryoiki_native.cpp` is the runtime/C ABI composition root. It owns lifecycle,
   workers, polling snapshots, and the current HWND adapter.
+- `Presentation` owns the user-selectable horizontal hand-coordinate policy.
+  Measurements remain in their documented camera/world domains. Native CAD binding
+  and the native 3D hand plot independently consume the same presentation mode at
+  their consumer boundaries; WPF selects the mode but performs no coordinate math.
 
 The `RyoikiTenkai.VisionCore` static target contains `Buffers`, `Pipeline`, `Geometry`,
 `HandPerception`, and the platform-neutral render packet slot, allowing those layers
@@ -68,6 +83,10 @@ to be tested without a camera, WPF, or a native window.
 - Every polled structure starts with `abi_version` and `struct_size`.
 - A layout, field meaning, calling convention, or ownership change requires an ABI
   version increment and matching native and managed changes.
+- Version 17 adds `ryoiki_set_hand_presentation_mode`. `MirrorDirect` reflects the
+  hand X axis so motion follows the mirrored preview, while `Physical` preserves the
+  measured X direction. `ryoiki_configure_cad_hand_interaction` also applies this
+  shared setting so CAD and the 3D hand plot cannot silently diverge.
 - Structures are blittable values. They contain no pointers or variable-length data.
 - Status-returning functions use a signed 32-bit integer: zero is failure and one is
   success. The ABI does not expose C++ `bool`.
@@ -82,6 +101,9 @@ to be tested without a camera, WPF, or a native window.
 - `ryoiki_resize` resizes the native child window to match the WPF host.
 - `ryoiki_destroy` stops the runtime, destroys its child window, and releases the
   handle. The handle is invalid after this call.
+- `ryoiki_cad_create` creates a separate native CAD viewport under a borrowed WPF
+  host HWND without starting another camera or perception session. Its matching
+  resize, view, reset, error, and destroy functions operate on `RyoikiCadHandle`.
 - C++ exceptions never cross the C ABI.
 
 The current `HwndHost` creates and destroys the runtime on the WPF UI thread.
@@ -137,6 +159,68 @@ with a mutex and copies it into caller-owned structures.
 - `bbox` is `[left, top, right, bottom]`.
 - Palm results include the highest-scoring bbox and seven `[x, y]` keypoints. The
   `palm_count` may be greater than one even though version 5 copies only the best palm.
+- Hand results include the normalized palm normal used by the native 3D direction
+  vector. CAD interaction derives relative yaw and pitch from this same direction
+  basis rather than from palm-center translation.
+- Hand results also include the raw domain-sign confidence, match flag, and six
+  component scores for index extension, middle-finger wrap, middle/ring/pinky curl,
+  and thumb tuck. These are copied metadata values; gesture detection never
+  reprocesses the image in WPF.
+- Version 11 also copies the model's 21 metric-scale world landmarks. The official
+  MediaPipe gesture embedder consumes these together with the 21 normalized screen
+  landmarks and handedness; C# receives copied values and does not own native model
+  buffers.
+- Version 12 adds the orthonormal palm rotation basis, palm center, palm scale,
+  and pose-valid flag. The basis excludes translation and uniform hand scale and
+  is continuously available independently of gesture classification.
+- Version 13 adds native clutch-reference capture and a weighted least-squares
+  relative palm rotation. The estimator uses wrist, four MCP anchors, and a
+  low-weight thumb CMC anchor; removes weighted translation and RMS scale; solves
+  a robust Davenport/Kabsch rotation; and publishes its normalized fit
+  residual. The solver runs three fixed-size Huber IRLS passes so a single
+  unstable MCP landmark has less leverage, rejects collinear/unobservable
+  geometry, and uses a symmetric Jacobi eigensolver for the 4x4 Davenport
+  matrix. No per-frame heap allocation is introduced.
+- Version 14 gives every hand snapshot its source `capture_timestamp_us` and
+  publishes the screen-palm measurement computed by native code. World pose
+  measurements never fall back to image coordinates. `palm_center` is the
+  centroid of wrist plus the four MCP anchors. `screen_palm_center` is normalized
+  upright image position; `screen_palm_scale` is an isotropic
+  upright-frame-width ratio with first-order palm-plane foreshortening
+  correction. Tracking loss resets temporal measurement history.
+- Version 15 moves continuous CAD hand interaction to native code. WPF sends
+  only interaction intent, presentation mode, and sensitivity. Native code
+  applies coordinate conversion, dead zone, captured sensitivity,
+  capture-timestamp filtering, pan/zoom mapping, tracking-loss policy, and the
+  native CAD view update.
+- Version 16 removes WPF's 33 ms interaction update loop. WPF configures intent
+  through `ryoiki_configure_cad_hand_interaction` only when input/settings change
+  and polls `ryoiki_get_cad_hand_interaction` for display. The perception worker
+  advances the native CAD binding directly from typed measurements. A shared
+  endpoint synchronizes CAD lifetime, mouse/API view access, and CAD destruction;
+  no borrowed CAD pointer is retained by the vision runtime.
+- The latest-State snapshot publishes built-in ID `1` (`state.domain_sign`) and
+  ID `2` (`state.open_palm`). Both recognizers and their time hysteresis run on
+  the native perception worker. The ROI overlay displays Candidate/Active state
+  text and color without routing recognition through CAD.
+- Version 18 adds `ryoiki_read_hand_events`. Swipe Left (`1`) and Swipe Right
+  (`2`) are delivered through a fixed-capacity native ring with monotonic sequence
+  numbers, bounded batches, and an explicit dropped-event count. WPF owns only
+  the read cursor. The native ROI displays a recognized Swipe for `600 ms`.
+
+`palm_rotation_fit_error` is the ordinary weighted RMS distance between the
+normalized current palm points and the rotated normalized reference points.
+Both point sets are centered and divided by their own weighted RMS radius, so
+the value is dimensionless and excludes translation and uniform hand scale.
+The reported residual is intentionally not Huber-clipped: the robust weights
+protect the rotation estimate from an outlier, while the public error still
+exposes that outlier to diagnostics and interaction policy. It is not a
+probability or an angular error, and its acceptance threshold must ultimately
+be calibrated from recorded landmark sequences.
+- The WPF host has no camera, ONNX inference, landmark projection, or overlay
+  rendering fallback. Native startup failure is terminal for perception. WPF
+  remains responsible only for the shell, polling small metadata, settings, and
+  interaction commands.
 - Image `x` and `y` values are expressed in the logical upright image defined by the
   frame orientation metadata, then normalized to `[0, 1]` before presentation
   mirroring. `x` increases right and `y` increases down. Storage width/height remain

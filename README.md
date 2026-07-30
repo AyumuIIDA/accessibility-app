@@ -1,5 +1,10 @@
 # RyoikiTenkai
 
+The production application uses the C++ native runtime exclusively for camera
+capture, hand-model inference, landmark processing, and camera/landmark rendering.
+There is no managed WPF inference or rendering fallback; a native startup failure is
+reported as an error.
+
 RyoikiTenkai is a Windows/.NET prototype that maps hand gestures to local PC actions.
 
 Current vertical slice:
@@ -39,6 +44,10 @@ net10.0-windows10.0.26100.0
 ```text
 doc/
   Design notes and product planning.
+  hand-input-architecture.md
+                Source of truth for perception-to-feature boundaries.
+  gesture-recognition-framework.md
+                State/Event recognition design below that boundary.
 
 src/RyoikiTenkai/
   Core console app and shared runtime code.
@@ -82,6 +91,14 @@ Run WPF UI:
 ```powershell
 dotnet run --project src/RyoikiTenkai.Wpf/RyoikiTenkai.Wpf.csproj
 ```
+
+The main window's **Open 3D Viewer** button opens a modeless native CAD-style viewer.
+The built-in demo assembly supports left-drag orbit, mouse-wheel zoom, and
+double-click reset without starting the camera. When the native camera runtime is
+running, enable **Hand control**, then use Space + hand rotation to orbit,
+Shift+Space + hand translation to pan, or Ctrl+Space + toward/away movement to
+zoom. Releasing Space ends any manipulation,
+pinch thumb and index finger to zoom, and hold a fist to disengage.
 
 Run console app:
 
