@@ -8,7 +8,7 @@
     <UseWPF>true</UseWPF>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <NativeRuntimeSourceDir>$(MSBuildProjectDirectory)\..\RyoikiTenkai.Native</NativeRuntimeSourceDir>
-    <NativeRuntimeBuildDir>$(MSBuildProjectDirectory)\..\..\build\RyoikiTenkai.Native.OpenCv</NativeRuntimeBuildDir>
+    <NativeRuntimeBuildDir>$(MSBuildProjectDirectory)\..\..\build\RyoikiTenkai.Native.Qnn.Arm64</NativeRuntimeBuildDir>
     <VcpkgRoot Condition="'$(VcpkgRoot)' == ''">$(VCPKG_ROOT)</VcpkgRoot>
     <VcpkgRoot Condition="'$(VcpkgRoot)' == '' and '$(VSINSTALLDIR)' != ''">$(VSINSTALLDIR)VC\vcpkg</VcpkgRoot>
     <VcpkgTriplet Condition="'$(VcpkgTriplet)' == ''">arm64-windows-static-md</VcpkgTriplet>

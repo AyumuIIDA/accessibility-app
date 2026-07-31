@@ -22,6 +22,8 @@ internal sealed partial class NativeVisionHost : HwndHost
 
     public event Action<string>? DiagnosticLogged;
 
+    internal IntPtr NativeHandle => _nativeHandle;
+
     public bool StartNativeRuntime()
     {
         if (!_nativeAvailable || _nativeHandle == IntPtr.Zero)
@@ -98,6 +100,127 @@ internal sealed partial class NativeVisionHost : HwndHost
             && result.AbiVersion == NativeVisionInterop.AbiVersion
             && result.StructSize == Marshal.SizeOf<NativeHandResult>();
     }
+
+    public bool TryGetHands(out NativeHandsResult result)
+    {
+        result = default;
+        var success = _nativeAvailable
+            && _nativeHandle != IntPtr.Zero
+            && NativeVisionInterop.GetLatestHands(_nativeHandle, out result) != 0;
+        return success
+            && result.AbiVersion == NativeVisionInterop.AbiVersion
+            && result.StructSize == Marshal.SizeOf<NativeHandsResult>();
+    }
+
+    public bool TryGetHandTopology(out NativeHandTopologySnapshot snapshot)
+    {
+        snapshot = default;
+        var success = _nativeAvailable
+            && _nativeHandle != IntPtr.Zero
+            && NativeVisionInterop.GetLatestHandTopology(_nativeHandle, out snapshot) != 0;
+        return success
+            && snapshot.AbiVersion == NativeVisionInterop.AbiVersion
+            && snapshot.StructSize == Marshal.SizeOf<NativeHandTopologySnapshot>();
+    }
+
+    public bool TryGetGestureRecognition(out NativeGestureRecognitionSnapshot snapshot)
+    {
+        snapshot = default;
+        var success = _nativeAvailable && _nativeHandle != IntPtr.Zero
+            && NativeVisionInterop.GetLatestGestureRecognition(_nativeHandle, out snapshot) != 0;
+        return success && snapshot.AbiVersion == NativeVisionInterop.AbiVersion
+            && snapshot.StructSize == Marshal.SizeOf<NativeGestureRecognitionSnapshot>();
+    }
+
+    public bool TryGetGestureDtwDebug(out NativeGestureDtwDebugSnapshot snapshot)
+    {
+        snapshot = default;
+        var success = _nativeAvailable && _nativeHandle != IntPtr.Zero
+            && NativeVisionInterop.GetLatestGestureDtwDebug(_nativeHandle, out snapshot) != 0;
+        return success && snapshot.AbiVersion == NativeVisionInterop.AbiVersion
+            && snapshot.StructSize == Marshal.SizeOf<NativeGestureDtwDebugSnapshot>();
+    }
+
+    public bool RequestGestureTemplateRegistration(uint trackId, uint templateId) =>
+        _nativeAvailable && _nativeHandle != IntPtr.Zero
+        && NativeVisionInterop.RequestGestureTemplateRegistration(_nativeHandle, trackId, templateId) != 0;
+
+    public bool BeginGestureRecording(uint templateId) =>
+        _nativeAvailable && _nativeHandle != IntPtr.Zero
+        && NativeVisionInterop.BeginGestureRecording(_nativeHandle, templateId) != 0;
+
+    public bool FinishGestureRecording() =>
+        _nativeAvailable && _nativeHandle != IntPtr.Zero
+        && NativeVisionInterop.FinishGestureRecording(_nativeHandle) != 0;
+
+    public bool CancelGestureRecording() =>
+        _nativeAvailable && _nativeHandle != IntPtr.Zero
+        && NativeVisionInterop.CancelGestureRecording(_nativeHandle) != 0;
+
+    public bool TryGetGestureRecordingStatus(out NativeGestureRecordingStatus status)
+    {
+        status = default;
+        var success = _nativeAvailable && _nativeHandle != IntPtr.Zero
+            && NativeVisionInterop.GetGestureRecordingStatus(_nativeHandle, out status) != 0;
+        return success && status.AbiVersion == NativeVisionInterop.AbiVersion
+            && status.StructSize == Marshal.SizeOf<NativeGestureRecordingStatus>();
+    }
+
+    public bool TryListGestureDefinitions(out NativeGestureDefinitionList definitions)
+    {
+        definitions = default;
+        if (!_nativeAvailable || _nativeHandle == IntPtr.Zero) return false;
+        _ = NativeVisionInterop.ListGestureDefinitions(_nativeHandle, out definitions);
+        // The native call initializes the ABI header and error text even when
+        // repository loading fails, so preserve that diagnostic snapshot.
+        return definitions.AbiVersion == NativeVisionInterop.AbiVersion
+            && definitions.StructSize == Marshal.SizeOf<NativeGestureDefinitionList>();
+    }
+
+    public bool SetGestureDefinitionMetadata(uint definitionId, string name, bool enabled) =>
+        _nativeAvailable && _nativeHandle != IntPtr.Zero
+        && NativeVisionInterop.SetGestureDefinitionMetadata(
+            _nativeHandle, definitionId, name, enabled ? 1U : 0U) != 0;
+
+    public bool DeleteGestureDefinition(uint definitionId) =>
+        _nativeAvailable && _nativeHandle != IntPtr.Zero
+        && NativeVisionInterop.DeleteGestureDefinition(_nativeHandle, definitionId) != 0;
+
+    public bool ReloadGestureDefinitions() =>
+        _nativeAvailable && _nativeHandle != IntPtr.Zero
+        && NativeVisionInterop.ReloadGestureDefinitions(_nativeHandle) != 0;
+
+    public bool TryListGestureRecordings(uint definitionId, out NativeGestureRecordingList recordings)
+    {
+        recordings = default;
+        if (!_nativeAvailable || _nativeHandle == IntPtr.Zero) return false;
+        _ = NativeVisionInterop.ListGestureRecordings(_nativeHandle, definitionId, out recordings);
+        return recordings.AbiVersion == NativeVisionInterop.AbiVersion
+            && recordings.StructSize == Marshal.SizeOf<NativeGestureRecordingList>();
+    }
+
+    public bool ExportGestureRecording(uint definitionId, uint takeIndex, string path) =>
+        _nativeAvailable && _nativeHandle != IntPtr.Zero
+        && NativeVisionInterop.ExportGestureRecording(_nativeHandle, definitionId, takeIndex, path) != 0;
+
+    public bool TryListGestureBindings(out NativeGestureBindingList bindings)
+    {
+        bindings = default;
+        if (!_nativeAvailable || _nativeHandle == IntPtr.Zero) return false;
+        _ = NativeVisionInterop.ListGestureBindings(_nativeHandle, out bindings);
+        return bindings.AbiVersion == NativeVisionInterop.AbiVersion
+            && bindings.StructSize == Marshal.SizeOf<NativeGestureBindingList>();
+    }
+
+    public bool UpsertGestureBinding(uint definitionId, string actionType,
+        string actionParameter, bool enabled) =>
+        _nativeAvailable && _nativeHandle != IntPtr.Zero
+        && NativeVisionInterop.UpsertGestureBinding(_nativeHandle, definitionId,
+            actionType, actionParameter, enabled ? 1U : 0U) != 0;
+
+    public bool DeleteGestureBinding(uint definitionId) =>
+        _nativeAvailable && _nativeHandle != IntPtr.Zero
+        && NativeVisionInterop.DeleteGestureBinding(_nativeHandle, definitionId) != 0;
 
     public bool TryGetStates(out NativeHandStateSnapshot snapshot)
     {

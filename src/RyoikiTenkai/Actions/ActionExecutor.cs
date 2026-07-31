@@ -3,8 +3,18 @@ using RyoikiTenkai.Core;
 
 namespace RyoikiTenkai.Actions;
 
-internal sealed class ActionExecutor
+internal interface IActionExecutor
 {
+    Task ExecuteAsync(ActionSpec action, CancellationToken cancellationToken);
+}
+
+internal sealed class ActionExecutor : IActionExecutor
+{
+    private readonly HandoffService? _handoffService;
+
+    public ActionExecutor(HandoffService? handoffService = null) =>
+        _handoffService = handoffService;
+
     public void Execute(ActionSpec action)
     {
         switch (action.Type)
@@ -22,6 +32,25 @@ internal sealed class ActionExecutor
                 Console.WriteLine($"Unsupported action type: {action.Type}");
                 break;
         }
+    }
+
+    public async Task ExecuteAsync(ActionSpec action, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (action.Type == "handoff.grab")
+        {
+            if (_handoffService is null) throw new InvalidOperationException("LAN handoff is unavailable.");
+            await _handoffService.GrabScreenshotAsync(cancellationToken).ConfigureAwait(false);
+            return;
+        }
+        if (action.Type == "handoff.release")
+        {
+            if (_handoffService is null) throw new InvalidOperationException("LAN handoff is unavailable.");
+            await _handoffService.ReleaseHereAsync(cancellationToken).ConfigureAwait(false);
+            return;
+        }
+        await Task.Run(() => Execute(action), cancellationToken).ConfigureAwait(false);
     }
 
     private static void Launch(ActionSpec action)
