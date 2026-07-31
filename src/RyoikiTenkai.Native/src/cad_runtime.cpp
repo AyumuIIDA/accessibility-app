@@ -93,10 +93,10 @@ bool CadInteractionEndpoint::configure(
     return true;
 }
 
-void CadInteractionEndpoint::process(const CadHandInput& input) noexcept
+bool CadInteractionEndpoint::process(const CadHandInput& input) noexcept
 {
     std::lock_guard endpointLock{mutex_};
-    if (cadHandle_ == nullptr) return;
+    if (cadHandle_ == nullptr) return false;
 
     rendering::CadView currentView{};
     {
@@ -132,6 +132,7 @@ void CadInteractionEndpoint::process(const CadHandInput& input) noexcept
     latest_.pan_y = output.view.panY;
     latest_.yaw_delta_degrees = output.yawDeltaDegrees;
     latest_.pitch_delta_degrees = output.pitchDeltaDegrees;
+    return output.referenceCaptureRequested;
 }
 
 bool CadInteractionEndpoint::copyLatest(

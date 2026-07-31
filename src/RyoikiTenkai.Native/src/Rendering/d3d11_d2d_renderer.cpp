@@ -683,16 +683,13 @@ private:
 
     void drawHandOverlay(const RenderPacket& packet, const FrameTransforms& transforms)
     {
-        const auto& hand = packet.perception.hand;
-        if (!hand.detected)
+        const std::size_t handCount = packet.perception.handCount > 0
+            ? packet.perception.handCount
+            : packet.perception.hand.detected ? 1 : 0;
+        if (handCount == 0)
         {
             return;
         }
-        const auto mapLandmark = [&hand, &transforms](const int index)
-        {
-            return transforms.uprightToViewport.transform(
-                {hand.landmarks[index].x, hand.landmarks[index].y});
-        };
         using hand_input::recognition::HandStatePhase;
         hand_input::recognition::HandStateResult eventDisplay{};
         const bool eventVisible = packet.latestEvent.id != 0
@@ -732,39 +729,56 @@ private:
         {
             overlayBrush = activeBrush_.Get();
         }
-        for (const auto& connection : kHandConnections)
-        {
-            d2dContext_->DrawLine(
-                toD2dPoint(mapLandmark(connection[0])),
-                toD2dPoint(mapLandmark(connection[1])),
-                overlayBrush,
-                2.0F);
-        }
-        for (int index = 0; index < 21; ++index)
-        {
-            d2dContext_->FillEllipse(
-                D2D1::Ellipse(toD2dPoint(mapLandmark(index)), 3.5F, 3.5F),
-                overlayBrush);
-        }
 
-        const auto topLeft = transforms.uprightToViewport.transform(
-            {hand.box.left, hand.box.top});
-        const auto bottomRight = transforms.uprightToViewport.transform(
-            {hand.box.right, hand.box.bottom});
-        d2dContext_->DrawRectangle(
-            D2D1::RectF(
-                (std::min)(topLeft.x, bottomRight.x),
-                (std::min)(topLeft.y, bottomRight.y),
-                (std::max)(topLeft.x, bottomRight.x),
-                (std::max)(topLeft.y, bottomRight.y)),
-            overlayBrush,
-            1.5F);
-        drawStateLabel(
-            displayState,
-            stateName,
-            topLeft,
-            bottomRight,
-            overlayBrush);
+        for (std::size_t handIndex = 0;
+            handIndex < handCount;
+            ++handIndex)
+        {
+            const auto& hand = packet.perception.handCount > 0
+                ? packet.perception.hands[handIndex]
+                : packet.perception.hand;
+            const auto mapLandmark = [&hand, &transforms](const int index)
+            {
+                return transforms.uprightToViewport.transform(
+                    {hand.landmarks[index].x, hand.landmarks[index].y});
+            };
+            for (const auto& connection : kHandConnections)
+            {
+                d2dContext_->DrawLine(
+                    toD2dPoint(mapLandmark(connection[0])),
+                    toD2dPoint(mapLandmark(connection[1])),
+                    overlayBrush,
+                    2.0F);
+            }
+            for (int index = 0; index < 21; ++index)
+            {
+                d2dContext_->FillEllipse(
+                    D2D1::Ellipse(toD2dPoint(mapLandmark(index)), 3.5F, 3.5F),
+                    overlayBrush);
+            }
+
+            const auto topLeft = transforms.uprightToViewport.transform(
+                {hand.box.left, hand.box.top});
+            const auto bottomRight = transforms.uprightToViewport.transform(
+                {hand.box.right, hand.box.bottom});
+            d2dContext_->DrawRectangle(
+                D2D1::RectF(
+                    (std::min)(topLeft.x, bottomRight.x),
+                    (std::min)(topLeft.y, bottomRight.y),
+                    (std::max)(topLeft.x, bottomRight.x),
+                    (std::max)(topLeft.y, bottomRight.y)),
+                overlayBrush,
+                1.5F);
+            if (handIndex == 0)
+            {
+                drawStateLabel(
+                    displayState,
+                    stateName,
+                    topLeft,
+                    bottomRight,
+                    overlayBrush);
+            }
+        }
     }
 
     void drawStateLabel(

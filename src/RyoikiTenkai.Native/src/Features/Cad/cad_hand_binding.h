@@ -25,6 +25,9 @@ enum class HandInteractionState : std::int32_t
     Panning = 3,
     Zooming = 4,
     Suspended = 5,
+    // Retained for ABI and managed-display compatibility. The binding no longer
+    // emits it: holding the clutch is a continuous statement of intent, so a
+    // tracking gap re-zeroes every reference instead of demanding a new press.
     AwaitingRelease = 6
 };
 
@@ -50,6 +53,10 @@ struct CadHandBindingOutput
     float yawDeltaDegrees{0.0F};
     float pitchDeltaDegrees{0.0F};
     bool viewChanged{false};
+    // Set on the frame the interaction (re)activates. The binding owns view and
+    // screen-space references, but the palm rotation reference belongs to the
+    // native estimator, so the runtime must capture a fresh one.
+    bool referenceCaptureRequested{false};
 };
 
 class CadHandBinding final
@@ -78,6 +85,5 @@ private:
     std::chrono::steady_clock::time_point lastNewFrameAt_{};
     HandInteractionMode activeMode_{HandInteractionMode::None};
     bool active_{false};
-    bool mustRelease_{false};
 };
 }

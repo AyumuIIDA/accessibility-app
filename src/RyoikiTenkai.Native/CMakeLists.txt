@@ -89,16 +89,29 @@ add_library(RyoikiTenkai.VisionCore STATIC
     src/HandPerception/MediaPipeGraph/palm_detection_graph.cpp
     src/HandPerception/MediaPipeGraph/palm_detection_postprocessor.cpp
     src/HandPerception/MediaPipeGraph/palm_detection_to_roi.cpp
+    src/HandInput/Measurements/gesture_candidate_window_history.cpp
     src/HandInput/Measurements/hand_measurement_extractor.cpp
+    src/HandInput/Measurements/hand_topology_history.cpp
+    src/HandInput/Measurements/hand_unified_feature_frame.cpp
+    src/HandInput/Measurements/multi_hand_measurement_stage.cpp
     src/HandInput/Measurements/palm_basis_rotation_tracker.cpp
     src/HandInput/Measurements/palm_rotation_eskf.cpp
+    src/HandInput/Measurements/palm_rotation_one_euro_filter.cpp
+    src/HandInput/Measurements/rotation_observation_gate.cpp
     src/HandInput/Measurements/weighted_palm_rotation_tracker.cpp
     src/HandInput/Publication/latest_hand_state_slot.cpp
     src/HandInput/Publication/ordered_hand_event_ring.cpp
     src/HandInput/Recognition/domain_expansion_state_recognizer.cpp
+    src/HandInput/Recognition/gesture_recording_session.cpp
+    src/HandInput/Recognition/gesture_template_repository.cpp
+    src/HandInput/Recognition/gesture_template_serialization.cpp
+    src/HandInput/Recognition/gesture_match_stabilizer.cpp
+    src/HandInput/Recognition/multi_hand_gesture_core.cpp
+    src/HandInput/Recognition/gesture_template_registry.cpp
     src/HandInput/Recognition/open_palm_state_recognizer.cpp
     src/HandInput/Recognition/swipe_event_recognizer.cpp
     src/HandInput/Recognition/timed_state_stabilizer.cpp
+    src/HandInput/Recognition/unified_sequence_gesture_comparator.cpp
     src/HandPerception/ModelRunners/ort_hand_landmark_runner.cpp
     src/HandPerception/ModelRunners/ort_palm_detection_runner.cpp
     src/HandPerception/ModelRunners/ort_session_configuration.cpp
@@ -110,6 +123,10 @@ add_library(RyoikiTenkai.VisionCore STATIC
     src/Pipeline/perception_mailbox.cpp
     src/Presentation/hand_presentation_transform.cpp
     src/Rendering/frame_transforms.cpp
+    src/Rendering/gesture_dtw_debug_layout.cpp
+    src/Rendering/gesture_dtw_debug_render_packet.cpp
+    src/Rendering/gesture_dtw_debug_source.cpp
+    src/Rendering/gesture_dtw_debug_render_packet_adapter.cpp
     src/Rendering/hand_3d_plot.cpp
     src/Rendering/latest_render_packet_slot.cpp
     src/Runtime/camera_device_selection.cpp
@@ -145,6 +162,7 @@ target_link_libraries(RyoikiTenkai.VisionCore PUBLIC
     d3d11
     d3dcompiler
     d3d12
+    winsqlite3
 )
 
 add_library(RyoikiTenkai.Native SHARED
@@ -153,7 +171,11 @@ add_library(RyoikiTenkai.Native SHARED
     src/Rendering/cad_renderer.cpp
     src/Rendering/cad_render_stage.cpp
     src/Rendering/d3d11_d2d_renderer.cpp
+    src/Rendering/gesture_dtw_debug_renderer.cpp
+    src/Rendering/gesture_dtw_debug_render_stage.cpp
     src/Rendering/native_render_stage.cpp
+    src/gesture_dtw_debug_runtime.cpp
+    src/gesture_recording_playback_runtime.cpp
     src/ryoiki_native.cpp
 )
 
@@ -211,6 +233,9 @@ if (BUILD_TESTING)
     target_link_libraries(RyoikiTenkai.HandPerception.Tests PRIVATE
         RyoikiTenkai.VisionCore
     )
+    target_include_directories(RyoikiTenkai.HandPerception.Tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
     target_compile_definitions(RyoikiTenkai.HandPerception.Tests PRIVATE
         RYOIKI_PALM_MODEL_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../RyoikiTenkai/models/palm_detection.onnx"
         RYOIKI_HAND_MODEL_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../RyoikiTenkai/models/hand_landmark.onnx"
@@ -220,4 +245,113 @@ if (BUILD_TESTING)
     endif()
     add_test(NAME RyoikiTenkai.HandPerception.Tests COMMAND RyoikiTenkai.HandPerception.Tests)
     copy_onnxruntime_runtime(RyoikiTenkai.HandPerception.Tests)
+
+    add_executable(RyoikiTenkai.HandUnifiedFeatureFrame.Tests
+        tests/hand_unified_feature_frame_tests.cpp
+    )
+    target_link_libraries(RyoikiTenkai.HandUnifiedFeatureFrame.Tests PRIVATE
+        RyoikiTenkai.VisionCore
+    )
+    if (MSVC)
+        target_compile_options(RyoikiTenkai.HandUnifiedFeatureFrame.Tests PRIVATE /W4 /permissive- /EHsc)
+    endif()
+    add_test(NAME RyoikiTenkai.HandUnifiedFeatureFrame.Tests COMMAND RyoikiTenkai.HandUnifiedFeatureFrame.Tests)
+    copy_onnxruntime_runtime(RyoikiTenkai.HandUnifiedFeatureFrame.Tests)
+
+    add_executable(RyoikiTenkai.GestureCandidateWindowHistory.Tests
+        tests/gesture_candidate_window_history_tests.cpp
+    )
+    target_link_libraries(RyoikiTenkai.GestureCandidateWindowHistory.Tests PRIVATE
+        RyoikiTenkai.VisionCore
+    )
+    if (MSVC)
+        target_compile_options(RyoikiTenkai.GestureCandidateWindowHistory.Tests PRIVATE /W4 /permissive- /EHsc)
+    endif()
+    add_test(NAME RyoikiTenkai.GestureCandidateWindowHistory.Tests COMMAND RyoikiTenkai.GestureCandidateWindowHistory.Tests)
+    copy_onnxruntime_runtime(RyoikiTenkai.GestureCandidateWindowHistory.Tests)
+
+    add_executable(RyoikiTenkai.UnifiedSequenceGestureComparator.Tests
+        tests/unified_sequence_gesture_comparator_tests.cpp
+    )
+    target_link_libraries(RyoikiTenkai.UnifiedSequenceGestureComparator.Tests PRIVATE
+        RyoikiTenkai.VisionCore
+    )
+    if (MSVC)
+        target_compile_options(RyoikiTenkai.UnifiedSequenceGestureComparator.Tests PRIVATE /W4 /permissive- /EHsc)
+    endif()
+    add_test(NAME RyoikiTenkai.UnifiedSequenceGestureComparator.Tests COMMAND RyoikiTenkai.UnifiedSequenceGestureComparator.Tests)
+    copy_onnxruntime_runtime(RyoikiTenkai.UnifiedSequenceGestureComparator.Tests)
+
+    add_executable(RyoikiTenkai.GestureTemplateRegistry.Tests
+        tests/gesture_template_registry_tests.cpp
+    )
+    target_link_libraries(RyoikiTenkai.GestureTemplateRegistry.Tests PRIVATE
+        RyoikiTenkai.VisionCore
+    )
+    if (MSVC)
+        target_compile_options(RyoikiTenkai.GestureTemplateRegistry.Tests PRIVATE /W4 /permissive- /EHsc)
+    endif()
+    add_test(NAME RyoikiTenkai.GestureTemplateRegistry.Tests COMMAND RyoikiTenkai.GestureTemplateRegistry.Tests)
+    copy_onnxruntime_runtime(RyoikiTenkai.GestureTemplateRegistry.Tests)
+
+    add_executable(RyoikiTenkai.GestureTemplateRepository.Tests tests/gesture_template_repository_tests.cpp)
+    target_link_libraries(RyoikiTenkai.GestureTemplateRepository.Tests PRIVATE RyoikiTenkai.VisionCore)
+    if (MSVC)
+        target_compile_options(RyoikiTenkai.GestureTemplateRepository.Tests PRIVATE /W4 /permissive- /EHsc)
+    endif()
+    add_test(NAME RyoikiTenkai.GestureTemplateRepository.Tests COMMAND RyoikiTenkai.GestureTemplateRepository.Tests)
+
+    add_executable(RyoikiTenkai.GestureDtwVisualizationPacket.Tests
+        tests/gesture_dtw_visualization_packet_tests.cpp
+    )
+    target_link_libraries(RyoikiTenkai.GestureDtwVisualizationPacket.Tests PRIVATE
+        RyoikiTenkai.VisionCore
+    )
+    if (MSVC)
+        target_compile_options(RyoikiTenkai.GestureDtwVisualizationPacket.Tests PRIVATE /W4 /permissive- /EHsc)
+    endif()
+    add_test(NAME RyoikiTenkai.GestureDtwVisualizationPacket.Tests COMMAND RyoikiTenkai.GestureDtwVisualizationPacket.Tests)
+    copy_onnxruntime_runtime(RyoikiTenkai.GestureDtwVisualizationPacket.Tests)
+
+    add_executable(RyoikiTenkai.GestureRecordingSession.Tests
+        tests/gesture_recording_session_tests.cpp
+    )
+    target_link_libraries(RyoikiTenkai.GestureRecordingSession.Tests PRIVATE
+        RyoikiTenkai.VisionCore
+    )
+    if (MSVC)
+        target_compile_options(RyoikiTenkai.GestureRecordingSession.Tests PRIVATE /W4 /permissive- /EHsc)
+    endif()
+    add_test(NAME RyoikiTenkai.GestureRecordingSession.Tests COMMAND RyoikiTenkai.GestureRecordingSession.Tests)
+    copy_onnxruntime_runtime(RyoikiTenkai.GestureRecordingSession.Tests)
+
+    add_executable(RyoikiTenkai.GestureMatchStabilizer.Tests
+        tests/gesture_match_stabilizer_tests.cpp)
+    target_link_libraries(RyoikiTenkai.GestureMatchStabilizer.Tests PRIVATE RyoikiTenkai.VisionCore)
+    if (MSVC)
+        target_compile_options(RyoikiTenkai.GestureMatchStabilizer.Tests PRIVATE /W4 /permissive- /EHsc)
+    endif()
+    add_test(NAME RyoikiTenkai.GestureMatchStabilizer.Tests COMMAND RyoikiTenkai.GestureMatchStabilizer.Tests)
+    copy_onnxruntime_runtime(RyoikiTenkai.GestureMatchStabilizer.Tests)
+
+    add_executable(RyoikiTenkai.MultiHandGestureCore.Tests
+        tests/multi_hand_gesture_core_tests.cpp)
+    target_link_libraries(RyoikiTenkai.MultiHandGestureCore.Tests PRIVATE RyoikiTenkai.VisionCore)
+    if (MSVC)
+        target_compile_options(RyoikiTenkai.MultiHandGestureCore.Tests PRIVATE /W4 /permissive- /EHsc)
+    endif()
+    add_test(NAME RyoikiTenkai.MultiHandGestureCore.Tests COMMAND RyoikiTenkai.MultiHandGestureCore.Tests)
+    copy_onnxruntime_runtime(RyoikiTenkai.MultiHandGestureCore.Tests)
+
+    add_executable(RyoikiTenkai.NativeAbi.Tests
+        tests/ryoiki_native_abi_tests.cpp
+    )
+    target_include_directories(RyoikiTenkai.NativeAbi.Tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_compile_features(RyoikiTenkai.NativeAbi.Tests PRIVATE cxx_std_20)
+    if (MSVC)
+        target_compile_options(RyoikiTenkai.NativeAbi.Tests PRIVATE /W4 /permissive- /EHsc)
+    endif()
+    add_test(NAME RyoikiTenkai.NativeAbi.Tests COMMAND RyoikiTenkai.NativeAbi.Tests)
 endif()

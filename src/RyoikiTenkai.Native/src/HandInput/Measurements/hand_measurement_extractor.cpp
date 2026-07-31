@@ -37,6 +37,10 @@ float distance(const Vector3 left, const Vector3 right) noexcept
 {
     return length(subtract(left, right));
 }
+float distance2d(const Vector3 left, const Vector3 right) noexcept
+{
+    return std::hypot(left.x - right.x, left.y - right.y);
+}
 bool isFinite(const Vector3 value) noexcept
 {
     return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
@@ -83,6 +87,10 @@ HandMeasurementFrame HandMeasurementExtractor::extract(
     result.handedness = hand.handedness;
     frame.screenPalm.frameId = frameId;
     frame.screenPalm.timestampUs = timestampUs;
+    frame.topology.frameId = frameId;
+    frame.topology.timestampUs = timestampUs;
+    frame.topology.handedness = hand.handedness;
+    frame.topology.confidence = hand.confidence;
     if (!hand.detected)
     {
         reset();
@@ -105,6 +113,135 @@ HandMeasurementFrame HandMeasurementExtractor::extract(
         result.quality = HandMeasurementQuality::InvalidLandmarks;
         reset();
         return frame;
+    }
+
+    const float imageHandScale = distance2d(imagePoints[0], imagePoints[9]);
+    if (imageHandScale > 1.0e-5F
+        && uprightWidth > 0
+        && uprightHeight > 0)
+    {
+        auto& topology = frame.topology;
+        constexpr std::array<std::size_t, 5> kFingerBases{
+            1, 5, 9, 13, 17};
+        constexpr std::array<std::size_t, 5> kFingerTips{
+            4, 8, 12, 16, 20};
+        constexpr float kFingerOpenThreshold = 0.55F;
+        for (std::size_t finger = 0;
+            finger < kFingerBases.size();
+            ++finger)
+        {
+            const float baseDistance = (std::max)(
+                distance2d(
+                    imagePoints[0],
+                    imagePoints[kFingerBases[finger]]),
+                1.0e-3F);
+            const float tipDistance = distance2d(
+                imagePoints[0],
+                imagePoints[kFingerTips[finger]]);
+            const float straightness = std::clamp(
+                (tipDistance / baseDistance - 1.05F) / 0.65F,
+                0.0F,
+                1.0F);
+            topology.fingerStraightness[finger] = straightness;
+            if (straightness >= kFingerOpenThreshold)
+            {
+                topology.fingerStateMask |= 1U << finger;
+            }
+        }
+
+        const Vector3& wrist = imagePoints[0];
+        const Vector3& indexMcp = imagePoints[5];
+        const Vector3& middleMcp = imagePoints[9];
+        const Vector3& pinkyMcp = imagePoints[17];
+        topology.signedPalmArea = (
+            (indexMcp.x - wrist.x) * (pinkyMcp.y - wrist.y)
+            - (indexMcp.y - wrist.y) * (pinkyMcp.x - wrist.x))
+            / (imageHandScale * imageHandScale);
+        topology.palmCompression =
+            distance2d(indexMcp, pinkyMcp) / imageHandScale;
+        float minimumZ = imagePoints[0].z;
+        float maximumZ = imagePoints[0].z;
+        for (const auto& point : imagePoints)
+        {
+            minimumZ = (std::min)(minimumZ, point.z);
+            maximumZ = (std::max)(maximumZ, point.z);
+        }
+        topology.palmDepthRange =
+            (maximumZ - minimumZ) / imageHandScale;
+        const float boxWidth = (std::max)(
+            0.0F, hand.box.right - hand.box.left);
+        const float boxHeight = (std::max)(
+            0.0F, hand.box.bottom - hand.box.top);
+        topology.boundingBoxAspect = boxHeight > 1.0e-5F
+            ? boxWidth / boxHeight
+            : 0.0F;
+        topology.boundingBoxArea =
+            boxWidth * boxHeight
+            / (static_cast<float>(uprightWidth)
+                * static_cast<float>(uprightHeight));
+        topology.handScale =
+            imageHandScale / static_cast<float>(uprightWidth);
+        topology.centerX =
+            0.5F * (wrist.x + middleMcp.x)
+            / static_cast<float>(uprightWidth);
+        topology.centerY =
+            0.5F * (wrist.y + middleMcp.y)
+            / static_cast<float>(uprightHeight);
+        topology.palmAxisRadians = std::atan2(
+            middleMcp.y - wrist.y,
+            middleMcp.x - wrist.x);
+
+        // Wrist displacement normalized by the average palm-axis length of the
+        // two observations. Working in source pixels keeps the value isotropic
+        // and independent of frame aspect ratio. The one-pixel floor is a
+        // degenerate-input guard, not a calibrated threshold.
+        if (hasPreviousTopology_)
+        {
+            const float averageScale = (std::max)(
+                1.0F, 0.5F * (imageHandScale + previousImageHandScale_));
+            const float stepX = (wrist.x - previousWristX_) / averageScale;
+            const float stepY = (wrist.y - previousWristY_) / averageScale;
+            if (std::isfinite(stepX) && std::isfinite(stepY))
+            {
+                topology.translationStepX = stepX;
+                topology.translationStepY = stepY;
+                const float seconds = timestampUs > previousTopologyTimestampUs_
+                    ? static_cast<float>(
+                        timestampUs - previousTopologyTimestampUs_) * 1.0e-6F
+                    : 0.0F;
+                topology.palmVelocity =
+                    std::hypot(stepX, stepY) / (std::max)(seconds, 1.0e-3F);
+            }
+        }
+
+        topology.valid = std::isfinite(topology.signedPalmArea)
+            && std::isfinite(topology.palmCompression)
+            && std::isfinite(topology.palmDepthRange)
+            && std::isfinite(topology.boundingBoxAspect)
+            && std::isfinite(topology.boundingBoxArea)
+            && std::isfinite(topology.handScale)
+            && std::isfinite(topology.centerX)
+            && std::isfinite(topology.centerY)
+            && std::isfinite(topology.palmAxisRadians)
+            && std::isfinite(topology.translationStepX)
+            && std::isfinite(topology.translationStepY);
+
+        if (topology.valid)
+        {
+            previousWristX_ = wrist.x;
+            previousWristY_ = wrist.y;
+            previousImageHandScale_ = imageHandScale;
+            previousTopologyTimestampUs_ = timestampUs;
+            hasPreviousTopology_ = true;
+        }
+        else
+        {
+            resetTopologyContinuity();
+        }
+    }
+    else
+    {
+        resetTopologyContinuity();
     }
 
     if (uprightWidth > 0 && uprightHeight > 0)
@@ -140,7 +277,7 @@ HandMeasurementFrame HandMeasurementExtractor::extract(
     if (!worldValid)
     {
         result.quality = HandMeasurementQuality::InvalidLandmarks;
-        reset();
+        resetWorldContinuity();
         return frame;
     }
 
@@ -150,7 +287,7 @@ HandMeasurementFrame HandMeasurementExtractor::extract(
     if (!std::isfinite(result.palmScale) || result.palmScale <= 1.0e-5F)
     {
         result.quality = HandMeasurementQuality::DegeneratePalm;
-        reset();
+        resetWorldContinuity();
         return frame;
     }
 
@@ -168,7 +305,7 @@ HandMeasurementFrame HandMeasurementExtractor::extract(
     if (!normalize(subtract(points[5], points[17]), result.palmXAxis))
     {
         result.quality = HandMeasurementQuality::DegeneratePalm;
-        reset();
+        resetWorldContinuity();
         return frame;
     }
     const Vector3 wristToMiddle = subtract(points[9], points[0]);
@@ -178,7 +315,7 @@ HandMeasurementFrame HandMeasurementExtractor::extract(
         || !normalize(cross(result.palmXAxis, result.palmYAxis), result.palmZAxis))
     {
         result.quality = HandMeasurementQuality::DegeneratePalm;
-        reset();
+        resetWorldContinuity();
         return frame;
     }
 
@@ -250,9 +387,24 @@ HandMeasurementFrame HandMeasurementExtractor::extract(
 
 void HandMeasurementExtractor::reset() noexcept
 {
+    resetWorldContinuity();
+    resetTopologyContinuity();
+}
+
+void HandMeasurementExtractor::resetWorldContinuity() noexcept
+{
     previousPalmPosition_ = {};
     previousTimestampUs_ = 0;
     previousPalmScale_ = 0.0F;
     hasPreviousFrame_ = false;
+}
+
+void HandMeasurementExtractor::resetTopologyContinuity() noexcept
+{
+    previousWristX_ = 0.0F;
+    previousWristY_ = 0.0F;
+    previousImageHandScale_ = 0.0F;
+    previousTopologyTimestampUs_ = 0;
+    hasPreviousTopology_ = false;
 }
 }

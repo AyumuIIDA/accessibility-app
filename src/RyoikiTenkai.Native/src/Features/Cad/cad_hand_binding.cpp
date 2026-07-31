@@ -12,6 +12,10 @@ constexpr float kMinimumSensitivity = 0.25F;
 constexpr float kMaximumSensitivity = 2.0F;
 constexpr float kRotationFitLimit = 0.35F;
 constexpr float kDeadZoneRadians = 0.020F;
+// Monocular world-landmark depth systematically under-represents rotation
+// around the palm X axis in the current camera/model path. Keep this as an
+// application-level control gain after filtering and dead-zone handling.
+constexpr float kPitchAxisGain = 1.60F;
 
 bool finiteRotation(const CadHandInput& input) noexcept
 {
@@ -97,16 +101,10 @@ CadHandBindingOutput CadHandBinding::update(
         presentation::HandPresentationTransform::fromMode(presentationMode);
     if (mode == HandInteractionMode::None)
     {
-        mustRelease_ = false;
         end();
         output.state = input.handPresent
             ? HandInteractionState::Ready
             : HandInteractionState::Inactive;
-        return output;
-    }
-    if (mustRelease_)
-    {
-        output.state = HandInteractionState::AwaitingRelease;
         return output;
     }
 
@@ -136,9 +134,12 @@ CadHandBindingOutput CadHandBinding::update(
             output.state = HandInteractionState::Suspended;
             return output;
         }
+        // The clutch is still held, so the interaction has not been abandoned.
+        // Drop the active session and let the next valid measurement re-zero
+        // every reference. Resuming against the pre-gap reference is what would
+        // snap the view, not the gap itself.
         end();
-        mustRelease_ = true;
-        output.state = HandInteractionState::AwaitingRelease;
+        output.state = HandInteractionState::Suspended;
         return output;
     }
     missingSince_ = {};
@@ -160,6 +161,10 @@ CadHandBindingOutput CadHandBinding::update(
             rotationSensitivity, kMinimumSensitivity, kMaximumSensitivity);
         activeMode_ = mode;
         active_ = true;
+        // The view and screen references are re-zeroed above. Ask the runtime
+        // for a matching palm rotation reference so the first applied rotation
+        // starts from identity instead of the pre-gap accumulated angle.
+        output.referenceCaptureRequested = true;
         output.state = activeState(mode);
         return output;
     }
@@ -202,6 +207,7 @@ CadHandBindingOutput CadHandBinding::update(
     float pitchDelta = -rotationX;
     if (std::abs(yawDelta) < kDeadZoneRadians) yawDelta = 0.0F;
     if (std::abs(pitchDelta) < kDeadZoneRadians) pitchDelta = 0.0F;
+    pitchDelta *= kPitchAxisGain;
     yawDelta *= capturedRotationSensitivity_;
     pitchDelta *= capturedRotationSensitivity_;
 

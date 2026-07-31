@@ -1,5 +1,6 @@
 #pragma once
 
+#include "HandInput/Measurements/hand_topology_history.h"
 #include "HandPerception/MediaPipeGraph/hand_landmark_graph.h"
 
 #include <array>
@@ -60,6 +61,7 @@ struct HandMeasurementFrame
 {
     HandMeasurements hand{};
     ScreenPalmMeasurement screenPalm{};
+    HandTopologyMeasurement topology{};
 };
 
 class HandMeasurementExtractor final
@@ -75,9 +77,20 @@ public:
     void reset() noexcept;
 
 private:
+    // World-landmark continuity backs the metric-scale linear speed. Image
+    // topology continuity is separate because a degenerate world palm does not
+    // invalidate the image-space trajectory.
+    void resetWorldContinuity() noexcept;
+    void resetTopologyContinuity() noexcept;
+
     HandMeasurementVector3 previousPalmPosition_{};
     std::uint64_t previousTimestampUs_{0};
     float previousPalmScale_{0.0F};
     bool hasPreviousFrame_{false};
+    float previousWristX_{0.0F};
+    float previousWristY_{0.0F};
+    float previousImageHandScale_{0.0F};
+    std::uint64_t previousTopologyTimestampUs_{0};
+    bool hasPreviousTopology_{false};
 };
 }

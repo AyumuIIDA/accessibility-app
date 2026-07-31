@@ -22,7 +22,9 @@ public:
         HandInteractionMode mode,
         presentation::HandPresentationMode presentationMode,
         float rotationSensitivity) noexcept;
-    void process(const CadHandInput& input) noexcept;
+    // Returns true when the interaction (re)activated and the caller must
+    // capture a fresh palm rotation reference before the next frame.
+    [[nodiscard]] bool process(const CadHandInput& input) noexcept;
     [[nodiscard]] bool copyLatest(
         RyoikiCadHandInteractionResult& result) const noexcept;
     void detach() noexcept;

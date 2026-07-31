@@ -6,6 +6,9 @@
 #include "Pipeline/perception_mailbox.h"
 #include "Rendering/latest_render_packet_slot.h"
 #include "Rendering/frame_transforms.h"
+#include "Rendering/gesture_dtw_debug_layout.h"
+#include "Rendering/gesture_dtw_debug_render_packet.h"
+#include "Rendering/gesture_dtw_debug_source.h"
 #include "Rendering/hand_3d_plot.h"
 #include "Runtime/camera_device_selection.h"
 #include "Runtime/frame_orientation.h"
@@ -482,6 +485,101 @@ void testLatestRenderPacketKeepsFrameAndMetadataTogether()
     require(!slot.snapshot().has_value(), "Render packet slot clear retained a packet.");
 }
 
+void testGestureDtwDebugRenderPacketValidation()
+{
+    using namespace ryoiki::rendering;
+    GestureDtwDebugRenderPacket packet{};
+    packet.candidateFrameCount = 2;
+    packet.templateFrameCount = 2;
+    packet.pathCount = 3;
+    packet.confidence = 0.82F;
+    packet.candidateFrames[1].timeOffsetMs = 100.0;
+    packet.templateFrames[1].timeOffsetMs = 120.0;
+    packet.path[0] = {0, 0};
+    packet.path[1] = {1, 0};
+    packet.path[2] = {1, 1};
+    require(validateGestureDtwDebugRenderPacket(packet),
+        "A valid bounded DTW render packet was rejected.");
+
+    auto invalid = packet;
+    invalid.path[2] = {0, 1};
+    require(!validateGestureDtwDebugRenderPacket(invalid),
+        "A backwards DTW path was accepted.");
+    invalid = packet;
+    invalid.path[2] = {2, 1};
+    require(!validateGestureDtwDebugRenderPacket(invalid),
+        "An out-of-range DTW path index was accepted.");
+    invalid = packet;
+    invalid.candidateFrames[1].timeOffsetMs = -1.0;
+    require(!validateGestureDtwDebugRenderPacket(invalid),
+        "A negative sequence timestamp was accepted.");
+    invalid = packet;
+    invalid.templateFrames[0].landmarks[8].x = std::numeric_limits<float>::quiet_NaN();
+    require(!validateGestureDtwDebugRenderPacket(invalid),
+        "A non-finite skeleton landmark was accepted.");
+    invalid = packet;
+    invalid.candidateFrameCount = 0;
+    require(!validateGestureDtwDebugRenderPacket(invalid),
+        "A DTW path without candidate frames was accepted.");
+}
+
+void testGestureDtwDebugThreePaneLayout()
+{
+    using namespace ryoiki::rendering;
+    const auto layout = createGestureDtwDebugLayout(1200.0F, 800.0F);
+    require(layout.valid, "A normal DTW debug viewport did not produce a layout.");
+    requireNear(layout.candidate.width(), layout.templateView.width(), 0.0001F,
+        "Candidate and template panes were not equal width.");
+    requireNear(layout.candidate.top, layout.templateView.top, 0.0001F,
+        "Candidate and template panes were not aligned.");
+    require(layout.candidate.right < layout.templateView.left,
+        "Candidate and template panes have no gutter.");
+    require(layout.diagnostics.top > layout.candidate.bottom,
+        "Diagnostics pane overlaps the skeleton panes.");
+    requireNear(layout.diagnostics.left, layout.candidate.left, 0.0001F,
+        "Diagnostics pane did not span the content width.");
+    requireNear(layout.diagnostics.right, layout.templateView.right, 0.0001F,
+        "Diagnostics pane did not span the content width.");
+
+    require(!createGestureDtwDebugLayout(0.0F, 800.0F).valid,
+        "A zero-width viewport produced a layout.");
+    require(!createGestureDtwDebugLayout(20.0F, 20.0F).valid,
+        "A viewport smaller than padding produced a layout.");
+    require(!createGestureDtwDebugLayout(
+        std::numeric_limits<float>::quiet_NaN(), 800.0F).valid,
+        "A non-finite viewport produced a layout.");
+}
+
+void testGestureDtwDebugSourceIsLatestOnlyAndOwnsValues()
+{
+    using namespace ryoiki::rendering;
+    GestureDtwDebugSource source;
+    GestureDtwDebugRenderPacket read{};
+    std::uint64_t revision = 0;
+    require(!source.tryGet(read, revision), "A new DTW source was not empty.");
+    GestureDtwDebugRenderPacket packet{};
+    packet.frameId = 1;
+    source.publish(packet);
+    packet.frameId = 2;
+    packet.candidateFrames[0].palmCenterX = 8.0F;
+    source.publish(packet);
+    packet.candidateFrames[0].palmCenterX = 99.0F;
+    require(source.tryGet(read, revision) && read.frameId == 2
+            && read.candidateFrames[0].palmCenterX == 8.0F,
+        "The DTW source did not own and retain only its latest value.");
+    std::array<GestureDtwDebugPoint, kGestureDtwDebugLandmarkCount> live{};
+    live[0] = {10.0F, 20.0F, 1.0F};
+    source.publishLiveHand(9, live);
+    const auto historyLandmark = read.candidateFrames[0].landmarks[0];
+    require(source.tryGet(read, revision) && read.liveHandValid
+            && read.liveHandFrameId == 9 && read.liveLandmarks[0].x == 10.0F,
+        "The independent live hand was not published.");
+    require(read.candidateFrames[0].landmarks[0].x == historyLandmark.x,
+        "Publishing a live hand mutated the DTW candidate history.");
+    source.clear();
+    require(!source.tryGet(read, revision), "DTW source clear retained a packet.");
+}
+
 std::vector<std::uint8_t> createOrientationSource(const bool bottomUp)
 {
     constexpr std::size_t kStride = 12;
@@ -732,6 +830,9 @@ int main()
         testInvalidGeometryInputs();
         testUserFacingCameraSelection();
         testLatestRenderPacketKeepsFrameAndMetadataTogether();
+        testGestureDtwDebugRenderPacketValidation();
+        testGestureDtwDebugThreePaneLayout();
+        testGestureDtwDebugSourceIsLatestOnlyAndOwnsValues();
         testFrameOrientationNormalization();
         testFrameOrientationRemainsMetadataUntilSampling();
         testFrameTransformsShareOneViewportContract();

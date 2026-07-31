@@ -8,9 +8,14 @@
 #include "HandPerception/MediaPipeGraph/palm_detection_graph.h"
 #include "HandPerception/MediaPipeGraph/palm_detection_postprocessor.h"
 #include "HandPerception/MediaPipeGraph/palm_detection_to_roi.h"
+#include "ryoiki_native.h"
+
 #include "HandInput/Measurements/hand_measurement_extractor.h"
+#include "HandInput/Measurements/multi_hand_measurement_stage.h"
 #include "HandInput/Measurements/palm_basis_rotation_tracker.h"
 #include "HandInput/Measurements/palm_rotation_eskf.h"
+#include "HandInput/Measurements/palm_rotation_one_euro_filter.h"
+#include "HandInput/Measurements/rotation_observation_gate.h"
 #include "HandInput/Measurements/weighted_palm_rotation_tracker.h"
 #include "HandInput/Publication/latest_hand_state_slot.h"
 #include "HandInput/Publication/ordered_hand_event_ring.h"
@@ -425,7 +430,10 @@ public:
         }
 
         clearRawOutput(output);
-        setDetection(output, 0, 5.0F, 0.0F, 0.0F, 2.0F, 2.0F);
+        for (const auto anchorIndex : detectionAnchorIndices)
+        {
+            setDetection(output, anchorIndex, 5.0F, 0.0F, 0.0F, 2.0F, 2.0F);
+        }
         result.inferenceMs = 12.5;
         error.clear();
         return true;
@@ -435,6 +443,7 @@ public:
     bool receivedExpectedShape{false};
     std::size_t runCallCount{0};
     std::vector<std::size_t> failOnCalls;
+    std::vector<std::size_t> detectionAnchorIndices{0};
 
 private:
     bool succeeds_{false};
@@ -509,6 +518,15 @@ ryoiki::hand_perception::HandLandmarkRawOutput createTrackedHandOutput(const flo
     return output;
 }
 
+ryoiki::hand_perception::HandLandmarkRawOutput createTrackedHandOutput(
+    const float presence,
+    const float handedness)
+{
+    auto output = createTrackedHandOutput(presence);
+    output.handedness = handedness;
+    return output;
+}
+
 void testHandPerceptionTrackingAndPalmFallback()
 {
     auto palmRunner = std::make_unique<FakePalmDetectionRunner>(true);
@@ -537,6 +555,9 @@ void testHandPerceptionTrackingAndPalmFallback()
         "Initial frame did not use palm detection and establish a hand.");
     require(palmObserver->runCallCount == 1 && handObserver->runCallCount == 1,
         "Initial frame invoked an incorrect model runner sequence.");
+    const auto initialTrackId = result.trackIds[0];
+    require(initialTrackId != 0,
+        "Initial palm-to-hand perception did not assign a track ID.");
 
     require(graph.process(frame, result, metrics, error),
         "Tracked hand perception frame failed.");
@@ -551,6 +572,8 @@ void testHandPerceptionTrackingAndPalmFallback()
         "Frame after a tracking miss did not fall back to palm detection.");
     require(palmObserver->runCallCount == 2 && handObserver->runCallCount == 3,
         "Palm fallback invoked an incorrect model runner sequence.");
+    require(result.trackIds[0] == initialTrackId,
+        "Palm fallback replaced the temporarily lost hand's track ID.");
 }
 
 void testCalibrationPalmProbeKeepsTrackedRoi()
@@ -583,6 +606,123 @@ void testCalibrationPalmProbeKeepsTrackedRoi()
         "Periodic calibration palm probe did not invoke both model runners.");
     require(metrics.palm.inferenceMs == 12.5,
         "Calibration palm probe timing was not exposed in graph metrics.");
+}
+
+void testHandPerceptionTracksTwoHandsWithSequentialInference()
+{
+    auto palmRunner = std::make_unique<FakePalmDetectionRunner>(true);
+    auto* palmObserver = palmRunner.get();
+    palmObserver->detectionAnchorIndices = {0, 200};
+    auto handRunner = std::make_unique<FakeHandLandmarkRunner>();
+    auto* handObserver = handRunner.get();
+    handObserver->rawOutput = createTrackedHandOutput(0.8F);
+
+    ryoiki::hand_perception::HandPerceptionGraph graph{
+        std::move(palmRunner),
+        std::move(handRunner)};
+    const auto frame = createFrame();
+    ryoiki::hand_perception::HandPerceptionResult result;
+    ryoiki::hand_perception::HandPerceptionGraphMetrics metrics{};
+    std::string error;
+
+    require(graph.process(frame, result, metrics, error),
+        "Two-hand palm discovery failed.");
+    require(result.handCount == 2 && result.hand.detected,
+        "Two-hand palm discovery did not publish both hands and a primary hand.");
+    require(handObserver->runCallCount == 2,
+        "Two-hand discovery did not run landmark inference once per hand.");
+    require(result.trackIds[0] != 0
+            && result.trackIds[1] != 0
+            && result.trackIds[0] != result.trackIds[1],
+        "Two-hand discovery did not assign distinct track IDs.");
+    const auto firstTrackIds = result.trackIds;
+
+    require(graph.process(frame, result, metrics, error),
+        "Two-hand ROI tracking failed.");
+    require(result.usedTracking && result.handCount == 2,
+        "Two-hand ROI tracking did not retain both hands.");
+    require(palmObserver->runCallCount == 1 && handObserver->runCallCount == 4,
+        "Two-hand tracking did not use sequential landmark-only inference.");
+    require(result.trackIds[0] == firstTrackIds[0]
+            && result.trackIds[1] == firstTrackIds[1],
+        "Two-hand ROI tracking did not preserve track IDs.");
+}
+
+void testHandPerceptionUsesReliableHandednessAcrossPositionConflict()
+{
+    auto palmRunner = std::make_unique<FakePalmDetectionRunner>(true);
+    auto* palmObserver = palmRunner.get();
+    palmObserver->detectionAnchorIndices = {0, 200};
+    auto handRunner = std::make_unique<FakeHandLandmarkRunner>();
+    auto* handObserver = handRunner.get();
+    handObserver->outputs = {
+        createTrackedHandOutput(0.8F, 0.05F),
+        createTrackedHandOutput(0.8F, 0.95F),
+        createTrackedHandOutput(0.8F, 0.95F),
+        createTrackedHandOutput(0.8F, 0.05F)};
+
+    ryoiki::hand_perception::HandPerceptionGraph graph{
+        std::move(palmRunner), std::move(handRunner)};
+    const auto frame = createFrame();
+    ryoiki::hand_perception::HandPerceptionResult result;
+    ryoiki::hand_perception::HandPerceptionGraphMetrics metrics{};
+    std::string error;
+
+    require(graph.process(frame, result, metrics, error)
+            && result.handCount == 2,
+        "Reliable-handedness test could not establish both tracks.");
+    const auto lowHandednessTrackId = result.trackIds[0];
+    const auto highHandednessTrackId = result.trackIds[1];
+    require(result.hands[0].handedness <= 0.20F
+            && result.hands[1].handedness >= 0.80F,
+        "Reliable-handedness test did not establish complementary identities.");
+
+    require(graph.process(frame, result, metrics, error)
+            && result.handCount == 2,
+        "Reliable-handedness conflict frame failed.");
+    require(result.trackIds[0] == lowHandednessTrackId
+            && result.hands[0].handedness <= 0.20F,
+        "Strong position/source evidence replaced the low-handedness identity.");
+    require(result.trackIds[1] == highHandednessTrackId
+            && result.hands[1].handedness >= 0.80F,
+        "Strong position/source evidence replaced the high-handedness identity.");
+}
+
+void testHandPerceptionReacquiresOneOfTwoTracksWithoutReplacingItsId()
+{
+    auto palmRunner = std::make_unique<FakePalmDetectionRunner>(true);
+    auto* palmObserver = palmRunner.get();
+    palmObserver->detectionAnchorIndices = {0, 200};
+    auto handRunner = std::make_unique<FakeHandLandmarkRunner>();
+    auto* handObserver = handRunner.get();
+    handObserver->outputs = {
+        createTrackedHandOutput(0.8F),
+        createTrackedHandOutput(0.8F),
+        createTrackedHandOutput(0.8F),
+        createTrackedHandOutput(0.49F),
+        createTrackedHandOutput(0.8F)};
+
+    ryoiki::hand_perception::HandPerceptionGraph graph{
+        std::move(palmRunner), std::move(handRunner)};
+    const auto frame = createFrame();
+    ryoiki::hand_perception::HandPerceptionResult result;
+    ryoiki::hand_perception::HandPerceptionGraphMetrics metrics{};
+    std::string error;
+
+    require(graph.process(frame, result, metrics, error)
+            && result.handCount == 2,
+        "Two-track reacquisition test could not establish both tracks.");
+    const auto initialTrackIds = result.trackIds;
+
+    require(graph.process(frame, result, metrics, error)
+            && result.handCount == 2,
+        "Collision-mode palm rediscovery did not restore the missing track.");
+    require(result.trackIds[0] == initialTrackIds[0]
+            && result.trackIds[1] == initialTrackIds[1],
+        "Palm rediscovery replaced or swapped an existing track ID.");
+    require(palmObserver->runCallCount == 2
+            && handObserver->runCallCount == 5,
+        "Two-track reacquisition invoked an incorrect model sequence.");
 }
 
 void testHandPerceptionContinuesAfterSingleFrameRunnerFailures()
@@ -675,6 +815,9 @@ void testHandMeasurementExtractorCanonicalization()
         "Hand-state extractor rejected a valid open hand.");
     require(firstFrame.screenPalm.valid,
         "Hand-state extractor rejected a valid screen palm measurement.");
+    require(firstFrame.topology.valid
+            && firstFrame.topology.fingerStateMask == 0b1'1111U,
+        "Gesture topology extraction did not identify the open hand.");
     requireNear(first.palmPosition.x, 0.12F, 1.0e-6F,
         "Palm position was not the wrist/MCP centroid.");
     requireNear(first.palmPosition.y, 0.656F, 1.0e-6F,
@@ -735,6 +878,352 @@ void testHandMeasurementExtractorCanonicalization()
     require(!noCoordinateFallback.present
             && noCoordinateFallback.quality == HandMeasurementQuality::InvalidLandmarks,
         "World measurement silently changed to image coordinates.");
+}
+
+void testHandTopologyHistorySummarizesAndBounds()
+{
+    using namespace ryoiki::hand_input::measurements;
+    HandTopologyHistory history;
+    HandTopologyMeasurement first{};
+    first.frameId = 10;
+    first.timestampUs = 1'000'000;
+    first.fingerStraightness.fill(0.9F);
+    first.fingerStateMask = 0b1'1111U;
+    first.signedPalmArea = 0.08F;
+    first.palmCompression = 1.0F;
+    first.palmDepthRange = 0.1F;
+    first.handScale = 0.10F;
+    first.centerX = 0.30F;
+    first.centerY = 0.40F;
+    first.valid = true;
+    history.push(first);
+
+    auto middle = first;
+    middle.frameId = 11;
+    middle.timestampUs = 1'033'333;
+    middle.fingerStraightness.fill(0.45F);
+    middle.fingerStateMask = 0b0'0011U;
+    middle.signedPalmArea = 0.0F;
+    middle.palmCompression = 0.35F;
+    middle.palmDepthRange = 0.45F;
+    middle.handScale = 0.13F;
+    middle.centerX = 0.40F;
+    middle.translationStepX = 0.10F;
+    history.push(middle);
+
+    auto last = middle;
+    last.frameId = 12;
+    last.timestampUs = 1'066'666;
+    last.fingerStraightness.fill(0.1F);
+    last.fingerStateMask = 0;
+    last.signedPalmArea = -0.07F;
+    last.palmCompression = 0.95F;
+    last.palmDepthRange = 0.2F;
+    last.handScale = 0.15F;
+    last.centerX = 0.55F;
+    last.centerY = 0.35F;
+    last.translationStepX = 0.15F;
+    last.translationStepY = -0.05F;
+    history.push(last);
+
+    const auto summary = history.summarize();
+    require(summary.valid && summary.sampleCount == 3,
+        "Topology history did not summarize all valid samples.");
+    require(summary.startFingerStateMask == 0b1'1111U
+            && summary.endFingerStateMask == 0
+            && summary.fingerStateTransitionCount == 5,
+        "Topology history did not retain finger-state transitions.");
+    require(summary.fingerStraightnessRangeMax > 0.79F
+            && summary.palmCompressionDrop > 0.64F
+            && summary.palmDepthRangeMax == 0.45F,
+        "Topology history did not retain finger or palm-turn evidence.");
+    require(summary.signedPalmAreaRange > 0.14F
+            && summary.translationDeltaX > 0.24F
+            && summary.handScaleRatioDelta > 0.49F,
+        "Topology history did not retain palm, translation, or scale change.");
+
+    for (std::size_t index = 0;
+        index < kHandTopologyHistoryCapacity + 5;
+        ++index)
+    {
+        last.frameId++;
+        // Keep the synthetic sequence inside the 2600 ms rolling window so
+        // this assertion exercises the fixed-capacity bound specifically.
+        last.timestampUs += 10'000;
+        history.push(last);
+    }
+    require(history.size() == kHandTopologyHistoryCapacity,
+        "Topology history exceeded its fixed capacity.");
+
+    // A single missing observation is within the grace window and must not
+    // discard the segment; only exceeding the tolerance should reset it.
+    HandTopologyMeasurement invalid{};
+    history.push(invalid);
+    require(history.size() == kHandTopologyHistoryCapacity,
+        "A single missing observation incorrectly broke the temporal segment.");
+    for (std::uint32_t index = 0;
+        index < kHandTopologyGapToleranceFrames;
+        ++index)
+    {
+        history.push(invalid);
+    }
+    require(history.size() == 0 && !history.summarize().valid,
+        "Exceeding the gap tolerance did not reset the temporal segment.");
+}
+
+void testHandTopologyHistoryTolerateShortGapAndAccumulatePath()
+{
+    using namespace ryoiki::hand_input::measurements;
+    HandTopologyHistory history;
+
+    // Three samples that move away from the origin and then back to it. A
+    // correct accumulator reports the traveled path length, not the (near
+    // zero) net displacement between the first and last sample.
+    HandTopologyMeasurement start{};
+    start.frameId = 1;
+    start.timestampUs = 0;
+    start.valid = true;
+    history.push(start);
+
+    HandTopologyMeasurement outbound{};
+    outbound.frameId = 2;
+    outbound.timestampUs = 33'333;
+    outbound.translationStepX = 0.30F;
+    outbound.translationStepY = 0.0F;
+    outbound.valid = true;
+    history.push(outbound);
+
+    HandTopologyMeasurement returned{};
+    returned.frameId = 3;
+    returned.timestampUs = 66'666;
+    returned.translationStepX = -0.30F;
+    returned.translationStepY = 0.0F;
+    returned.valid = true;
+    history.push(returned);
+
+    const auto roundTripSummary = history.summarize();
+    require(roundTripSummary.valid, "Round-trip topology summary was invalid.");
+    requireNear(roundTripSummary.palmTravel, 0.60F, 1.0e-4F,
+        "Accumulated palm travel did not sum per-step path length.");
+    requireNear(roundTripSummary.translationDistance, 0.0F, 1.0e-4F,
+        "Net translation distance should cancel for a round trip.");
+    require(roundTripSummary.palmTravel > roundTripSummary.translationDistance,
+        "Palm travel must exceed endpoint distance for a non-monotonic path.");
+
+    // Missing observations up to the tolerance keep the segment (and its
+    // sample count) intact; the next valid sample continues the same
+    // segment instead of starting a new one.
+    require(history.size() == 3,
+        "Setup for the gap-tolerance check lost samples unexpectedly.");
+    for (std::uint32_t index = 0;
+        index < kHandTopologyGapToleranceFrames;
+        ++index)
+    {
+        history.noteMissingObservation();
+        require(history.size() == 3,
+            "A within-tolerance gap discarded the retained segment.");
+    }
+    require(history.missingObservationCount() == kHandTopologyGapToleranceFrames,
+        "Gap counter did not track consecutive missing observations.");
+
+    HandTopologyMeasurement continued{};
+    continued.frameId = 4;
+    continued.timestampUs = 500'000;
+    continued.valid = true;
+    history.push(continued);
+    require(history.size() == 4 && history.missingObservationCount() == 0,
+        "A valid sample after a short gap did not continue the same segment.");
+
+    // One more missing observation than the tolerance allows must discard
+    // the segment entirely, mirroring the perception graph's own
+    // missing-track grace window.
+    for (std::uint32_t index = 0;
+        index <= kHandTopologyGapToleranceFrames;
+        ++index)
+    {
+        history.noteMissingObservation();
+    }
+    require(history.size() == 0 && !history.summarize().valid,
+        "Exceeding the missing-track grace window did not reset the segment.");
+}
+
+void testHandTopologyHistoryPrunesToRollingTimeWindow()
+{
+    using namespace ryoiki::hand_input::measurements;
+    HandTopologyHistory history;
+
+    // At a 60 FPS-equivalent 16.66 ms cadence the 2600 ms window elapses
+    // long before the 192-sample capacity does, so the oldest samples must
+    // be evicted by elapsed time, not only by the fixed-size ring buffer.
+    constexpr std::uint64_t kFrameIntervalUs = 16'666;
+    constexpr std::size_t kFrameCount = 220;
+    for (std::size_t index = 0; index < kFrameCount; ++index)
+    {
+        HandTopologyMeasurement sample{};
+        sample.frameId = index;
+        sample.timestampUs = index * kFrameIntervalUs;
+        sample.valid = true;
+        history.push(sample);
+    }
+
+    require(history.size() < kHandTopologyHistoryCapacity,
+        "Time-based pruning did not evict samples before capacity was reached.");
+    const auto summary = history.summarize();
+    require(summary.valid, "Time-windowed topology summary was invalid.");
+    require(summary.durationUs <= kHandTopologyWindowUs,
+        "Retained topology history exceeded the 2600 ms rolling window.");
+    require(summary.lastFrameId == kFrameCount - 1,
+        "Time-based pruning discarded the newest sample.");
+}
+
+void testMultiHandRelationOrderingIsDeterministic()
+{
+    using ryoiki::hand_input::measurements::MultiHandMeasurementStage;
+    using ryoiki::hand_input::measurements::TwoHandOrdering;
+
+    // Identical geometry for both cases below: hands[0] (track 5) sits to
+    // the right of hands[1] (track 9). Only the filtered handedness gap
+    // differs, so any ordering difference is attributable to it alone.
+    const auto buildObservations = [](const float handedness0, const float handedness1)
+    {
+        ryoiki::hand_perception::HandPerceptionResult observations{};
+        observations.handCount = 2;
+        observations.trackIds = {5, 9};
+        observations.filteredHandedness = {handedness0, handedness1};
+        observations.hands[0] = createOpenHandStateTestInput();
+        observations.hands[1] = createOpenHandStateTestInput();
+        for (auto& landmark : observations.hands[0].landmarks)
+        {
+            landmark.x += 500.0F;
+        }
+        for (auto& landmark : observations.hands[1].landmarks)
+        {
+            landmark.x += 100.0F;
+        }
+        return observations;
+    };
+
+    // Reliable handedness gap (>= kReliableHandednessGap), deliberately
+    // opposite to screen position: the lower-handedness hand (track 5) is
+    // on the right. Ordering must still follow handedness, not position.
+    {
+        auto observations = buildObservations(0.10F, 0.90F);
+        MultiHandMeasurementStage stage;
+        const auto frame = stage.extract(observations, 1, 1'000'000, 640, 480);
+        require(frame.relation.valid && frame.relation.ordering == TwoHandOrdering::Handedness,
+            "A reliable handedness gap did not select handedness ordering.");
+        require(frame.relation.firstTrackId == 5 && frame.relation.secondTrackId == 9,
+            "Handedness ordering did not place the lower handedness hand first.");
+        require(frame.relation.deltaX < 0.0F,
+            "Handedness ordering did not override the conflicting screen-space delta sign.");
+    }
+
+    // Ambiguous handedness gap (< kReliableHandednessGap) with the same
+    // geometry: ordering must fall back to screen position (leftmost
+    // first), flipping both the track order and the delta sign versus the
+    // handedness-reliable case above.
+    {
+        auto observations = buildObservations(0.52F, 0.50F);
+        MultiHandMeasurementStage stage;
+        const auto frame = stage.extract(observations, 1, 1'000'000, 640, 480);
+        require(frame.relation.valid
+                && frame.relation.ordering == TwoHandOrdering::ScreenPosition,
+            "An ambiguous handedness gap did not fall back to screen-position ordering.");
+        require(frame.relation.firstTrackId == 9 && frame.relation.secondTrackId == 5,
+            "Screen-position ordering did not place the leftmost hand first.");
+        require(frame.relation.deltaX > 0.0F,
+            "Screen-position ordering produced a non-positive delta for the rightmost second hand.");
+    }
+}
+
+void testMultiHandMeasurementStageKeepsPerTrackHistory()
+{
+    using ryoiki::hand_input::measurements::MultiHandMeasurementStage;
+    ryoiki::hand_perception::HandPerceptionResult observations{};
+    observations.handCount = 2;
+    observations.trackIds = {41, 84};
+    observations.hands[0] = createOpenHandStateTestInput();
+    observations.hands[1] = createOpenHandStateTestInput();
+    for (auto& landmark : observations.hands[0].landmarks)
+    {
+        landmark.x = landmark.x * 40.0F + 160.0F;
+        landmark.y = landmark.y * 40.0F + 120.0F;
+        landmark.z *= 40.0F;
+    }
+    for (auto& landmark : observations.hands[1].landmarks)
+    {
+        landmark.x = landmark.x * 40.0F + 480.0F;
+        landmark.y = landmark.y * 40.0F + 120.0F;
+        landmark.z *= 40.0F;
+    }
+
+    MultiHandMeasurementStage stage;
+    const auto first = stage.extract(
+        observations, 1, 1'000'000, 640, 480);
+    require(first.handCount == 2 && first.relation.valid,
+        "Multi-hand measurement stage did not produce a two-hand relation.");
+    require(first.hands[0].trackId == 41 && first.hands[1].trackId == 84,
+        "Multi-hand measurement stage did not preserve track IDs.");
+    require(first.hands[0].topologySummary.sampleCount == 1
+            && first.hands[1].topologySummary.sampleCount == 1,
+        "Multi-hand measurement stage did not start independent topology histories.");
+    requireNear(first.relation.deltaX, 320.0F / 37.6F, 0.02F,
+        "Two-hand palm-axis-normalized separation is incorrect.");
+
+    std::swap(observations.hands[0], observations.hands[1]);
+    std::swap(observations.trackIds[0], observations.trackIds[1]);
+    const auto second = stage.extract(
+        observations, 2, 1'033'333, 640, 480);
+    require(second.hands[0].trackId == 84 && second.hands[1].trackId == 41,
+        "Multi-hand measurement stage reordered track identities.");
+    require(second.hands[0].topologySummary.sampleCount == 2
+            && second.hands[1].topologySummary.sampleCount == 2,
+        "Track-ID reordering reset or mixed topology histories.");
+    require(second.hands[0].hand.linearSpeed < 0.001F
+            && second.hands[1].hand.linearSpeed < 0.001F,
+        "Per-hand temporal measurement history leaked between track IDs.");
+
+    observations.handCount = 1;
+    static_cast<void>(stage.extract(
+        observations, 3, 1'066'666, 640, 480));
+    observations.handCount = 2;
+    const auto afterMissing = stage.extract(
+        observations, 4, 1'099'999, 640, 480);
+    require(afterMissing.hands[0].topologySummary.sampleCount == 4
+            && afterMissing.hands[1].topologySummary.sampleCount == 3,
+        "A one-frame hand gap did not preserve both per-track topology segments.");
+}
+
+void testRyoikiHandTopologyAbiStructSizesAreBlittable()
+{
+    // These mirror the static_asserts in ryoiki_native.h/.cpp. Duplicating
+    // them as a runtime-visible test keeps the C ABI's blittable contract
+    // with NativeVisionInterop.cs (managed [StructLayout(Sequential)]
+    // mirrors) from silently drifting when a field is added or reordered.
+    static_assert(sizeof(RyoikiHandTopologySummary) == 136,
+        "RyoikiHandTopologySummary size no longer matches the documented ABI.");
+    static_assert(sizeof(RyoikiTwoHandRelation) == 40,
+        "RyoikiTwoHandRelation size no longer matches the documented ABI.");
+    static_assert(sizeof(RyoikiHandTopologySnapshot) == 344,
+        "RyoikiHandTopologySnapshot size no longer matches the documented ABI.");
+    static_assert(
+        sizeof(RyoikiHandTopologySnapshot)
+            == 2 * sizeof(std::uint32_t)
+                + 2 * sizeof(std::uint64_t)
+                + 2 * sizeof(std::uint32_t)
+                + kRyoikiMaxHands * sizeof(RyoikiHandTopologySummary)
+                + sizeof(RyoikiTwoHandRelation),
+        "RyoikiHandTopologySnapshot layout no longer matches its documented header/body shape.");
+
+    require(kRyoikiAbiVersion >= 21,
+        "ABI version was not advanced for the hand topology snapshot export.");
+
+    RyoikiHandTopologySnapshot snapshot{};
+    snapshot.abi_version = kRyoikiAbiVersion;
+    snapshot.struct_size = static_cast<std::uint32_t>(sizeof(RyoikiHandTopologySnapshot));
+    require(snapshot.abi_version == kRyoikiAbiVersion
+            && snapshot.struct_size == sizeof(RyoikiHandTopologySnapshot),
+        "RyoikiHandTopologySnapshot did not round-trip its own ABI/struct-size fields.");
 }
 
 void testWeightedPalmRotationTracker()
@@ -935,6 +1424,393 @@ void testPalmBasisRotationMatchesRigidLandmarkRotation()
     }
 }
 
+void testPalmRotationOneEuroSuppressesJitterWithLowLag()
+{
+    using ryoiki::hand_input::measurements::PalmRotationEstimate;
+    using ryoiki::hand_input::measurements::PalmRotationOneEuroFilter;
+    const auto observation = [](const float angle)
+    {
+        PalmRotationEstimate value{};
+        const float cosine = std::cos(angle);
+        const float sine = std::sin(angle);
+        value.rotation = {
+            cosine, 0.0F, -sine,
+            0.0F, 1.0F, 0.0F,
+            sine, 0.0F, cosine};
+        value.valid = true;
+        return value;
+    };
+    const auto yaw = [](const PalmRotationEstimate& value)
+    {
+        return std::atan2(value.rotation[6], value.rotation[0]);
+    };
+
+    PalmRotationOneEuroFilter stationary;
+    std::uint64_t timestamp = 1'000'000;
+    static_cast<void>(stationary.update(observation(0.0F), timestamp));
+    float rawMagnitude = 0.0F;
+    float filteredMagnitude = 0.0F;
+    for (std::size_t frame = 1; frame <= 40; ++frame)
+    {
+        timestamp += 33'333;
+        const float angle = frame % 2 == 0 ? 0.035F : -0.035F;
+        const auto filtered = stationary.update(observation(angle), timestamp);
+        rawMagnitude += std::abs(angle);
+        filteredMagnitude += std::abs(yaw(filtered));
+    }
+    // Tightened when the cutoff pair was derived from recorded speeds. The
+    // previous 0.65 bound also passed with a filter whose speed term never
+    // engaged, so it could not detect that regression.
+    require(filteredMagnitude < rawMagnitude * 0.45F,
+        "Palm One Euro filter did not suppress stationary angular jitter.");
+
+    PalmRotationOneEuroFilter moving;
+    timestamp = 2'000'000;
+    static_cast<void>(moving.update(observation(0.0F), timestamp));
+    PalmRotationEstimate filtered{};
+    constexpr float step = 0.012F;
+    for (std::size_t frame = 1; frame <= 60; ++frame)
+    {
+        timestamp += 33'333;
+        filtered = moving.update(
+            observation(step * static_cast<float>(frame)), timestamp);
+    }
+    requireNear(yaw(filtered), 60.0F * step, 0.035F,
+        "Palm One Euro filter introduced excessive lag during smooth motion.");
+}
+
+void testRotationObservationGateHoldsAndReacquiresContinuously()
+{
+    using ryoiki::hand_input::measurements::PalmRotationEstimate;
+    using ryoiki::hand_input::measurements::RotationObservationGate;
+    using ryoiki::hand_input::measurements::RotationObservationGateState;
+    const auto observation = [](const float angleDegrees)
+    {
+        const float angle =
+            angleDegrees * 3.14159265358979323846F / 180.0F;
+        const float cosine = std::cos(angle);
+        const float sine = std::sin(angle);
+        PalmRotationEstimate result{};
+        result.rotation = {
+            cosine, 0.0F, -sine,
+            0.0F, 1.0F, 0.0F,
+            sine, 0.0F, cosine};
+        result.valid = true;
+        return result;
+    };
+    const auto yawDegrees = [](const PalmRotationEstimate& value)
+    {
+        return std::atan2(value.rotation[6], value.rotation[0])
+            * 180.0F / 3.14159265358979323846F;
+    };
+
+    RotationObservationGate gate;
+    auto output = gate.update(observation(0.0F));
+    require(output.observation.valid
+            && output.state == RotationObservationGateState::Tracking,
+        "Rotation gate did not initialize into Tracking.");
+    output = gate.update(observation(60.0F));
+    require(output.observation.valid
+            && output.state == RotationObservationGateState::Tracking,
+        "Rotation gate rejected a valid 60-degree consecutive delta.");
+    requireNear(yawDegrees(output.observation), 60.0F, 1.0e-3F,
+        "Rotation gate changed a valid 60-degree observation.");
+
+    output = gate.update(observation(-60.0F));
+    require(!output.observation.valid
+            && output.rejection
+                == ryoiki::hand_input::measurements::
+                    RotationObservationRejection::AngularJump,
+        "Rotation gate published a greater-than-90-degree angular jump.");
+    require(output.state == RotationObservationGateState::Tracking
+            && output.outlierFrames == 1,
+        "Rotation gate abandoned its trajectory on the first outlier.");
+
+    // The implausible branch persists, so the trajectory really moved and the
+    // gate falls back to continuity-preserving recovery.
+    for (std::size_t frame = 2; frame <= 5; ++frame)
+    {
+        output = gate.update(observation(-60.0F));
+        require(output.state == RotationObservationGateState::Tracking
+                && output.outlierFrames == frame,
+            "Rotation gate left Tracking inside the outlier budget.");
+    }
+    output = gate.update(observation(-60.0F));
+    require(!output.observation.valid
+            && output.state == RotationObservationGateState::Holding,
+        "Rotation gate did not abandon a persistent implausible branch.");
+
+    output = gate.update(observation(-60.0F));
+    require(!output.observation.valid
+            && output.state == RotationObservationGateState::Reacquiring,
+        "Rotation gate did not begin a recovery candidate.");
+    output = gate.update(observation(-57.0F));
+    require(!output.observation.valid && output.stableCandidateFrames == 2,
+        "Rotation gate accepted a recovery candidate too early.");
+    output = gate.update(observation(-54.0F));
+    require(output.observation.valid && output.reacquired
+            && output.state == RotationObservationGateState::Tracking,
+        "Rotation gate did not accept a stable recovery sequence.");
+    requireNear(yawDegrees(output.observation), 66.0F, 1.0e-3F,
+        "Rotation gate did not rebase recovery onto the held output.");
+
+    output = gate.update(observation(-51.0F));
+    requireNear(yawDegrees(output.observation), 69.0F, 1.0e-3F,
+        "Rotation gate failed to preserve motion after reacquisition.");
+
+    // A missing inference breaks continuity before the next finite trajectory.
+    PalmRotationEstimate missing{};
+    output = gate.update(missing);
+    require(!output.observation.valid
+            && output.state == RotationObservationGateState::Holding,
+        "Rotation gate did not hold a missing inference.");
+    output = gate.update(observation(0.0F));
+    require(!output.observation.valid
+            && output.state == RotationObservationGateState::Reacquiring,
+        "Rotation gate did not begin inference-gap reacquisition.");
+    output = gate.update(observation(2.0F));
+    require(!output.observation.valid && output.stableCandidateFrames == 2,
+        "Rotation gate accepted an inference-gap candidate too early.");
+    output = gate.update(observation(4.0F));
+    require(output.observation.valid && output.reacquired,
+        "Rotation gate did not complete inference-gap reacquisition.");
+    requireNear(yawDegrees(output.observation), 73.0F, 1.0e-3F,
+        "Rotation gate introduced a discontinuity across an inference gap.");
+
+    // Explicit track-id rebinding follows the same path and does not depend on
+    // camera timestamps.
+    gate.beginReacquisition();
+    output = gate.update(observation(0.0F));
+    require(!output.observation.valid
+            && output.state == RotationObservationGateState::Reacquiring,
+        "Rotation gate did not begin an explicit track handoff.");
+    output = gate.update(observation(2.0F));
+    output = gate.update(observation(4.0F));
+    require(output.observation.valid && output.reacquired,
+        "Rotation gate did not complete an explicit track handoff.");
+    requireNear(yawDegrees(output.observation), 77.0F, 1.0e-3F,
+        "Rotation gate introduced a discontinuity during track handoff.");
+}
+
+void testRotationObservationGateAbsorbsTransientFlips()
+{
+    using ryoiki::hand_input::measurements::PalmRotationEstimate;
+    using ryoiki::hand_input::measurements::RotationObservationGate;
+    using ryoiki::hand_input::measurements::RotationObservationGateState;
+    const auto observation = [](const float angleDegrees)
+    {
+        const float angle =
+            angleDegrees * 3.14159265358979323846F / 180.0F;
+        const float cosine = std::cos(angle);
+        const float sine = std::sin(angle);
+        PalmRotationEstimate result{};
+        result.rotation = {
+            cosine, 0.0F, -sine,
+            0.0F, 1.0F, 0.0F,
+            sine, 0.0F, cosine};
+        result.valid = true;
+        return result;
+    };
+    const auto yawDegrees = [](const PalmRotationEstimate& value)
+    {
+        return std::atan2(value.rotation[6], value.rotation[0])
+            * 180.0F / 3.14159265358979323846F;
+    };
+
+    // Recorded perception failures alternate between the tracked branch and a
+    // branch roughly 180 degrees away for one or two frames at a time. The gate
+    // must absorb those without rebasing, otherwise every flip injects a
+    // permanent offset between the hand and the manipulated model.
+    RotationObservationGate gate;
+    auto output = gate.update(observation(0.0F));
+    output = gate.update(observation(10.0F));
+    output = gate.update(observation(-170.0F));
+    require(!output.observation.valid
+            && output.state == RotationObservationGateState::Tracking,
+        "Rotation gate abandoned its trajectory on a one-frame flip.");
+    output = gate.update(observation(14.0F));
+    require(output.observation.valid && !output.reacquired
+            && output.state == RotationObservationGateState::Tracking,
+        "Rotation gate did not resume directly after a one-frame flip.");
+    requireNear(yawDegrees(output.observation), 14.0F, 1.0e-3F,
+        "Rotation gate altered the observation after absorbing a flip.");
+    requireNear(output.rebaseOffsetDegrees, 0.0F, 1.0e-3F,
+        "Rotation gate injected drift while absorbing a one-frame flip.");
+
+    // Motion during the flip is preserved because the trajectory anchor was
+    // never abandoned.
+    output = gate.update(observation(-172.0F));
+    output = gate.update(observation(-174.0F));
+    output = gate.update(observation(20.0F));
+    require(output.observation.valid && !output.reacquired,
+        "Rotation gate did not resume after a two-frame flip.");
+    requireNear(yawDegrees(output.observation), 20.0F, 1.0e-3F,
+        "Rotation gate lost real motion across an absorbed flip.");
+    requireNear(output.rebaseOffsetDegrees, 0.0F, 1.0e-3F,
+        "Rotation gate injected drift across a two-frame flip.");
+}
+
+void testRotationObservationGateReportsRebaseDrift()
+{
+    using ryoiki::hand_input::measurements::PalmRotationEstimate;
+    using ryoiki::hand_input::measurements::RotationObservationGate;
+    const auto observation = [](const float angleDegrees)
+    {
+        const float angle =
+            angleDegrees * 3.14159265358979323846F / 180.0F;
+        const float cosine = std::cos(angle);
+        const float sine = std::sin(angle);
+        PalmRotationEstimate result{};
+        result.rotation = {
+            cosine, 0.0F, -sine,
+            0.0F, 1.0F, 0.0F,
+            sine, 0.0F, cosine};
+        result.valid = true;
+        return result;
+    };
+
+    RotationObservationGate gate;
+    auto output = gate.update(observation(0.0F));
+    requireNear(output.rebaseOffsetDegrees, 0.0F, 1.0e-3F,
+        "Rotation gate reported drift before any recovery.");
+    output = gate.update(observation(60.0F));
+    requireNear(output.rebaseOffsetDegrees, 0.0F, 1.0e-3F,
+        "Rotation gate reported drift while continuously tracking.");
+    requireNear(output.rebaseStepDegrees, 0.0F, 1.0e-3F,
+        "Rotation gate reported a rebase step without a recovery.");
+
+    // A persistent flip past the 90-degree rule. The outlier budget is spent
+    // first, then recovery anchors the output to the first candidate (-60 raw
+    // held against 60 published), so it permanently injects 120 degrees of
+    // divergence. Motion during the candidate frames is preserved, which is why
+    // the published yaw reaches 66.
+    for (std::size_t frame = 0; frame <= 5; ++frame)
+    {
+        output = gate.update(observation(-60.0F));
+        requireNear(output.rebaseOffsetDegrees, 0.0F, 1.0e-3F,
+            "Rotation gate injected drift while absorbing an outlier.");
+    }
+    output = gate.update(observation(-60.0F));
+    output = gate.update(observation(-57.0F));
+    output = gate.update(observation(-54.0F));
+    require(output.reacquired, "Rotation gate did not complete the recovery.");
+    requireNear(output.rebaseStepDegrees, 120.0F, 1.0e-2F,
+        "Rotation gate did not report the offset injected by one recovery.");
+    requireNear(output.rebaseOffsetDegrees, 120.0F, 1.0e-2F,
+        "Rotation gate did not report accumulated drift after one recovery.");
+
+    output = gate.update(observation(-51.0F));
+    requireNear(output.rebaseOffsetDegrees, 120.0F, 1.0e-2F,
+        "Rotation gate changed accumulated drift while tracking.");
+    requireNear(output.rebaseStepDegrees, 0.0F, 1.0e-3F,
+        "Rotation gate repeated a rebase step on a tracking frame.");
+
+    // A second recovery accumulates onto the first. Tracking loss abandons the
+    // trajectory immediately instead of consuming the outlier budget.
+    PalmRotationEstimate missing{};
+    output = gate.update(missing);
+    requireNear(output.rebaseOffsetDegrees, 120.0F, 1.0e-2F,
+        "Rotation gate lost accumulated drift while holding.");
+    output = gate.update(observation(-81.0F));
+    output = gate.update(observation(-79.0F));
+    output = gate.update(observation(-77.0F));
+    require(output.reacquired,
+        "Rotation gate did not complete the second recovery.");
+    requireNear(output.rebaseStepDegrees, 30.0F, 1.0e-2F,
+        "Rotation gate did not report the second injected offset.");
+    requireNear(output.rebaseOffsetDegrees, 150.0F, 1.0e-2F,
+        "Rotation gate did not accumulate drift across two recoveries.");
+}
+
+void testNativeCadHandBindingRezeroesAfterTrackingGap()
+{
+    using ryoiki::features::cad::CadHandBinding;
+    using ryoiki::features::cad::CadHandInput;
+    using ryoiki::features::cad::HandInteractionMode;
+    using ryoiki::features::cad::HandInteractionState;
+    using ryoiki::presentation::HandPresentationMode;
+    using ryoiki::rendering::CadView;
+    const auto yawRotation = [](const float angle)
+    {
+        const float cosine = std::cos(angle);
+        const float sine = std::sin(angle);
+        return std::array<float, 9>{
+            cosine, 0.0F, -sine,
+            0.0F, 1.0F, 0.0F,
+            sine, 0.0F, cosine};
+    };
+    auto start = std::chrono::steady_clock::time_point{
+        std::chrono::milliseconds{1000}};
+    CadHandInput input{};
+    input.frameId = 1;
+    input.captureTimestampUs = 1'000'000;
+    input.trackingQuality = 0.95F;
+    input.screenCenterX = 0.5F;
+    input.screenCenterY = 0.5F;
+    input.screenScale = 0.1F;
+    input.relativeRotation = yawRotation(0.0F);
+    input.handPresent = true;
+    input.screenPalmValid = true;
+    input.relativeRotationValid = true;
+
+    CadHandBinding binding;
+    const CadView initial{};
+    auto output = binding.update(
+        input, initial, HandInteractionMode::Rotate,
+        HandPresentationMode::MirrorDirect, 1.0F, start);
+    require(output.referenceCaptureRequested,
+        "Native CAD binding did not request a reference at clutch-down.");
+
+    input.frameId = 2;
+    input.relativeRotation = yawRotation(0.30F);
+    output = binding.update(
+        input, initial, HandInteractionMode::Rotate,
+        HandPresentationMode::MirrorDirect, 1.0F,
+        start + std::chrono::milliseconds{33});
+    require(output.viewChanged && !output.referenceCaptureRequested,
+        "Native CAD binding re-requested a reference while tracking.");
+    const auto heldView = output.view;
+
+    // Tracking is lost well beyond the grace period while the clutch is held.
+    input.handPresent = false;
+    input.relativeRotationValid = false;
+    input.screenPalmValid = false;
+    for (std::size_t frame = 0; frame < 30; ++frame)
+    {
+        input.frameId = 3 + frame;
+        output = binding.update(
+            input, heldView, HandInteractionMode::Rotate,
+            HandPresentationMode::MirrorDirect, 1.0F,
+            start + std::chrono::milliseconds{
+                66 + static_cast<int>(frame) * 33});
+        require(output.state != HandInteractionState::AwaitingRelease,
+            "Native CAD binding still demands a clutch release after a gap.");
+        require(!output.viewChanged,
+            "Native CAD binding moved the view while tracking was lost.");
+    }
+
+    // The hand returns at a completely different pose. The session must re-zero
+    // rather than snap the view by the pre-gap relative rotation.
+    input.handPresent = true;
+    input.relativeRotationValid = true;
+    input.screenPalmValid = true;
+    input.screenCenterX = 0.2F;
+    input.frameId = 100;
+    input.relativeRotation = yawRotation(2.0F);
+    output = binding.update(
+        input, heldView, HandInteractionMode::Rotate,
+        HandPresentationMode::MirrorDirect, 1.0F,
+        start + std::chrono::milliseconds{1200});
+    require(output.state == HandInteractionState::Rotating,
+        "Native CAD binding did not resume while the clutch was held.");
+    require(!output.viewChanged,
+        "Native CAD binding moved the view on the re-zero frame.");
+    require(output.referenceCaptureRequested,
+        "Native CAD binding resumed without a fresh rotation reference.");
+    requireNear(output.view.yawRadians, heldView.yawRadians, 1.0e-4F,
+        "Native CAD binding did not preserve the view across a gap.");
+}
+
 void testNativeCadHandBindingSensitivityAndPresentation()
 {
     using ryoiki::features::cad::CadHandBinding;
@@ -992,6 +1868,35 @@ void testNativeCadHandBindingSensitivityAndPresentation()
         normalOutput.yawDeltaDegrees * 2.0F,
         1.0e-3F,
         "Native CAD sensitivity did not scale rotation.");
+
+    CadHandBinding pitchBinding;
+    input.relativeRotation = {
+        1.0F, 0.0F, 0.0F,
+        0.0F, 1.0F, 0.0F,
+        0.0F, 0.0F, 1.0F};
+    input.frameId = 3;
+    input.captureTimestampUs += 33'333;
+    static_cast<void>(pitchBinding.update(
+        input, initial, HandInteractionMode::Rotate,
+        HandPresentationMode::Physical, 1.0F,
+        start + std::chrono::milliseconds{66}));
+    input.relativeRotation = {
+        1.0F, 0.0F, 0.0F,
+        0.0F, cosine, sine,
+        0.0F, -sine, cosine};
+    input.frameId = 4;
+    input.captureTimestampUs += 33'333;
+    const auto pitchOutput = pitchBinding.update(
+        input, initial, HandInteractionMode::Rotate,
+        HandPresentationMode::Physical, 1.0F,
+        start + std::chrono::milliseconds{99});
+    requireNear(
+        std::abs(pitchOutput.pitchDeltaDegrees),
+        angle * 1.60F * 180.0F / 3.14159265358979323846F,
+        1.0e-3F,
+        "Native CAD binding did not apply the independent pitch-axis gain.");
+    requireNear(pitchOutput.yawDeltaDegrees, 0.0F, 1.0e-3F,
+        "Pitch-axis gain leaked into CAD yaw.");
 
     CadHandBinding mirrorPan;
     CadHandBinding physicalPan;
@@ -1536,12 +2441,26 @@ int main()
         testPalmDetectionGraphFailure();
         testHandPerceptionTrackingAndPalmFallback();
         testCalibrationPalmProbeKeepsTrackedRoi();
+        testHandPerceptionTracksTwoHandsWithSequentialInference();
+        testHandPerceptionUsesReliableHandednessAcrossPositionConflict();
+        testHandPerceptionReacquiresOneOfTwoTracksWithoutReplacingItsId();
         testHandPerceptionContinuesAfterSingleFrameRunnerFailures();
         testHandMeasurementExtractorCanonicalization();
+        testHandTopologyHistorySummarizesAndBounds();
+        testHandTopologyHistoryTolerateShortGapAndAccumulatePath();
+        testHandTopologyHistoryPrunesToRollingTimeWindow();
+        testMultiHandRelationOrderingIsDeterministic();
+        testRyoikiHandTopologyAbiStructSizesAreBlittable();
+        testMultiHandMeasurementStageKeepsPerTrackHistory();
         testWeightedPalmRotationTracker();
         testWeightedPalmRotationTrackerMixedRotationAndDegeneracy();
         testPalmRotationEskfSuppressesJitterAndTracksMotion();
         testPalmBasisRotationMatchesRigidLandmarkRotation();
+        testPalmRotationOneEuroSuppressesJitterWithLowLag();
+        testRotationObservationGateHoldsAndReacquiresContinuously();
+        testRotationObservationGateAbsorbsTransientFlips();
+        testRotationObservationGateReportsRebaseDrift();
+        testNativeCadHandBindingRezeroesAfterTrackingGap();
         testNativeCadHandBindingSensitivityAndPresentation();
         testDomainExpansionGestureGeometry();
         testOpenPalmStateRecognition();
