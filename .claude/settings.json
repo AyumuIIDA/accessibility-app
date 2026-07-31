@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git ls-files:*)",
+      "Bash(git stash list:*)",
+      "Bash(git add:*)",
+      "Bash(ls:*)",
+      "Bash(printenv:*)",
+      "Bash(which:*)",
+      "Bash(wc:*)",
+      "Bash(dotnet --info)",
+      "Bash(dotnet --version)",
+      "Bash(dotnet restore:*)",
+      "Bash(dotnet build:*)",
+      "Bash(dotnet clean:*)",
+      "Bash(dotnet test:*)",
+      "Bash(cmake:*)",
+      "Bash(ctest:*)",
+      "Bash(ninja:*)",
+      "Bash(cl.exe:*)"
+    ],
+    "deny": [
+      "Bash(dotnet run:*)",
+      "Bash(git push:*)",
+      "Bash(git commit:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(git clean:*)",
+      "Bash(*RyoikiTenkai.Wpf.exe*)"
+    ]
+  }
+}
