@@ -157,6 +157,13 @@ mapping concern. This follows established 3D navigation practice: Blender
 describes orbit sensitivity as a simple speed factor, while 3Dconnexion exposes
 speed independently from per-axis reversal and navigation mode.
 
+After temporal filtering and dead-zone handling, CAD pitch has an independent
+`1.60x` axis gain. This compensates the current monocular world-landmark path's
+under-response around the palm X axis without changing the measured rotation,
+yaw response, or temporal filter. The user-selected rotation sensitivity is
+applied after this axis gain, so yaw remains `sensitivity × 1.0` and pitch is
+`sensitivity × 1.60`.
+
 Presentation direction is a shared native policy, independent of sensitivity:
 
 - `MirrorDirect` reflects the hand X axis so horizontal motion follows the mirrored
@@ -180,8 +187,22 @@ A sample is usable only when:
 - metadata age is at most `150 ms`;
 - the source frame ID is newer than the last consumed frame.
 
-Invalid or missing input freezes the view immediately. A continuous `500 ms` absence
-returns the state to `Inactive`; reacquisition must arm again.
+Invalid or missing input freezes the view immediately. After a continuous
+`220 ms` absence the active session ends, but the clutch is not revoked: holding
+the key is a continuous statement of intent, so the next valid measurement
+re-zeroes the view, screen, and palm rotation references and control resumes.
+
+Re-arming after a gap was a requirement of the earlier open-palm arming design,
+which had no continuous intent signal. With a physical clutch it is unnecessary:
+resuming against a stale reference is what snaps the view, and re-zeroing removes
+that by construction. `AwaitingRelease` is retained in the ABI and the managed
+display for compatibility but is no longer emitted.
+
+Because the binding owns only the view and screen references, it reports
+`referenceCaptureRequested` on the frame it reactivates and the runtime captures
+the matching palm rotation reference. That capture also resets the rotation
+observation gate, so the rebase offset accumulated across the gap is discarded
+instead of being carried into the resumed session.
 
 ### 6.2 Scale normalization
 
@@ -225,8 +246,9 @@ the relative 3D rotation from the pose captured at clutch-down:
 
 The reference basis is captured at clutch-down. Translation and uniform hand scale
 do not rotate the model. Gesture classification is not consulted while rotating.
-Invalid tracking freezes rotation, and exceeding the grace period requires a new
-clutch press so an old reference cannot produce a large jump.
+Invalid tracking freezes rotation; exceeding the grace period ends the session and
+the next valid measurement captures a fresh reference, so an old reference cannot
+produce a large jump while the clutch stays held.
 
 ### 6.5 Pinch zoom
 

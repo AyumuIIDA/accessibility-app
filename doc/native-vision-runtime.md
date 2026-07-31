@@ -1,6 +1,6 @@
 # Native Vision Runtime Contract
 
-This document defines the version 18 contract between the WPF host and
+This document defines the version 24 contract between the WPF host and
 `RyoikiTenkai.Native.dll`. The public declarations are in
 `src/RyoikiTenkai.Native/include/ryoiki_native.h`.
 
@@ -9,8 +9,11 @@ in [hand-input-architecture.md](hand-input-architecture.md). Recognition is an
 optional interpretation layer within that architecture and is specified in
 [gesture-recognition-framework.md](gesture-recognition-framework.md). Version 15
 publishes generic latest State snapshots while retaining the gesture-specific
-Domain Sign fields for compatibility comparison. Ordered Event publication remains
-future work.
+Domain Sign fields for compatibility comparison. Version 18 adds ordered Event
+publication. Version 19 adds a maximum-two-hand observation snapshot while retaining
+the primary-hand compatibility API. Version 20 adds multi-hand association
+diagnostics for track-ID and handedness validation. Version 21 adds a separate
+latest-only topology snapshot without changing the version 20 hands layout.
 
 ## Native pipeline layers
 
@@ -71,6 +74,29 @@ CameraCapture
   Measurements remain in their documented camera/world domains. Native CAD binding
   and the native 3D hand plot independently consume the same presentation mode at
   their consumer boundaries; WPF selects the mode but performs no coordinate math.
+- `HandInput/Measurements/hand_unified_feature_frame` builds the dimensionless,
+  fixed-layout single-hand feature vector (`UnifiedFeatureFrame`, 64 floats;
+  offsets documented in the header) and resamples an ordered observation
+  sequence to a fixed 32-sample `UnifiedFeatureFrame` sequence
+  (`buildUnifiedSequence`). It is a native, allocation-bounded port of the C#
+  prototype's `GestureFeatureExtractor` (`BuildUnifiedSequence`, `Resample`,
+  `Interpolate`, `AnalyzeFingerPose`) from `origin/pr/1/head`, adapted to reuse
+  `hand_perception::HandLandmarkResult` landmarks and cross-checked against
+  `HandTopologyMeasurement`'s equivalent fields
+  (`hand_unified_feature_frame_tests.cpp`). It does not select which
+  observations form a sequence, gate on topology, or run recognition/DTW;
+  candidate selection is owned by the per-track history below.
+- `HandInput/Measurements/gesture_candidate_window_history` attaches one
+  bounded 2600 ms rolling history to each stable track slot in
+  `MultiHandMeasurementStage`. It ports the PR single-hand
+  `WindowGestureRecognizer.CreateCandidateWindows` policy: candidate windows
+  end at the latest observation, use 1400/1700/2100/2500 ms cutoffs, require
+  at least 1400 ms and 25 observations passing the 0.35 confidence gate, and
+  yield a 32-point unified sequence. Short observation gaps follow the
+  existing track grace period; slot eviction or reassignment clears the
+  history. Candidate construction is on demand and is not published through
+  the ABI. The PR's joint two-hand fused-feature recognizer is a separate
+  future integration.
 
 The `RyoikiTenkai.VisionCore` static target contains `Buffers`, `Pipeline`, `Geometry`,
 `HandPerception`, and the platform-neutral render packet slot, allowing those layers
@@ -87,6 +113,47 @@ to be tested without a camera, WPF, or a native window.
   hand X axis so motion follows the mirrored preview, while `Physical` preserves the
   measured X direction. `ryoiki_configure_cad_hand_interaction` also applies this
   shared setting so CAD and the 3D hand plot cannot silently diverge.
+- Version 19 adds `ryoiki_get_latest_hands`. It returns at most two copied landmark
+  observations with stable native track IDs. `ryoiki_get_latest_hand` remains the
+  compatibility and application-control view of the primary hand.
+- Version 20 adds raw and temporally filtered handedness to each observed hand,
+  plus an ambiguous-crossing flag and visible-owner track ID to the multi-hand
+  snapshot. WPF records these values with bbox center, confidence, and
+  tracking/Palm provenance in the regular action log.
+- Version 21 adds `ryoiki_get_latest_hand_topology`. It publishes at most two
+  per-track rolling topology summaries and one deterministically ordered
+  two-hand relation. The snapshot is latest-only measurement metadata; it does
+  not contain image buffers, perform recognition, or widen `RyoikiHandsResult`.
+- Version 22 adds latest-only gesture-recognition diagnostics and an
+  asynchronous in-memory template-registration request. Candidate-local
+  topology, DTW feature buffers, and templates remain native-owned; only
+  scalar scores, IDs, counts, and bounded reason strings cross the ABI.
+
+The WPF validation panel can request an in-memory template from the current
+candidate window and displays the version 22 diagnostics. Templates remain
+process-local and are cleared when the native runtime is destroyed.
+
+The validation UI presents this as a recording workflow: Start Recording,
+a 1.5-second preparation countdown, at least 2.5 seconds of capture, then
+Stop & Register. The minimum capture time ensures the native 2500 ms rolling
+candidate is wholly inside the visible recording phase rather than including
+motion from before the user pressed Start. The UI shows REC/progress,
+processing, saved/rejected feedback, accepted take count, and live-match
+confidence. This is presentation state only; feature construction and
+template acceptance remain native-owned.
+
+For phone/secondary-device validation, WPF can explicitly start a small LAN
+HTTP endpoint on a user-selected port. It is stopped by default and requires
+a bearer token of at least 12 characters. It exposes only:
+
+```text
+GET  /api/gesture/status
+POST /api/gesture/templates/{templateId}?trackId={trackId}
+```
+
+It does not expose arbitrary action execution. The listener binds all local
+interfaces, so Windows Firewall and the current network profile still govern
+whether another Wi-Fi device can connect.
 - Structures are blittable values. They contain no pointers or variable-length data.
 - Status-returning functions use a signed 32-bit integer: zero is failure and one is
   success. The ABI does not expose C++ `bool`.
@@ -159,6 +226,11 @@ with a mutex and copies it into caller-owned structures.
 - `bbox` is `[left, top, right, bottom]`.
 - Palm results include the highest-scoring bbox and seven `[x, y]` keypoints. The
   `palm_count` may be greater than one even though version 5 copies only the best palm.
+- Version 19 hand perception tracks at most two independent ROI loopbacks. Landmark
+  inference is deliberately sequential through the existing runner. While one hand
+  is tracked, full-frame palm detection runs periodically to discover a second hand;
+  detections associated with an existing track are suppressed after inference output
+  rather than by mutating camera pixels.
 - Hand results include the normalized palm normal used by the native 3D direction
   vector. CAD interaction derives relative yaw and pitch from this same direction
   basis rather than from palm-center translation.
@@ -310,6 +382,84 @@ metrics as CSV. The initial ARM64 Release baseline and its limitations are recor
   `DXGI_SWAP_EFFECT_FLIP_DISCARD`. A waitable swap chain is deferred until latency
   metrics show that it improves this device.
 
+## Explicit gesture recording (ABI v23)
+
+Gesture teaching uses a native-owned session rather than taking a snapshot of
+the live rolling recognition history when the user presses Stop:
+
+```text
+ryoiki_begin_gesture_recording(template_id)
+  -> AwaitingHand while zero or two hands are usable
+  -> Recording after exactly one hand is locked internally
+ryoiki_finish_gesture_recording()
+  -> existing candidate construction and template quality gates
+  -> Completed or Rejected
+```
+
+`ryoiki_cancel_gesture_recording` abandons the take, and
+`ryoiki_get_gesture_recording_status` is a latest-value polling snapshot. The
+application never supplies a track ID. Samples observed before Begin are not
+eligible for the take, the locked track is not rebound, and live DTW matching
+is paused while a take is awaiting a hand or recording. The legacy rolling
+registration export remains for compatibility but is not used by the WPF
+registration workflow.
+
+## Recording provenance review and playback (ABI v29)
+
+`ryoiki_list_gesture_recordings` returns at most three small provenance records
+for one saved definition: take index, capture time, duration, quality counters,
+frame counts, confidence, and source diagnostics. The list has an explicit
+reserved alignment field and a fixed size of 888 bytes; no skeleton payload is
+part of this ABI.
+
+`ryoiki_recording_playback_create(parent, source)` creates a native child HWND.
+Selection, play/pause, normalized seek, resize, and bounded status polling are
+exposed through the playback API. Native code reloads the selected provenance
+frames and owns the GPU rendering surface. The playback handle borrows `source`;
+callers must destroy it before `ryoiki_stop`/`ryoiki_destroy` on that source.
+
+`ryoiki_export_gesture_recording` writes one definition/take as the versioned
+native recording format. Its path argument is UTF-8 and is converted to a native
+Windows filesystem path before opening the file.
+
+## DTW developer diagnostics (ABI v24)
+
+`ryoiki_get_latest_gesture_dtw_debug` publishes the best comparison attempt,
+including rejected attempts. It contains the bounded 32x32 DTW alignment path,
+forward and reverse scores, threshold, warp ratio, eligibility, the twelve
+distance contributions, candidate duration, and rejection reason. All arrays
+are fixed and bounded; feature vectors, templates, frames, and images remain
+native-owned. The WPF DTW debugger renders this latest metadata and never
+recomputes recognition.
+
+ABI v25 also provides an optional, independent GPU DTW visualization surface.
+`ryoiki_dtw_debug_create(parent, source)/resize/destroy` own a child HWND and a
+dedicated latest-only render worker. The source runtime copies each bounded
+32-frame candidate/template skeleton and DTW path into an internal native slot;
+no skeleton payload crosses the public ABI and the renderer retains no registry
+or recognition-history pointer. DTW remains CPU recognition work. Only D2D
+raster and swap-chain presentation run on the surface worker. Destruction joins
+the source bridge and render worker before destroying its child HWND and
+releasing the D3D device. The UI must destroy the debug surface before its
+source runtime handle.
+
+The debug surface uses two vertical regions. Its upper region shows the
+perception-rate live candidate hand beside the template hand selected by the
+latest DTW path endpoint; live observations are stored separately and never
+overwrite the 32-frame candidate sequence used by DTW. Faint palm trails are
+only spatial context. The lower region follows the two complementary views in
+Romain Tavenard's DTW Figure 7: a simple binary alignment matrix (grid, ideal
+diagonal, actual DTW path, and current endpoint) beside vertically separated
+candidate/template palm-velocity series joined by the actual multivariate DTW
+correspondences. Palm velocity is only an intuitive one-dimensional projection;
+it does not replace or recompute the 64-feature CPU DTW. Live-hand publication
+may update every perception frame while the CPU DTW packet remains at
+recognition cadence.
+
+After an explicit recording completes, the live candidate histories are reset
+before validation begins. This prevents the recorded take from immediately
+matching itself; Test It Now must accumulate a fresh post-registration motion.
+
 ## Failure handling
 
 The runtime separates initialization failures from frame-local processing failures:
@@ -378,3 +528,17 @@ CMake copies the complete architecture-specific native directory beside the nati
 and native tests. QNN execution is not considered validated until both QDQ models pass
 session creation, inference smoke, accuracy comparison, and the same stage-timing run
 as the CPU baseline.
+
+## Gesture bindings and ordered commands (ABI v28)
+
+ABI v28 adds fixed-size list/upsert/delete metadata for gesture bindings. The
+native repository owns SQLite schema v4 and keys each binding by the numeric
+gesture definition ID. Confirmed recognition still publishes only an ordered
+`RyoikiHandEvent`; action type, parameters, and application intent never enter
+the perception or recognition loop.
+
+WPF consumes `ryoiki_read_hand_events` with a persistent sequence cursor, reports
+ring overflow, resolves the binding from an in-memory cache populated through
+`ryoiki_list_gesture_bindings`, and dispatches an `ActionSpec` asynchronously.
+Failed external actions are logged and consumed once rather than retried, because
+an action may have produced a side effect before reporting failure.

@@ -251,6 +251,23 @@ Swipe Left event               -> previous-page command
 A binding does not calculate landmarks, infer a pose, select a model provider, or
 own camera buffers.
 
+Confirmed custom gestures follow the same boundary:
+
+```text
+native ordered HandEvent (definition ID, confidence, segment timestamps)
+  -> C# event pump (sequence cursor and overflow reporting)
+  -> GestureCommandDispatcher
+  -> SQLite binding lookup/cache by numeric definition ID
+  -> ActionSpec
+  -> IActionExecutor
+```
+
+Display names are not identity and may be renamed without invalidating a binding.
+The `bindings` table references `definitions(id)` with cascade deletion. Action
+execution never runs in perception or recognition code. The UI may edit binding
+policy, while tests substitute `IActionExecutor` so keyboard injection and process
+launch are not performed during verification.
+
 ## Native and managed ownership
 
 | Responsibility | Owner |
@@ -381,6 +398,36 @@ domain_expansion_state_recognizer -> HandInput/Recognition
 
 The algorithms and thresholds were retained during that move. New code must use the
 new locations; do not recreate a broad `Patterns` directory.
+
+A second migration is in progress: porting the C# prototype's fixed-length
+gesture feature representation (`RyoikiTenkai/Vision/GestureFeatureExtractor.cs`
+on `origin/pr/1/head`) to native code, one responsibility at a time, ahead of
+any recognition step that will consume it:
+
+```text
+single-hand unified feature-frame construction
+  and fixed 32-point time resampling  -> HandInput/Measurements
+                                          (hand_unified_feature_frame)
+per-track 2600 ms rolling history
+  and candidate-window selection      -> HandInput/Measurements
+                                          (gesture_candidate_window_history)
+```
+
+These steps port frame construction, resampling, and the single-hand
+`WindowGestureRecognizer` candidate-window policy. Each stable native track
+has an independent bounded history. Candidate durations remain
+1400/1700/2100/2500 ms, require at least 1400 ms and 25 usable observations,
+and produce a 32-point sequence. The separate PR two-hand fused-feature path
+is not mixed into this per-track path. Candidate-local topology, bounded
+in-memory templates, best-match selection, and unified-sequence DTW now live
+under `HandInput/Recognition`; version 23 also exposes an explicit gesture
+recording session. `Begin` clears a dedicated take buffer and waits for exactly
+one usable hand, the native worker locks that internal track without exposing
+its ID to the UI, and `Finish` registers only observations collected by that
+take. Two visible hands never cause an implicit selection, and a lost locked
+track is rejected instead of rebound. The rolling histories remain inputs to
+live recognition only. Recognition events, persistent template storage, and
+application commands remain future work.
 
 ## Demo scope
 

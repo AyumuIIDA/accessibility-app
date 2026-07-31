@@ -3,6 +3,52 @@
 Status: incremental design. Recognition is an optional interpretation layer within
 the architecture defined by [hand-input-architecture.md](hand-input-architecture.md).
 
+## Native three-take registration
+
+Custom single-hand definitions follow the PR prototype's
+`RequiredTemplateCount = 3` rule. A session accepts three separate takes
+through the existing duration, usable-frame, usable-FPS, motion, and topology
+quality gates. Failed attempts retry the same take index while earlier
+accepted takes remain pending; cancellation discards that pending set.
+
+The third acceptance atomically appends all three templates to the numeric
+definition. They are not averaged. Definitions with fewer than three
+recognizable templates are inactive. Recognition compares every candidate
+duration with every accepted template and selects the lowest eligible DTW
+score, matching the PR's `MinimumTemplateCount` and `FindBestMatch` behavior.
+
+### SQLite persistence
+
+Native templates are stored in a versioned SQLite database. The Windows-only
+runtime links the Windows SDK `winsqlite3` system library rather than adding a
+vcpkg package or shipping another DLL. Schema migration uses SQLite
+`user_version`; schema version 1 separates definition metadata from ordered
+trial payloads. Each payload has its own explicit format version and writes
+every scalar field in order—native structs are never copied as raw bytes.
+
+The third accepted take writes the definition and all three independent
+trials under `BEGIN IMMEDIATE`; any bind, insert, or commit error rolls back
+without changing the in-memory registry. Registry restoration happens into a
+temporary registry and replaces the live registry only after every enabled
+definition has decoded successfully. Disabled definitions remain listed in
+metadata but do not participate in recognition.
+
+Schema version 3 stores recording provenance separately from recognition
+templates. Every accepted take retains a stable source ID, UTC capture time,
+quality counters, and up to 360 native normalized skeleton frame sets for one
+or two hands. The three templates and their provenance records commit in the
+same transaction. High-frequency skeleton data remains native-owned and is
+loaded only for playback or explicit versioned binary export; WPF is the
+metadata/playback shell and does not maintain a duplicate capture buffer.
+
+ABI version 29 exposes only a bounded three-item provenance list and playback
+status to WPF. Selecting a take loads its skeleton frames inside native code and
+renders them into a dedicated child HWND backed by the native GPU renderer;
+landmark arrays never cross into managed code. Playback handles borrow the
+source `RyoikiHandle`, so the WPF playback window is owned by the main window
+and is closed before the source runtime is stopped. Explicit export writes the
+versioned native recording payload selected by definition and take index.
+
 `HandMeasurements`, `HandMeasurementExtractor`, Domain Sign geometry, and the
 weighted native palm-rotation tracker are implemented and replay-tested under
 `HandInput/Measurements` and `HandInput/Recognition`. ABI version 18 exposes world
@@ -10,28 +56,65 @@ landmarks, palm pose, relative rotation, and fit quality. Generic latest-State
 publication is implemented for Domain Sign and Open Palm. Ordered Event
 publication and the first Swipe Left/Right Event recognizer are implemented.
 
-Native CAD rotation passes two geometrically estimated observations through
+Native CAD rotation passes two low-cost palm-basis observations through
 `PalmRotationEskf` before feature mapping:
 
-- clutch-reference to current landmarks provides an absolute SO(3) orientation
+- the same orthonormal basis used by the 3D plot is constructed from `5 - 17`
+  and the orthogonalized `9 - 0` direction;
+- clutch-reference to current basis provides an absolute SO(3) orientation
   observation and prevents accumulated drift;
-- previous-frame to current landmarks provides a local angular-velocity observation;
+- previous-frame to current basis provides a local angular-velocity observation;
 - the nominal state is orientation plus body angular velocity, with a 6x6 error
   covariance over small-angle and angular-velocity errors;
 - normalized rigid-fit error increases observation covariance, and a Mahalanobis
   gate rejects implausible corrections.
 
-The filter does not select landmarks or change the rigid fitting algorithm.
-`WeightedPalmRotationTracker` remains the observation source so landmark-set and
-weight experiments can be evaluated independently from temporal filtering. The CAD
-binding no longer adds its former fixed 75 ms exponential filter; it consumes the
-ESKF rotation and retains application sensitivity, dead zone, presentation, and
-view constraints.
+The palm basis requires vector normalization, Gram-Schmidt orthogonalization, a
+cross product, and a 3x3 relative-basis product. It replaces the normal-path
+six-point solver, which requires three robust-weight iterations and repeated 4x4
+Jacobi eigensolves. `WeightedPalmRotationTracker` now runs only when rotation
+comparison CSV logging is enabled. The CAD binding consumes the selected
+temporal-filter result and retains application sensitivity, dead zone,
+presentation, and view constraints.
 
-The default is ESKF. For an A/B run using the same landmark source and rigid fit,
-set `RYOIKI_PALM_ROTATION_FILTER=raw` before starting the process. Unset the
-variable, or set it to `eskf`, to restore filtering. This switch deliberately does
-not change landmark selection, weights, presentation, or CAD sensitivity.
+The default temporal filter is an SO(3) One Euro filter with a `6 Hz` minimum
+cutoff, `0.05` angular-speed coefficient, and `1 Hz` derivative cutoff. A replay
+of 2,335 real world-landmark frames compared filters against a centered,
+zero-phase palm-basis trajectory:
+
+```text
+                         geodesic RMSE   pitch RMSE   estimated lag
+ESKF                         21.34 deg     11.76 deg       1 frame
+One Euro, 6 Hz / 0.05        13.41 deg      6.81 deg       0 frames
+raw                          14.67 deg      8.04 deg       0 frames
+```
+
+The reference is a diagnostic smooth trajectory rather than instrumented ground
+truth, so these values compare temporal behavior, not absolute physical accuracy.
+The One Euro path was selected because it reduced jitter and trajectory error
+without measurable frame delay in this recording.
+
+Before temporal filtering, `RotationObservationGate` rejects a basis observation
+whose single-frame SO(3) delta exceeds `20 degrees` or whose inferred angular
+speed exceeds `720 degrees/second`. Rejected observations are not passed into the
+temporal filter. The gate holds the last accepted effective orientation, then
+requires three internally continuous candidate frames before reacquisition.
+At reacquisition it computes:
+
+```text
+rebase = held_orientation * inverse(first_candidate)
+effective(t) = rebase * candidate(t)
+```
+
+This discards unobservable motion during the unstable interval while preserving
+motion after the first recovery candidate and preventing a view jump. The temporal
+filter is reset on the rebased recovery frame so stale derivative state cannot
+produce catch-up motion.
+
+For a temporal-filter A/B run using the same active source, set
+`RYOIKI_PALM_ROTATION_FILTER` to `raw`, `eskf`, or `one-euro`. An unset or
+unrecognized value selects `one-euro`. This switch deliberately does not change
+the observation source, presentation, or CAD sensitivity.
 
 ### Rotation-source comparison capture
 
@@ -58,6 +141,24 @@ thumb-separation measurements. It uses a `120 ms` enter duration, a `150 ms`
 exit duration, and a `220 ms` missing-input grace period. This is a practical
 geometry baseline, not a claim of parity with the official canned classifier;
 thresholds must be calibrated from native-runtime recordings.
+
+The first custom-gesture preparation stage is also native. Each valid hand
+observation now produces a typed `HandTopologyMeasurement` containing the five
+radial finger-straightness values and state mask, signed palm area, palm
+compression, landmark depth range, image-space hand scale, bounding-box shape,
+palm-axis angle, and screen center. `HandTopologyHistory` retains a 2600 ms
+rolling window in a fixed 192-sample buffer without per-frame allocation and
+produces a bounded temporal summary for finger transitions, palm turns, scale
+changes, accumulated palm travel, and endpoint translation.
+
+Histories are keyed by stable native track ID in `MultiHandMeasurementStage`.
+Up to five consecutive missing observations preserve that track's segment; a
+longer gap resets only that track. Handedness remains a measurement and must not
+be used as the primary two-hand sequence key. It may deterministically order a
+two-hand relation when the filtered scores differ by at least 0.20; otherwise
+screen position provides the ordering. Template quality gates, bounded DTW,
+template upload, and custom Event publication are subsequent recognition stages;
+they do not belong in the measurement history.
 
 ## Scope
 
@@ -515,6 +616,47 @@ Event:
 
 For PC actions, false activation rate is a primary acceptance criterion; aggregate
 classification accuracy alone is insufficient.
+
+## Template-match event stabilization
+
+The native template recognizer preserves the PR recognizer's delivery semantics:
+
+```text
+eligible best match
+  -> same template ID on 2 consecutive recognition passes
+  -> reject overlap with the last delivered segment
+  -> reject while the 1500 ms cooldown remains
+  -> publish one ordered HandEvent whose ID is the template ID
+```
+
+The decision order is consecutive-count, duplicate segment, cooldown, then
+confirmation. A missing match or hand resets only the pending ID/count. It does
+not clear the last delivered segment or cooldown. Successful registration changes
+the registry identity and therefore clears both pending and prior-delivery state;
+this prevents definitions from the old registry suppressing a newly recorded
+template. Candidate segment identity is its inclusive start/end timestamp range,
+and overlap uses inclusive interval intersection exactly as in the PR.
+
+## Two-hand template core
+
+The bounded native two-hand core mirrors the PR frame-set algorithm. Two hands
+must occur in the same timestamped frame set; it never joins observations from
+different camera frames. A pair is ordered by handedness when the score gap is
+at least `0.20`, otherwise by palm-center X. Confidence below `0.35` or
+normalized separation below `0.65` makes the pair unusable.
+
+Each frame concatenates both 64-value hand vectors and relative X, Y,
+first-frame distance ratio, and angle, producing 132 values. Registration keeps
+the PR's 70% coverage, 32-frame, 1900 ms, 16 fps, and 0.32 topology gates.
+Comparison uses 32 resampled frames, mean-L1 bounded DTW, reverse margin 0.94,
+confidence threshold 0.80, and the unchanged relative geometry gates.
+The recording workflow chooses one-hand or two-hand kind from predominant
+coverage without exposing track IDs to the UI. It requires three takes of the
+same kind, persists each trial with kind `0` (one hand) or `1` (two hands), and
+restores the variant payload without flattening or averaging the takes. At run
+time the two-hand path has its own rolling frame-set history and confirmation
+state; while two hands are present it suppresses the single-hand path to avoid
+publishing two events for one physical gesture.
 
 ## Migration
 

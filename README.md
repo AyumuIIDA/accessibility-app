@@ -237,6 +237,7 @@ ryoiki_destroy
 ryoiki_get_latest_metrics
 ryoiki_get_latest_palm
 ryoiki_get_latest_hand
+ryoiki_get_latest_hands
 ryoiki_get_last_error
 ```
 
@@ -374,20 +375,20 @@ From the repository root in that ARM64 Developer PowerShell:
 
 ```powershell
 dotnet restore src/RyoikiTenkai.Wpf/RyoikiTenkai.Wpf.csproj
-cmake -S src/RyoikiTenkai.Native -B build/RyoikiTenkai.Native.OpenCv -G Ninja `
+cmake -S src/RyoikiTenkai.Native -B build/RyoikiTenkai.Native.Qnn.Arm64 -G Ninja `
   -DCMAKE_BUILD_TYPE=Debug `
   -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
   -DVCPKG_TARGET_TRIPLET=arm64-windows-static-md
-cmake --build build/RyoikiTenkai.Native.OpenCv
-ctest --test-dir build/RyoikiTenkai.Native.OpenCv --output-on-failure
+cmake --build build/RyoikiTenkai.Native.Qnn.Arm64
+ctest --test-dir build/RyoikiTenkai.Native.Qnn.Arm64 --output-on-failure
 ```
 
 The expected native outputs are:
 
 ```text
-build/RyoikiTenkai.Native.OpenCv/RyoikiTenkai.Native.dll
-build/RyoikiTenkai.Native.OpenCv/RyoikiTenkai.VisionCore.Tests.exe
-build/RyoikiTenkai.Native.OpenCv/RyoikiTenkai.HandPerception.Tests.exe
+build/RyoikiTenkai.Native.Qnn.Arm64/RyoikiTenkai.Native.dll
+build/RyoikiTenkai.Native.Qnn.Arm64/RyoikiTenkai.VisionCore.Tests.exe
+build/RyoikiTenkai.Native.Qnn.Arm64/RyoikiTenkai.HandPerception.Tests.exe
 ```
 
 The default native build uses the QNN ONNX Runtime distribution. Build the DirectML
@@ -475,7 +476,7 @@ If the build directory was previously configured for x86, x64, or another vcpkg
 triplet, remove only that generated directory before reconfiguring:
 
 ```powershell
-$nativeBuild = Resolve-Path build/RyoikiTenkai.Native.OpenCv -ErrorAction SilentlyContinue
+$nativeBuild = Resolve-Path build/RyoikiTenkai.Native.Qnn.Arm64 -ErrorAction SilentlyContinue
 if ($nativeBuild -and $nativeBuild.Path.StartsWith((Resolve-Path .).Path)) {
   Remove-Item -LiteralPath $nativeBuild.Path -Recurse -Force
 }
@@ -516,6 +517,21 @@ If loading fails with `0x800711C7`, Windows Application Control rejected the uns
 development DLL. Use the organization-approved development signing process or an
 approved development environment; do not disable the policy as a build workaround.
 
+## Orchestrated Agent Runs
+
+An external codex session can drive Claude Code as a non-interactive worker:
+
+```powershell
+powershell -NoProfile -File tools\codex-claude-task.ps1 -NativeBuildEnv `
+  -OutputFormat json -Task tmp\codex-task.md
+```
+
+The wrapper enters the ARM64 developer environment when asked, runs from the
+repository root, and applies the allow/deny lists in `.claude/settings.json`. The
+worker cannot run `dotnet run` or launch the WPF executable, so camera-dependent
+verification stays manual. See
+[`doc/codex-claude-orchestration.md`](doc/codex-claude-orchestration.md).
+
 ## Logs And Runtime Files
 
 WPF runtime log:
@@ -530,17 +546,17 @@ View latest log:
 Get-Content src/RyoikiTenkai.Wpf/bin/arm64/Debug/net10.0-windows10.0.26100.0/ryoikitenkai.log -Tail 100
 ```
 
-Gesture/action bindings are stored next to the running app:
+Gesture definitions, recording provenance, and action bindings share the native
+SQLite repository:
 
 ```text
-src/RyoikiTenkai.Wpf/bin/arm64/Debug/net10.0-windows10.0.26100.0/bindings.json
-src/RyoikiTenkai/bin/arm64/Debug/net10.0-windows10.0.26100.0/bindings.json
+%LOCALAPPDATA%\RyoikiTenkai\gestures.db
 ```
 
-Delete WPF bindings and let the app recreate the default sample:
+For isolated validation, override the repository path before starting WPF:
 
 ```powershell
-Remove-Item src/RyoikiTenkai.Wpf/bin/arm64/Debug/net10.0-windows10.0.26100.0/bindings.json
+$env:RYOIKI_GESTURE_DB = "$pwd\gesture-recordings\validation.db"
 ```
 
 ## Environment Variables
