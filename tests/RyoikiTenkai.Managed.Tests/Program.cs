@@ -37,6 +37,8 @@ await using (var handoff = new HandoffService(new StubHandoffPayloadProvider(), 
 {
     Require(handoff.GetStatus().State == HandoffState.Idle,
         "A fresh handoff service did not report Idle.");
+    Require(handoff.GetStatus().LastTransfer is null,
+        "A fresh handoff service reported a completed transfer.");
     await RequireThrowsAsync<InvalidOperationException>(
         () => handoff.ReleaseHereAsync(CancellationToken.None),
         "Releasing without an offer did not fail.");

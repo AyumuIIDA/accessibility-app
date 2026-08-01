@@ -43,13 +43,23 @@
                 <ScaleTransform x:Name="BadgeScale" ScaleX="0.92" ScaleY="0.92" />
             </Border.RenderTransform>
             <StackPanel Orientation="Horizontal">
+                <!-- A completed transfer shows the payload itself: the gesture
+                     gives no other confirmation of what actually moved. -->
+                <Border x:Name="BadgeThumbnailFrame" Visibility="Collapsed"
+                        Width="112" Height="72" CornerRadius="8" Margin="0,0,16,0"
+                        Background="{StaticResource SurfaceSunken}"
+                        BorderBrush="{StaticResource DividerStrong}" BorderThickness="1">
+                    <Border x:Name="BadgeThumbnail" CornerRadius="7" Margin="1" />
+                </Border>
                 <TextBlock x:Name="BadgeGlyph" Text="⇪" FontSize="21" Margin="0,0,12,0"
                            VerticalAlignment="Center" Foreground="{StaticResource Accent}" />
-                <StackPanel VerticalAlignment="Center">
+                <StackPanel VerticalAlignment="Center" MaxWidth="360">
                     <TextBlock x:Name="BadgeTitle" Text="Offering over LAN"
-                               FontSize="15" FontWeight="SemiBold" />
+                               FontSize="15" FontWeight="SemiBold"
+                               TextTrimming="CharacterEllipsis" />
                     <TextBlock x:Name="BadgeDetail" Text="" FontSize="11"
-                               Foreground="{StaticResource TextSecondary}" Margin="0,2,0,0" />
+                               Foreground="{StaticResource TextSecondary}" Margin="0,2,0,0"
+                               TextTrimming="CharacterEllipsis" />
                 </StackPanel>
             </StackPanel>
         </Border>

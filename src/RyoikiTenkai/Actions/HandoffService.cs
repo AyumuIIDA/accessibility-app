@@ -34,6 +34,7 @@ internal sealed class HandoffService : IAsyncDisposable
     private ReceivedOffer? _latest;
     private int _nextClientId;
     private bool _claiming;
+    private HandoffTransfer? _lastTransfer;
     private HandoffState _outcome = HandoffState.Idle;
     private string _outcomeMessage = "";
     private DateTimeOffset _outcomeAt;
@@ -57,19 +58,20 @@ internal sealed class HandoffService : IAsyncDisposable
         {
             var now = DateTimeOffset.UtcNow;
             var offer = SnapshotOffer(now);
-            if (_claiming) return new(HandoffState.Claiming, "Claiming the offer…", offer);
+            var transfer = _lastTransfer;
+            if (_claiming) return new(HandoffState.Claiming, "Claiming the offer…", offer, transfer);
             if (_outcome is HandoffState.Completed or HandoffState.Failed
                 && now - _outcomeAt < OutcomeDisplayWindow)
-                return new(_outcome, _outcomeMessage, offer);
+                return new(_outcome, _outcomeMessage, offer, transfer);
             if (_active is { } payload && !_claimed && payload.CreatedAt + OfferTtl > now)
                 return new(HandoffState.Advertising,
                     $"Offering {payload.FileName} · {(payload.CreatedAt + OfferTtl - now).TotalSeconds:0}s left",
-                    offer);
+                    offer, transfer);
             if (offer is not null)
                 return new(HandoffState.OfferAvailable,
                     $"{offer.FileName} from {offer.SenderName} · {(offer.ExpiresAt - now).TotalSeconds:0}s left",
-                    offer);
-            return new(HandoffState.Idle, "Waiting for offers", null);
+                    offer, transfer);
+            return new(HandoffState.Idle, "Waiting for offers", null, transfer);
         }
     }
 
@@ -123,6 +125,8 @@ internal sealed class HandoffService : IAsyncDisposable
             {
                 _claiming = false;
                 if (ReferenceEquals(_latest, offer)) _latest = null;
+                _lastTransfer = new(HandoffDirection.Received, offer.PayloadId, Path.GetFileName(path),
+                    header.ContentType, data.LongLength, offer.SenderName, DateTimeOffset.UtcNow, data, path);
                 RecordOutcomeLocked(HandoffState.Completed, "Received " + Path.GetFileName(path));
             }
             await _provider.OpenReceivedFileAsync(path, cancellationToken).ConfigureAwait(false);
@@ -238,6 +242,7 @@ internal sealed class HandoffService : IAsyncDisposable
 
     private async Task ServeClientAsync(TcpClient client, CancellationToken token)
     {
+        var peer = DescribePeer(client);
         using (client)
         await using (var stream = client.GetStream())
         {
@@ -262,11 +267,30 @@ internal sealed class HandoffService : IAsyncDisposable
                 lock (_gate)
                 {
                     if (_active?.PayloadId == payload.PayloadId) _active = null;
+                    _lastTransfer = new(HandoffDirection.Sent, payload.PayloadId, payload.FileName,
+                        payload.ContentType, payload.Data.LongLength, peer, DateTimeOffset.UtcNow,
+                        payload.Data, null);
                     RecordOutcomeLocked(HandoffState.Completed, "Sent " + payload.FileName);
                 }
                 _log($"Handoff sent: {payload.FileName}");
             }
             catch { lock (_gate) if (_active?.PayloadId == payload.PayloadId) _claimed = false; throw; }
+        }
+    }
+
+    /// <summary>
+    /// The claim message carries no identity, so a sent transfer names its peer
+    /// by address rather than extending the wire format for a display string.
+    /// </summary>
+    private static string DescribePeer(TcpClient client)
+    {
+        try
+        {
+            return (client.Client.RemoteEndPoint as IPEndPoint)?.Address.ToString() ?? "an unknown peer";
+        }
+        catch (Exception exception) when (exception is SocketException or ObjectDisposedException)
+        {
+            return "an unknown peer";
         }
     }
 

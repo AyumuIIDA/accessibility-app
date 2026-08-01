@@ -42,6 +42,12 @@ public partial class MainWindow : Window
     private readonly HandoffService _handoffService;
     private HandoffEffectWindow? _handoffEffect;
     private HandoffState _lastHandoffState = HandoffState.Idle;
+    private string? _lastTransferKey;
+    private string? _lastTransferPath;
+    private System.Windows.Media.ImageSource? _lastTransferImage;
+
+    /// <summary>Wide enough to recognize a screenshot, far short of a viewer.</summary>
+    private const int TransferPreviewWidth = 480;
 
     /// <summary>Semantic colours come from Theme.xaml so code-driven states match the XAML.</summary>
     private static System.Windows.Media.Brush ThemeBrush(string key) =>
@@ -733,8 +739,150 @@ public partial class MainWindow : Window
         };
         HandoffStatusText.Foreground = accent;
         HandoffStatusDot.Fill = accent;
+        // Decode before the effect so a completed transfer can show its payload.
+        UpdateLastTransfer(status.LastTransfer);
         PlayHandoffEffectOnChange(status);
     }
+
+    /// <summary>
+    /// Renders the receipt for a newly completed transfer. Nothing clears it:
+    /// after the effect fades this is the only record of what moved.
+    /// </summary>
+    private void UpdateLastTransfer(HandoffTransfer? transfer)
+    {
+        if (transfer is null) return;
+        var key = $"{transfer.Direction}:{transfer.PayloadId}";
+        if (StringComparer.Ordinal.Equals(key, _lastTransferKey)) return;
+        _lastTransferKey = key;
+        _lastTransferPath = transfer.LocalPath;
+        _lastTransferImage = TryDecodeTransferPreview(transfer);
+
+        var received = transfer.Direction == HandoffDirection.Received;
+        LastTransferGlyph.Text = received ? "↓" : "↑";
+        LastTransferGlyph.Foreground = ThemeBrush(received ? "Success" : "Accent");
+        LastTransferHeadline.Text = received
+            ? $"Received from {transfer.PeerName}"
+            : $"Sent to {transfer.PeerName}";
+        LastTransferDetail.Text =
+            $"{transfer.FileName} · {DescribeByteSize(transfer.Length)} · {transfer.CompletedAt.ToLocalTime():HH:mm:ss}";
+        LastTransferThumbnail.Background = _lastTransferImage is null
+            ? null
+            : new System.Windows.Media.ImageBrush(_lastTransferImage)
+            {
+                Stretch = System.Windows.Media.Stretch.UniformToFill
+            };
+        LastTransferThumbnailFallback.Visibility = _lastTransferImage is null
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        var openable = _lastTransferPath is not null && System.IO.File.Exists(_lastTransferPath);
+        LastTransferCard.Cursor = openable ? System.Windows.Input.Cursors.Hand : null;
+        LastTransferCard.ToolTip = BuildTransferTooltip(transfer, openable);
+        LastTransferCard.Visibility = Visibility.Visible;
+    }
+
+    /// <summary>
+    /// A larger look at the payload, built in code so the preview brush and the
+    /// pointer hint stay together with the transfer they describe.
+    /// </summary>
+    private object BuildTransferTooltip(HandoffTransfer transfer, bool openable)
+    {
+        var content = new StackPanel { MaxWidth = 360 };
+        if (_lastTransferImage is not null)
+        {
+            content.Children.Add(new Border
+            {
+                Height = 200,
+                CornerRadius = new CornerRadius(6),
+                Background = new System.Windows.Media.ImageBrush(_lastTransferImage)
+                {
+                    Stretch = System.Windows.Media.Stretch.Uniform
+                }
+            });
+        }
+        content.Children.Add(new TextBlock
+        {
+            Text = transfer.FileName,
+            FontWeight = FontWeights.SemiBold,
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(0, _lastTransferImage is null ? 0 : 10, 0, 0)
+        });
+        var caption = transfer.Direction == HandoffDirection.Received
+            ? $"Received from {transfer.PeerName} · {DescribeByteSize(transfer.Length)}"
+            : $"Sent to {transfer.PeerName} · {DescribeByteSize(transfer.Length)}";
+        if (transfer.LocalPath is { } path) caption += "\n" + path;
+        if (openable) caption += "\nClick to open";
+        content.Children.Add(new TextBlock
+        {
+            Text = caption,
+            Foreground = ThemeBrush("TextSecondary"),
+            FontSize = 11,
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(0, 4, 0, 0)
+        });
+        return new ToolTip
+        {
+            Content = new Border
+            {
+                Style = (Style)Application.Current.Resources["Card"],
+                Padding = new Thickness(12),
+                Child = content
+            },
+            Background = System.Windows.Media.Brushes.Transparent,
+            BorderThickness = new Thickness(0),
+            Padding = new Thickness(0),
+            HasDropShadow = false
+        };
+    }
+
+    private System.Windows.Media.ImageSource? TryDecodeTransferPreview(HandoffTransfer transfer)
+    {
+        if (!transfer.ContentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase)
+            || transfer.Data.IsEmpty)
+        {
+            return null;
+        }
+        try
+        {
+            using var stream = new System.IO.MemoryStream(transfer.Data.ToArray());
+            var image = new System.Windows.Media.Imaging.BitmapImage();
+            image.BeginInit();
+            // OnLoad decodes while the stream is alive; the receipt outlives it.
+            image.CacheOption = System.Windows.Media.Imaging.BitmapCacheOption.OnLoad;
+            image.DecodePixelWidth = TransferPreviewWidth;
+            image.StreamSource = stream;
+            image.EndInit();
+            image.Freeze();
+            return image;
+        }
+        catch (Exception exception) when (exception is NotSupportedException
+            or ArgumentException or System.IO.IOException or OverflowException)
+        {
+            Log("Handoff preview could not be decoded: " + exception.Message);
+            return null;
+        }
+    }
+
+    private void LastTransferCard_MouseLeftButtonUp(object sender, System.Windows.Input.MouseButtonEventArgs e)
+    {
+        if (_lastTransferPath is not { } path || !System.IO.File.Exists(path)) return;
+        try
+        {
+            System.Diagnostics.Process.Start(
+                new System.Diagnostics.ProcessStartInfo(path) { UseShellExecute = true });
+        }
+        catch (Exception exception) when (exception is System.ComponentModel.Win32Exception
+            or InvalidOperationException or System.IO.IOException)
+        {
+            Log("Could not open the received file: " + exception.Message);
+        }
+    }
+
+    private static string DescribeByteSize(long bytes) => bytes switch
+    {
+        >= 1024 * 1024 => $"{bytes / (1024.0 * 1024.0):0.0} MB",
+        >= 1024 => $"{bytes / 1024.0:0} KB",
+        _ => $"{bytes} B"
+    };
 
     /// <summary>
     /// The transfer is invisible otherwise: the operator's hand is on the
@@ -766,7 +914,19 @@ public partial class MainWindow : Window
             HandoffState.Failed => "Handoff failed",
             _ => "Offer available"
         };
+        var detail = status.Message;
+        System.Windows.Media.ImageSource? preview = null;
+        // On completion the payload itself is the message: name what moved,
+        // where it went or came from, and show it.
+        if (status.State == HandoffState.Completed && status.LastTransfer is { } transfer)
+        {
+            title = transfer.Direction == HandoffDirection.Received
+                ? $"Received from {transfer.PeerName}"
+                : $"Sent to {transfer.PeerName}";
+            detail = $"{transfer.FileName} · {DescribeByteSize(transfer.Length)}";
+            preview = _lastTransferImage;
+        }
         _handoffEffect ??= new HandoffEffectWindow { Owner = this };
-        _handoffEffect.Play(this, effect, title, status.Message);
+        _handoffEffect.Play(this, effect, title, detail, preview);
     }
 }

@@ -194,6 +194,7 @@
 
         <Grid Grid.Row="2" Margin="0,16,0,0">
             <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="*" />
                 <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
@@ -203,7 +204,44 @@
                 <TextBlock x:Name="StateText" Text="Camera stopped" FontSize="14"
                            Foreground="{StaticResource TextSecondary}" VerticalAlignment="Center" />
             </StackPanel>
-            <Border Grid.Column="1" Style="{StaticResource StatusPill}">
+
+            <!-- Receipt for the last completed transfer. The effect is transient
+                 and the gesture gives no confirmation, so what was sent or
+                 received stays visible here until the next transfer. -->
+            <Border x:Name="LastTransferCard" Grid.Column="1" Visibility="Collapsed"
+                    HorizontalAlignment="Right" VerticalAlignment="Center" MaxWidth="460"
+                    Margin="20,0,16,0" Padding="8,7" CornerRadius="10"
+                    Background="{StaticResource Surface}" BorderThickness="1"
+                    BorderBrush="{StaticResource Divider}"
+                    MouseLeftButtonUp="LastTransferCard_MouseLeftButtonUp">
+                <StackPanel Orientation="Horizontal">
+                    <Border Width="52" Height="34" CornerRadius="6" Margin="0,0,11,0"
+                            Background="{StaticResource SurfaceSunken}" BorderThickness="1"
+                            BorderBrush="{StaticResource Divider}">
+                        <Grid>
+                            <TextBlock x:Name="LastTransferThumbnailFallback" Text="▤" FontSize="15"
+                                       HorizontalAlignment="Center" VerticalAlignment="Center"
+                                       Foreground="{StaticResource TextMuted}" />
+                            <Border x:Name="LastTransferThumbnail" CornerRadius="5" Margin="1" />
+                        </Grid>
+                    </Border>
+                    <StackPanel VerticalAlignment="Center">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock x:Name="LastTransferGlyph" Text="↑" FontSize="12"
+                                       FontWeight="Bold" Margin="0,0,6,0" VerticalAlignment="Center"
+                                       Foreground="{StaticResource Accent}" />
+                            <TextBlock x:Name="LastTransferHeadline" Text="" FontSize="12"
+                                       FontWeight="SemiBold" VerticalAlignment="Center"
+                                       TextTrimming="CharacterEllipsis" />
+                        </StackPanel>
+                        <TextBlock x:Name="LastTransferDetail" Text="" Margin="0,2,0,0"
+                                   Style="{StaticResource CaptionText}"
+                                   TextTrimming="CharacterEllipsis" />
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <Border Grid.Column="2" Style="{StaticResource StatusPill}">
                 <StackPanel Orientation="Horizontal">
                     <TextBlock Text="Inference" Foreground="{StaticResource TextMuted}"
                                FontSize="12" Margin="0,0,10,0" VerticalAlignment="Center" />

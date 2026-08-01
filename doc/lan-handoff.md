@@ -57,6 +57,27 @@ expands for `Advertising` and contracts for `Claiming`, so send and receive are
 distinguishable at a glance. `OfferAvailable` only plays on the way up from
 `Idle`, so a peer re-advertising every 900 ms cannot strobe the screen.
 
+## What moved
+
+`GetStatus().LastTransfer` carries the last completed transfer: direction, file
+name, size, peer, completion time, the payload bytes, and — for a received file —
+its path on disk. The gesture itself confirms nothing, so this is how the
+operator learns *what* was sent or received rather than only that something was:
+
+- The `Completed` effect names the peer, names the file, and shows the payload as
+  a thumbnail. A cue carrying a preview holds for 2.2 s instead of 0.78 s, which
+  is the difference between seeing a flash and reading a file name.
+- The main window's footer keeps a receipt card with the same thumbnail, which
+  survives the effect and stays until the next transfer replaces it. Hovering it
+  shows a larger preview and the full path; clicking a received file opens it.
+
+Exactly one payload is retained, bounded by the 16 MiB payload limit. The sender
+keeps the bytes because the payload stops being advertised the moment it is
+claimed, and the receipt has to outlive that. Previews are decoded once per
+transfer at `DecodePixelWidth = 480` and frozen. A claim message carries no
+identity, so the sending side reports its peer by address while the receiving
+side uses the machine name from the offer broadcast.
+
 A `handoff.release` with no unexpired offer fails rather than picking a peer, so a
 release gesture can never send to an arbitrary device. When several peers are
 advertising, the most recently received unexpired offer is the claim target;

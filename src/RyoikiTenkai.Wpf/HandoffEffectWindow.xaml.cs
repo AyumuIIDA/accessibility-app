@@ -29,7 +29,11 @@ public partial class HandoffEffectWindow : Window
     private const int WsExNoActivate = 0x08000000;
     private const int WsExToolWindow = 0x00000080;
 
-    private static readonly Duration EffectDuration = new(TimeSpan.FromMilliseconds(1150));
+    // A cue with a payload preview has to stay up long enough to read the file
+    // name and recognize the image; a phase cue does not.
+    private static readonly TimeSpan CueHold = TimeSpan.FromMilliseconds(780);
+    private static readonly TimeSpan PreviewHold = TimeSpan.FromMilliseconds(2200);
+    private static readonly TimeSpan FadeOut = TimeSpan.FromMilliseconds(420);
 
     private readonly Storyboard _storyboard = new();
 
@@ -43,8 +47,11 @@ public partial class HandoffEffectWindow : Window
     /// <summary>
     /// Positions the effect over <paramref name="owner"/> and plays one pass.
     /// Replays restart the storyboard rather than stacking windows.
+    /// <paramref name="preview"/> is the transferred payload, shown so the
+    /// operator sees what moved and not merely that something did.
     /// </summary>
-    internal void Play(Window owner, HandoffEffectKind kind, string title, string detail)
+    internal void Play(Window owner, HandoffEffectKind kind, string title, string detail,
+        ImageSource? preview = null)
     {
         if (!TryTrackOwner(owner)) return;
 
@@ -73,8 +80,13 @@ public partial class HandoffEffectWindow : Window
         BadgeDetail.Visibility = string.IsNullOrWhiteSpace(detail)
             ? Visibility.Collapsed
             : Visibility.Visible;
+        BadgeThumbnail.Background = preview is null
+            ? null
+            : new ImageBrush(preview) { Stretch = Stretch.UniformToFill };
+        BadgeThumbnailFrame.Visibility = preview is null ? Visibility.Collapsed : Visibility.Visible;
+        BadgeThumbnailFrame.BorderBrush = accent;
 
-        BuildStoryboard(kind);
+        BuildStoryboard(kind, preview is not null);
         Show();
         _storyboard.Begin(this, true);
     }
@@ -95,10 +107,12 @@ public partial class HandoffEffectWindow : Window
         return true;
     }
 
-    private void BuildStoryboard(HandoffEffectKind kind)
+    private void BuildStoryboard(HandoffEffectKind kind, bool hasPreview)
     {
         _storyboard.Stop(this);
         _storyboard.Children.Clear();
+
+        var hold = hasPreview ? PreviewHold : CueHold;
 
         // Offering pushes outward; claiming pulls inward. Terminal states settle.
         var (ringFrom, ringTo) = kind switch
@@ -111,8 +125,7 @@ public partial class HandoffEffectWindow : Window
 
         AddDouble(Root, UIElement.OpacityProperty, 0.0, 1.0, TimeSpan.Zero,
             TimeSpan.FromMilliseconds(140));
-        AddDouble(Root, UIElement.OpacityProperty, 1.0, 0.0, TimeSpan.FromMilliseconds(780),
-            TimeSpan.FromMilliseconds(370));
+        AddDouble(Root, UIElement.OpacityProperty, 1.0, 0.0, hold, FadeOut);
 
         AddDouble(Ring, UIElement.OpacityProperty, 0.0, 0.85, TimeSpan.Zero,
             TimeSpan.FromMilliseconds(120));
@@ -135,7 +148,7 @@ public partial class HandoffEffectWindow : Window
         AddScale(BadgeScale, 0.9, 1.0, TimeSpan.Zero, TimeSpan.FromMilliseconds(260),
             new BackEase { EasingMode = EasingMode.EaseOut, Amplitude = 0.4 });
 
-        _storyboard.Duration = EffectDuration;
+        _storyboard.Duration = new Duration(hold + FadeOut);
     }
 
     private void AddDouble(DependencyObject target, DependencyProperty property,
