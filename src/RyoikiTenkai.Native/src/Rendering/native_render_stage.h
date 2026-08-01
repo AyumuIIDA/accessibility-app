@@ -41,9 +41,7 @@ public:
     void publishPerception(
         hand_perception::HandPerceptionResult perception,
         std::uint64_t sourceFrameId,
-        hand_input::recognition::HandStateResult domainSignState,
-        hand_input::recognition::HandStateResult openPalmState,
-        hand_input::recognition::HandEvent latestEvent);
+        hand_input::recognition::HandStateResult domainSignState);
     void resize(std::uint32_t width, std::uint32_t height);
     void updateHand3dView(Hand3dView view);
     void requestRedraw();
@@ -69,8 +67,6 @@ private:
     hand_perception::HandPerceptionResult latestPerception_{};
     std::uint64_t latestPerceptionFrameId_{0};
     hand_input::recognition::HandStateResult latestDomainSignState_{};
-    hand_input::recognition::HandStateResult latestOpenPalmState_{};
-    hand_input::recognition::HandEvent latestEvent_{};
     std::optional<PixelSize> pendingResize_;
     std::optional<Hand3dView> pendingHand3dView_;
     PresentationCallback presentationCallback_;

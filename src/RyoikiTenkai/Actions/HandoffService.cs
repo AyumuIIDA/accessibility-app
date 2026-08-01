@@ -14,6 +14,7 @@ internal sealed class HandoffService : IAsyncDisposable
     private const int MaximumProtocolLineBytes = 4096;
     private static readonly TimeSpan OfferTtl = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan RepeatInterval = TimeSpan.FromMilliseconds(900);
+    private static readonly TimeSpan OutcomeDisplayWindow = TimeSpan.FromSeconds(10);
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly IHandoffPayloadProvider _provider;
     private readonly Action<string> _log;
@@ -32,6 +33,10 @@ internal sealed class HandoffService : IAsyncDisposable
     private bool _claimed;
     private ReceivedOffer? _latest;
     private int _nextClientId;
+    private bool _claiming;
+    private HandoffState _outcome = HandoffState.Idle;
+    private string _outcomeMessage = "";
+    private DateTimeOffset _outcomeAt;
 
     public HandoffService(IHandoffPayloadProvider provider, Action<string> log,
         int offerPort = DefaultOfferPort)
@@ -40,23 +45,57 @@ internal sealed class HandoffService : IAsyncDisposable
         _receiveTask = ReceiveOffersAsync(_shutdown.Token);
     }
 
-    public HandoffOffer? LatestOffer
+    public HandoffOffer? LatestOffer { get { lock (_gate) return SnapshotOffer(DateTimeOffset.UtcNow); } }
+
+    /// <summary>
+    /// Phase to display passively. Both handoff sides are driven by recognized
+    /// gestures, so the caller only observes; it never advances this state.
+    /// </summary>
+    public HandoffStatus GetStatus()
     {
-        get { lock (_gate) return _latest is { } x && x.ExpiresAt > DateTimeOffset.UtcNow
-                ? new(x.PayloadId, x.SenderName, x.FileName, x.ContentType, x.Length, x.ExpiresAt) : null; }
+        lock (_gate)
+        {
+            var now = DateTimeOffset.UtcNow;
+            var offer = SnapshotOffer(now);
+            if (_claiming) return new(HandoffState.Claiming, "Claiming the offer…", offer);
+            if (_outcome is HandoffState.Completed or HandoffState.Failed
+                && now - _outcomeAt < OutcomeDisplayWindow)
+                return new(_outcome, _outcomeMessage, offer);
+            if (_active is { } payload && !_claimed && payload.CreatedAt + OfferTtl > now)
+                return new(HandoffState.Advertising,
+                    $"Offering {payload.FileName} · {(payload.CreatedAt + OfferTtl - now).TotalSeconds:0}s left",
+                    offer);
+            if (offer is not null)
+                return new(HandoffState.OfferAvailable,
+                    $"{offer.FileName} from {offer.SenderName} · {(offer.ExpiresAt - now).TotalSeconds:0}s left",
+                    offer);
+            return new(HandoffState.Idle, "Waiting for offers", null);
+        }
     }
 
     public async Task GrabScreenshotAsync(CancellationToken cancellationToken)
     {
-        var payload = await _provider.CaptureScreenshotAsync(cancellationToken).ConfigureAwait(false);
-        if (payload is null) throw new InvalidOperationException("Screenshot capture returned no data.");
-        ValidatePayload(payload);
-        EnsureTransferServer();
+        HandoffPayload? payload;
+        try
+        {
+            payload = await _provider.CaptureScreenshotAsync(cancellationToken).ConfigureAwait(false);
+            if (payload is null) throw new InvalidOperationException("Screenshot capture returned no data.");
+            ValidatePayload(payload);
+            EnsureTransferServer();
+        }
+        catch (Exception exception)
+        {
+            RecordOutcome(HandoffState.Failed, "Grab failed: " + exception.Message);
+            throw;
+        }
         lock (_gate)
         {
             _active = payload with { FileName = SafeFileName(payload.FileName) };
             _claimToken = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
             _claimed = false;
+            _outcome = HandoffState.Advertising;
+            _outcomeMessage = "";
+            _outcomeAt = DateTimeOffset.UtcNow;
         }
         _broadcastTask ??= BroadcastOffersAsync(_shutdown.Token);
         _log($"Handoff offer ready: {payload.FileName}");
@@ -65,14 +104,57 @@ internal sealed class HandoffService : IAsyncDisposable
     public async Task<string> ReleaseHereAsync(CancellationToken cancellationToken)
     {
         ReceivedOffer offer;
-        lock (_gate) offer = _latest is { ExpiresAt: var expiry } value && expiry > DateTimeOffset.UtcNow
-            ? value : throw new InvalidOperationException("No unexpired handoff offer is available.");
-        var (header, data) = await ClaimAsync(offer, cancellationToken).ConfigureAwait(false);
-        var path = await _provider.SaveReceivedFileAsync(SafeFileName(header.FileName), data,
-            cancellationToken).ConfigureAwait(false);
-        await _provider.OpenReceivedFileAsync(path, cancellationToken).ConfigureAwait(false);
-        _log($"Handoff received: {path}");
-        return path;
+        lock (_gate)
+        {
+            if (_latest is not { } value || value.ExpiresAt <= DateTimeOffset.UtcNow)
+            {
+                RecordOutcomeLocked(HandoffState.Failed, "No unexpired offer is available");
+                throw new InvalidOperationException("No unexpired handoff offer is available.");
+            }
+            offer = value;
+            _claiming = true;
+        }
+        try
+        {
+            var (header, data) = await ClaimAsync(offer, cancellationToken).ConfigureAwait(false);
+            var path = await _provider.SaveReceivedFileAsync(SafeFileName(header.FileName), data,
+                cancellationToken).ConfigureAwait(false);
+            lock (_gate)
+            {
+                _claiming = false;
+                if (ReferenceEquals(_latest, offer)) _latest = null;
+                RecordOutcomeLocked(HandoffState.Completed, "Received " + Path.GetFileName(path));
+            }
+            await _provider.OpenReceivedFileAsync(path, cancellationToken).ConfigureAwait(false);
+            _log($"Handoff received: {path}");
+            return path;
+        }
+        catch (Exception exception)
+        {
+            lock (_gate)
+            {
+                _claiming = false;
+                RecordOutcomeLocked(HandoffState.Failed, "Release failed: " + exception.Message);
+            }
+            throw;
+        }
+    }
+
+    private HandoffOffer? SnapshotOffer(DateTimeOffset now) =>
+        _latest is { } x && x.ExpiresAt > now
+            ? new(x.PayloadId, x.SenderName, x.FileName, x.ContentType, x.Length, x.ExpiresAt)
+            : null;
+
+    private void RecordOutcome(HandoffState state, string message)
+    {
+        lock (_gate) RecordOutcomeLocked(state, message);
+    }
+
+    private void RecordOutcomeLocked(HandoffState state, string message)
+    {
+        _outcome = state;
+        _outcomeMessage = message;
+        _outcomeAt = DateTimeOffset.UtcNow;
     }
 
     private void EnsureTransferServer()
@@ -177,7 +259,12 @@ internal sealed class HandoffService : IAsyncDisposable
                 await WriteHeaderAsync(stream, new("handoff.payload", payload.FileName,
                     payload.ContentType, payload.Data.LongLength), token).ConfigureAwait(false);
                 await stream.WriteAsync(payload.Data, token).ConfigureAwait(false);
-                lock (_gate) if (_active?.PayloadId == payload.PayloadId) _active = null;
+                lock (_gate)
+                {
+                    if (_active?.PayloadId == payload.PayloadId) _active = null;
+                    RecordOutcomeLocked(HandoffState.Completed, "Sent " + payload.FileName);
+                }
+                _log($"Handoff sent: {payload.FileName}");
             }
             catch { lock (_gate) if (_active?.PayloadId == payload.PayloadId) _claimed = false; throw; }
         }

@@ -27,25 +27,25 @@ public partial class MainWindow : Window
     private bool _isGestureRecording;
     private bool _nativeRecordingBegan;
     private bool _isRecordingCountdown;
-    private uint _pendingTemplateId;
     private bool _awaitingNativeRecordingStart;
+    private uint _pendingTemplateId;
     private uint _validationTemplateId;
     private uint _currentRecordingTrial = 1;
-    private readonly Dictionary<uint, string> _gestureNames = [];
-    private readonly Dictionary<uint, GestureCommandBinding> _savedGestureBindings = [];
     private GestureDtwDebugWindow? _dtwDebugWindow;
     private GestureRecordingPlaybackWindow? _recordingPlaybackWindow;
+    private GestureActionWindow? _gestureActionWindow;
     private DateTimeOffset _lastValidationMatchAt;
     private readonly MutableGestureBindingResolver _gestureBindings = new();
+    private readonly GestureCatalog _gestureCatalog;
     private readonly NativeGestureEventPump _gestureEventPump;
     private CancellationTokenSource _gestureDispatchCancellation = new();
     private readonly HandoffService _handoffService;
+    private HandoffEffectWindow? _handoffEffect;
+    private HandoffState _lastHandoffState = HandoffState.Idle;
 
-    private sealed record SavedGestureItem(uint Id, string Name, bool Enabled, uint TakeCount)
-    {
-        public override string ToString() =>
-            $"{Name}  ·  {TakeCount} takes  ·  {(Enabled ? "Enabled" : "Disabled")}";
-    }
+    /// <summary>Semantic colours come from Theme.xaml so code-driven states match the XAML.</summary>
+    private static System.Windows.Media.Brush ThemeBrush(string key) =>
+        (System.Windows.Media.Brush)Application.Current.Resources[key];
 
     public MainWindow()
     {
@@ -57,6 +57,8 @@ public partial class MainWindow : Window
             : System.IO.Path.GetFullPath(metricsPath);
         NativeVisionHostControl.DiagnosticLogged += Log;
         _handoffService = new HandoffService(new WpfHandoffPayloadProvider(this), Log);
+        _gestureCatalog = new GestureCatalog(NativeVisionHostControl, _gestureBindings);
+        _gestureCatalog.Refreshed += (_, _) => GestureCatalogSummaryText.Text = _gestureCatalog.Status;
         _gestureEventPump = new NativeGestureEventPump(
             NativeVisionHostControl,
             new GestureCommandDispatcher(_gestureBindings, new ActionExecutor(_handoffService)),
@@ -72,12 +74,14 @@ public partial class MainWindow : Window
     {
         StartButton.IsEnabled = false;
         StopButton.IsEnabled = true;
-        StateText.Text = "Starting camera and hand models…";
+        SetCameraStatus("Starting camera and hand models…", "Warning");
         NativeVisionHostControl.Visibility = Visibility.Visible;
+        PreviewPlaceholder.Visibility = Visibility.Collapsed;
         if (!NativeVisionHostControl.StartNativeRuntime())
         {
             NativeVisionHostControl.Visibility = Visibility.Collapsed;
-            StateText.Text = "Camera could not start";
+            PreviewPlaceholder.Visibility = Visibility.Visible;
+            SetCameraStatus("Camera could not start", "Danger");
             StartButton.IsEnabled = true;
             StopButton.IsEnabled = false;
             Log("Native runtime is required; no managed inference fallback exists.");
@@ -91,8 +95,8 @@ public partial class MainWindow : Window
         _gestureEventPump.Reset();
         InitializeNativeMetricsFile();
         _nativePollTimer.Start();
-        StateText.Text = "Camera running";
-        RefreshSavedGestures();
+        SetCameraStatus("Camera running", "Success");
+        _gestureCatalog.Refresh();
         if (RegistrationPanel.Visibility == Visibility.Visible)
         {
             StartGestureRecordingButton.IsEnabled = true;
@@ -104,9 +108,15 @@ public partial class MainWindow : Window
     private void StopButton_Click(object sender, RoutedEventArgs e)
     {
         StopNativeRuntime();
-        StateText.Text = "Camera stopped";
+        SetCameraStatus("Camera stopped", "TextMuted");
         StartButton.IsEnabled = true;
         StopButton.IsEnabled = false;
+    }
+
+    private void SetCameraStatus(string message, string brushKey)
+    {
+        StateText.Text = message;
+        CameraStatusDot.Fill = ThemeBrush(brushKey);
     }
 
     private void OpenCadViewerButton_Click(object sender, RoutedEventArgs e)
@@ -122,9 +132,37 @@ public partial class MainWindow : Window
             _dtwDebugWindow.Activate();
             return;
         }
-        _dtwDebugWindow = new GestureDtwDebugWindow(NativeVisionHostControl) { Owner = this };
+        _dtwDebugWindow = new GestureDtwDebugWindow(NativeVisionHostControl, _gestureCatalog) { Owner = this };
         _dtwDebugWindow.Closed += (_, _) => _dtwDebugWindow = null;
         _dtwDebugWindow.Show();
+    }
+
+    private void OpenGestureActionsButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_gestureActionWindow is { IsVisible: true })
+        {
+            _gestureActionWindow.Activate();
+            return;
+        }
+        _gestureCatalog.Refresh();
+        _gestureActionWindow = new GestureActionWindow(_gestureCatalog) { Owner = this };
+        _gestureActionWindow.ReviewRequested += GestureActionWindow_ReviewRequested;
+        _gestureActionWindow.Closed += (_, _) => _gestureActionWindow = null;
+        _gestureActionWindow.Show();
+    }
+
+    private void GestureActionWindow_ReviewRequested(object? sender, SavedGestureItem item)
+    {
+        // Playback keeps a non-owning native runtime pointer, so this window
+        // owns its lifetime and destroys it before the runtime stops.
+        if (_recordingPlaybackWindow is { IsVisible: true })
+        {
+            _recordingPlaybackWindow.Close();
+        }
+        _recordingPlaybackWindow = new GestureRecordingPlaybackWindow(
+            NativeVisionHostControl, item.Id, item.Name) { Owner = this };
+        _recordingPlaybackWindow.Closed += (_, _) => _recordingPlaybackWindow = null;
+        _recordingPlaybackWindow.Show();
     }
 
     private void EnterGestureRegistrationModeButton_Click(object sender, RoutedEventArgs e)
@@ -132,7 +170,7 @@ public partial class MainWindow : Window
         RegistrationColumn.Width = new GridLength(420);
         RegistrationPanel.Visibility = Visibility.Visible;
         OpenGestureRegistrationButton.IsEnabled = false;
-        RefreshSavedGestures();
+        _gestureCatalog.Refresh();
         ResetRecordingUi(NativeVisionHostControl.IsStarted
             ? "Keep only the hand you want to record in view."
             : "Start the camera before recording a gesture.");
@@ -169,11 +207,24 @@ public partial class MainWindow : Window
             return;
         }
 
-        _pendingTemplateId = CreateStableTemplateId(name);
-        if (!TryRepositoryOperation(
-                () => NativeVisionHostControl.SetGestureDefinitionMetadata(_pendingTemplateId, name, true),
-                "Ready to record.", "The gesture name could not be prepared for saving."))
+        var startingNewSession = _pendingTemplateId == 0 || _validationTemplateId != 0;
+        if (startingNewSession)
         {
+            // Completed and cancelled status snapshots intentionally remain
+            // pollable in native code. Explicitly terminate the previous
+            // workflow before reusing a stable ID for three fresh takes.
+            NativeVisionHostControl.CancelGestureRecording();
+            _validationTemplateId = 0;
+            _currentRecordingTrial = 1;
+            AcceptedTrialsProgress.Value = 0;
+            GestureValidationPanel.Visibility = Visibility.Collapsed;
+        }
+        _pendingTemplateId = CreateStableTemplateId(name);
+        if (!_gestureCatalog.PrepareDefinition(_pendingTemplateId, name))
+        {
+            // The catalog status text now lives in the action window, so the
+            // recording panel has to report its own failure.
+            RecordingQualityText.Text = _gestureCatalog.Status;
             return;
         }
         _isGestureRecording = true;
@@ -184,7 +235,7 @@ public partial class MainWindow : Window
         StartGestureRecordingButton.Visibility = Visibility.Collapsed;
         StopGestureRecordingButton.Visibility = Visibility.Collapsed;
         RecordingPhaseText.Text = "GET READY";
-        RecordingPhaseText.Foreground = System.Windows.Media.Brushes.Gold;
+        RecordingPhaseText.Foreground = ThemeBrush("Warning");
         RecordingClockText.Text = "3";
         RecordingProgressBar.Value = 0;
         RecordingTrialText.Text = $"TRIAL {_currentRecordingTrial} OF 3";
@@ -200,26 +251,14 @@ public partial class MainWindow : Window
         _recordingDisplayTimer.Stop();
         _isGestureRecording = false;
         RecordingPhaseText.Text = "PROCESSING";
-        RecordingPhaseText.Foreground = System.Windows.Media.Brushes.Gold;
+        RecordingPhaseText.Foreground = ThemeBrush("Warning");
         RecordingClockText.Text = string.Empty;
         RecordingInstructionText.Text = "Checking motion quality and building the gesture template.";
-        var startingNewSession = _pendingTemplateId == 0 || _validationTemplateId != 0;
-        if (startingNewSession)
-        {
-            // Completed and cancelled status snapshots intentionally remain
-            // pollable in native code. Explicitly terminate the previous
-            // workflow before reusing a stable ID for three fresh takes.
-            NativeVisionHostControl.CancelGestureRecording();
-            _validationTemplateId = 0;
-            _currentRecordingTrial = 1;
-            AcceptedTrialsProgress.Value = 0;
-            GestureValidationPanel.Visibility = Visibility.Collapsed;
-        }
         StopGestureRecordingButton.IsEnabled = false;
         if (!NativeVisionHostControl.FinishGestureRecording())
         {
             RecordingPhaseText.Text = "TRY AGAIN";
-            RecordingPhaseText.Foreground = System.Windows.Media.Brushes.OrangeRed;
+            RecordingPhaseText.Foreground = ThemeBrush("Danger");
             RecordingQualityText.Text = "The recording could not be saved. Please try again.";
             ShowRecordingRetry();
         }
@@ -249,9 +288,17 @@ public partial class MainWindow : Window
             RecordingPhaseText.Text = "START NOW";
             if (!NativeVisionHostControl.BeginGestureRecording(_pendingTemplateId))
             {
+                _awaitingNativeRecordingStart = false;
                 RecordingPhaseText.Text = "TRY AGAIN";
                 RecordingQualityText.Text = "Recording could not start. Keep one hand visible and try again.";
                 ShowRecordingRetry();
+            }
+            else
+            {
+                // Begin is delivered through the native worker mailbox. Until
+                // AwaitingHand/Recording is observed, the polled snapshot may
+                // still be Completed from the previous registration.
+                _awaitingNativeRecordingStart = true;
             }
             return;
         }
@@ -267,6 +314,8 @@ public partial class MainWindow : Window
 
     private async void NativePollTimer_Tick(object? sender, EventArgs e)
     {
+        // Offers arrive and expire independently of the camera pipeline.
+        UpdateHandoffStatus();
         if (!NativeVisionHostControl.IsStarted || !NativeVisionHostControl.TryGetMetrics(out var metrics)) return;
         var nativeError = NativeVisionHostControl.GetLastErrorMessage();
         if (!string.IsNullOrWhiteSpace(nativeError)
@@ -282,27 +331,27 @@ public partial class MainWindow : Window
         PollGestureRecordingStatus();
         LogGestureRecognitionSnapshot();
         AppendNativeMetrics(metrics);
-        if (_handoffService.LatestOffer is { } offer)
-            HandoffStatusText.Text = $"LAN offer: {offer.FileName} from {offer.SenderName} ({Math.Max(0, (offer.ExpiresAt - DateTimeOffset.UtcNow).TotalSeconds):0}s)";
         try
-                _awaitingNativeRecordingStart = false;
         {
             await _gestureEventPump.PollAsync(_gestureDispatchCancellation.Token);
         }
         catch (OperationCanceledException) when (_gestureDispatchCancellation.IsCancellationRequested) { }
-            else
-            {
-                // Begin is delivered through the native worker mailbox. Until
-                // AwaitingHand/Recording is observed, the polled snapshot may
-                // still be Completed from the previous registration.
-                _awaitingNativeRecordingStart = true;
-            }
         catch (Exception exception) { Log("Gesture dispatch failed: " + exception.Message); }
     }
 
     private void PollGestureRecordingStatus()
     {
         if (!NativeVisionHostControl.TryGetGestureRecordingStatus(out var status)) return;
+        if (_isRecordingCountdown) return;
+        if (_awaitingNativeRecordingStart)
+        {
+            if (status.State is not (NativeGestureRecordingState.AwaitingHand
+                or NativeGestureRecordingState.Recording))
+            {
+                return;
+            }
+            _awaitingNativeRecordingStart = false;
+        }
         var requiredTakeCount = Math.Max(1U, status.RequiredTakeCount);
         // Native current_take is already one-based and, after an accepted take,
         // already identifies the next take. Never increment it in the UI. Zero
@@ -329,7 +378,7 @@ public partial class MainWindow : Window
                 _recordingStartedAt = DateTimeOffset.UtcNow;
             }
             RecordingPhaseText.Text = "RECORDING";
-            RecordingPhaseText.Foreground = System.Windows.Media.Brushes.OrangeRed;
+            RecordingPhaseText.Foreground = ThemeBrush("Danger");
             RecordingInstructionText.Text = "Move now. Hold the final pose until recording stops.";
         }
         else if (status.State == NativeGestureRecordingState.AwaitingNextTake)
@@ -340,17 +389,7 @@ public partial class MainWindow : Window
             _recordingDisplayTimer.Stop();
             RecordingTrialText.Text = $"TRIAL {currentTake} OF {requiredTakeCount}";
             RecordingPhaseText.Text = "ACCEPTED";
-        if (_isRecordingCountdown) return;
-        if (_awaitingNativeRecordingStart)
-        {
-            if (status.State is not (NativeGestureRecordingState.AwaitingHand
-                or NativeGestureRecordingState.Recording))
-            {
-                return;
-            }
-            _awaitingNativeRecordingStart = false;
-        }
-            RecordingPhaseText.Foreground = System.Windows.Media.Brushes.LightGreen;
+            RecordingPhaseText.Foreground = ThemeBrush("Success");
             RecordingClockText.Text = string.Empty;
             RecordingProgressBar.Value = 0;
             RecordingInstructionText.Text =
@@ -370,15 +409,16 @@ public partial class MainWindow : Window
                 && _validationTemplateId != savedTemplateId)
             {
                 var name = GestureNameText.Text.Trim();
-                _gestureNames[savedTemplateId] = name;
+                _gestureCatalog.NoteName(savedTemplateId, name);
                 _validationTemplateId = savedTemplateId;
-                RefreshSavedGestures(savedTemplateId);
+                _gestureCatalog.Refresh();
+                _gestureActionWindow?.SelectGesture(savedTemplateId);
                 BeginGestureValidation(name);
             }
             AcceptedTrialsProgress.Value = requiredTakeCount;
             RecordingTrialText.Text = $"{requiredTakeCount} OF {requiredTakeCount} ACCEPTED";
             RecordingPhaseText.Text = "ALL TRIALS SAVED";
-            RecordingPhaseText.Foreground = System.Windows.Media.Brushes.LightGreen;
+            RecordingPhaseText.Foreground = ThemeBrush("Success");
             RecordingInstructionText.Text = "Repeat the gesture in the camera. Recognition updates automatically.";
             RecordingQualityText.Text = string.Empty;
             _recordingDisplayTimer.Stop();
@@ -393,7 +433,7 @@ public partial class MainWindow : Window
         {
             RecordingTrialText.Text = $"TRIAL {currentTake} OF {requiredTakeCount}";
             RecordingPhaseText.Text = "TRY AGAIN";
-            RecordingPhaseText.Foreground = System.Windows.Media.Brushes.OrangeRed;
+            RecordingPhaseText.Foreground = ThemeBrush("Danger");
             RecordingQualityText.Text = status.GetReason();
             RecordingInstructionText.Text =
                 $"Trial {currentTake} was not saved. Return to the starting pose and retry the same trial.";
@@ -430,6 +470,8 @@ public partial class MainWindow : Window
         _isGestureRecording = false;
         _nativeRecordingBegan = false;
         _isRecordingCountdown = false;
+        _awaitingNativeRecordingStart = false;
+        _pendingTemplateId = 0;
         _validationTemplateId = 0;
         _currentRecordingTrial = 1;
         GestureNameText.IsEnabled = true;
@@ -441,7 +483,7 @@ public partial class MainWindow : Window
         StopGestureRecordingButton.Visibility = Visibility.Collapsed;
         StopGestureRecordingButton.IsEnabled = true;
         RecordingPhaseText.Text = "SHOW ONE HAND";
-        RecordingPhaseText.Foreground = System.Windows.Media.Brushes.DeepSkyBlue;
+        RecordingPhaseText.Foreground = ThemeBrush("Info");
         RecordingClockText.Text = string.Empty;
         RecordingClockText.Visibility = Visibility.Visible;
         RecordingProgressBar.Value = 0;
@@ -471,243 +513,6 @@ public partial class MainWindow : Window
         foreach (var value in Encoding.UTF8.GetBytes(name.Trim().ToUpperInvariant()))
             hash = unchecked((hash ^ value) * prime);
         return hash == 0 ? 1U : hash;
-        _awaitingNativeRecordingStart = false;
-        _pendingTemplateId = 0;
-    }
-
-    private void SavedGesturesList_SelectionChanged(
-        object sender,
-        System.Windows.Controls.SelectionChangedEventArgs e)
-    {
-        if (SavedGesturesList.SelectedItem is not SavedGestureItem item) return;
-        GestureNameText.Text = item.Name;
-        SelectedGestureEnabledCheckBox.IsChecked = item.Enabled;
-        GestureRepositoryStatusText.Text =
-            $"{item.TakeCount} accepted takes. Changes are saved by the native repository.";
-        if (_savedGestureBindings.TryGetValue(item.Id, out var binding))
-        {
-            GestureBindingEnabledCheckBox.IsChecked = binding.Enabled;
-            GestureActionParameterText.Text = binding.Action.Params.Values.FirstOrDefault() ?? string.Empty;
-            foreach (var option in GestureActionTypeComboBox.Items.OfType<ComboBoxItem>())
-                if (StringComparer.Ordinal.Equals(option.Tag as string, binding.Action.Type))
-                    GestureActionTypeComboBox.SelectedItem = option;
-        }
-        else
-        {
-            GestureBindingEnabledCheckBox.IsChecked = true;
-            GestureActionParameterText.Clear();
-            GestureActionTypeComboBox.SelectedIndex = 0;
-        }
-    }
-
-    private void ReviewGestureRecordingsButton_Click(object sender, RoutedEventArgs e)
-    {
-        if (SavedGesturesList.SelectedItem is not SavedGestureItem item)
-        {
-            GestureRepositoryStatusText.Text = "Select a saved gesture to review.";
-            return;
-        }
-        if (_recordingPlaybackWindow is { IsVisible: true })
-        {
-            _recordingPlaybackWindow.Close();
-        }
-        _recordingPlaybackWindow = new GestureRecordingPlaybackWindow(
-            NativeVisionHostControl, item.Id, item.Name) { Owner = this };
-        _recordingPlaybackWindow.Closed += (_, _) => _recordingPlaybackWindow = null;
-        _recordingPlaybackWindow.Show();
-    }
-
-    private void SaveGestureBindingButton_Click(object sender, RoutedEventArgs e)
-    {
-        if (SavedGesturesList.SelectedItem is not SavedGestureItem item
-            || GestureActionTypeComboBox.SelectedItem is not ComboBoxItem option
-            || option.Tag is not string actionType)
-        {
-            GestureRepositoryStatusText.Text = "Select a saved gesture and action type.";
-            return;
-        }
-        var parameter = GestureActionParameterText.Text;
-        var parameterRequired = !actionType.StartsWith("handoff.", StringComparison.Ordinal);
-        if ((parameterRequired && string.IsNullOrWhiteSpace(parameter))
-            || Encoding.UTF8.GetByteCount(parameter) > 255)
-        {
-            GestureRepositoryStatusText.Text = "Enter an action value of at most 255 UTF-8 bytes.";
-            return;
-        }
-        if (!TryRepositoryOperation(() => NativeVisionHostControl.UpsertGestureBinding(
-                item.Id, actionType, parameter, GestureBindingEnabledCheckBox.IsChecked == true),
-            "Action binding saved.", "The action binding could not be saved.")) return;
-        RefreshGestureBindings();
-        SavedGesturesList_SelectionChanged(SavedGesturesList,
-            new SelectionChangedEventArgs(
-                System.Windows.Controls.Primitives.Selector.SelectionChangedEvent,
-                new System.Collections.ArrayList(), new System.Collections.ArrayList()));
-    }
-
-    private void RemoveGestureBindingButton_Click(object sender, RoutedEventArgs e)
-    {
-        if (SavedGesturesList.SelectedItem is not SavedGestureItem item)
-        {
-            GestureRepositoryStatusText.Text = "Select a saved gesture first.";
-            return;
-        }
-        if (!TryRepositoryOperation(() => NativeVisionHostControl.DeleteGestureBinding(item.Id),
-            "Action binding removed.", "The action binding could not be removed.")) return;
-        RefreshGestureBindings();
-        GestureActionParameterText.Clear();
-    }
-
-    private async void UpdateGestureDefinitionButton_Click(object sender, RoutedEventArgs e)
-    {
-        if (SavedGesturesList.SelectedItem is not SavedGestureItem item)
-        {
-            GestureRepositoryStatusText.Text = "Select a saved gesture to update.";
-            return;
-        }
-        var name = GestureNameText.Text.Trim();
-        if (string.IsNullOrWhiteSpace(name) || Encoding.UTF8.GetByteCount(name) > 63)
-        {
-            GestureRepositoryStatusText.Text = "The name must contain 1–63 UTF-8 bytes.";
-            return;
-        }
-        if (!TryRepositoryOperation(() => NativeVisionHostControl.SetGestureDefinitionMetadata(
-                item.Id, name, SelectedGestureEnabledCheckBox.IsChecked == true),
-            "Gesture updated.", "The gesture could not be updated.")) return;
-        await RefreshAfterRepositoryCommandAsync(item.Id);
-    }
-
-    private async void DeleteGestureDefinitionButton_Click(object sender, RoutedEventArgs e)
-    {
-        if (SavedGesturesList.SelectedItem is not SavedGestureItem item)
-        {
-            GestureRepositoryStatusText.Text = "Select a saved gesture to delete.";
-            return;
-        }
-        if (MessageBox.Show(this,
-                $"Delete “{item.Name}” and all {item.TakeCount} recorded takes?",
-                "Delete gesture", MessageBoxButton.YesNo, MessageBoxImage.Warning)
-            != MessageBoxResult.Yes) return;
-        if (!TryRepositoryOperation(() => NativeVisionHostControl.DeleteGestureDefinition(item.Id),
-            "Gesture deleted.", "The gesture could not be deleted.")) return;
-        _gestureNames.Remove(item.Id);
-        await RefreshAfterRepositoryCommandAsync();
-    }
-
-    private async void ReloadGestureDefinitionsButton_Click(object sender, RoutedEventArgs e)
-    {
-        if (!TryRepositoryOperation(NativeVisionHostControl.ReloadGestureDefinitions,
-            "Saved gestures reloaded.", "Saved gestures could not be reloaded.")) return;
-        await RefreshAfterRepositoryCommandAsync();
-    }
-
-    private bool TryRepositoryOperation(Func<bool> operation, string success, string failure)
-    {
-        if (!NativeVisionHostControl.IsStarted)
-        {
-            GestureRepositoryStatusText.Text = "Start the camera to change saved gestures.";
-            return false;
-        }
-        try
-        {
-            if (!operation())
-            {
-                GestureRepositoryStatusText.Text = failure;
-                return false;
-            }
-            GestureRepositoryStatusText.Text = success;
-            return true;
-        }
-        catch (Exception exception) when (exception is EntryPointNotFoundException
-            or DllNotFoundException or BadImageFormatException)
-        {
-            GestureRepositoryStatusText.Text = "Native gesture storage is unavailable: " + exception.Message;
-            return false;
-        }
-    }
-
-    private async Task RefreshAfterRepositoryCommandAsync(uint selectId = 0)
-    {
-        await Task.Delay(500);
-        var error = NativeVisionHostControl.GetLastErrorMessage();
-        if (error.StartsWith("Gesture repository:", StringComparison.Ordinal))
-        {
-            GestureRepositoryStatusText.Text = error;
-            return;
-        }
-        RefreshSavedGestures(selectId);
-    }
-
-    private void RefreshSavedGestures(uint selectId = 0)
-    {
-        try
-        {
-            if (!NativeVisionHostControl.TryListGestureDefinitions(out var definitions))
-            {
-                GestureRepositoryStatusText.Text = "Saved gestures could not be read.";
-                return;
-            }
-            SavedGesturesList.Items.Clear();
-            _gestureNames.Clear();
-            var count = (int)Math.Min(definitions.Count, (uint)NativeVisionInterop.MaxGestureDefinitions);
-            for (var index = 0; index < count; ++index)
-            {
-                var metadata = definitions.GetItem(index);
-                var item = new SavedGestureItem(
-                    metadata.DefinitionId, metadata.GetName(), metadata.Enabled != 0, metadata.TakeCount);
-                SavedGesturesList.Items.Add(item);
-                _gestureNames[item.Id] = item.Name;
-                if (item.Id == selectId) SavedGesturesList.SelectedItem = item;
-            }
-            RefreshGestureBindings();
-            if (SavedGesturesList.SelectedItem is SavedGestureItem)
-                SavedGesturesList_SelectionChanged(SavedGesturesList,
-                    new SelectionChangedEventArgs(
-                        System.Windows.Controls.Primitives.Selector.SelectionChangedEvent,
-                        new System.Collections.ArrayList(), new System.Collections.ArrayList()));
-            var error = definitions.GetError();
-            GestureRepositoryStatusText.Text = !string.IsNullOrWhiteSpace(error)
-                ? error
-                : count == 0 ? "No saved gestures yet." : $"{count} saved gesture{(count == 1 ? string.Empty : "s")}.";
-        }
-        catch (Exception exception) when (exception is EntryPointNotFoundException
-            or DllNotFoundException or BadImageFormatException)
-        {
-            GestureRepositoryStatusText.Text = "Native gesture storage is unavailable: " + exception.Message;
-        }
-    }
-
-    private void RefreshGestureBindings()
-    {
-        _savedGestureBindings.Clear();
-        if (!NativeVisionHostControl.TryListGestureBindings(out var bindings))
-        {
-            _gestureBindings.Replace([]);
-            return;
-        }
-        var count = (int)Math.Min(bindings.Count, (uint)NativeVisionInterop.MaxGestureDefinitions);
-        for (var index = 0; index < count; ++index)
-        {
-            var native = bindings.GetItem(index);
-            var actionType = native.GetActionType();
-            var parameterName = actionType switch
-            {
-                "app.launch" => "path",
-                "keyboard.typeText" => "text",
-                "keyboard.hotkey" => "hotkey",
-                "handoff.grab" => string.Empty,
-                "handoff.release" => string.Empty,
-                _ => string.Empty
-            };
-            if (actionType is not ("app.launch" or "keyboard.typeText" or "keyboard.hotkey"
-                or "handoff.grab" or "handoff.release")) continue;
-            var binding = new GestureCommandBinding(native.DefinitionId,
-                _gestureNames.GetValueOrDefault(native.DefinitionId, $"Gesture {native.DefinitionId}"),
-                native.Enabled != 0,
-                new ActionSpec(actionType, string.IsNullOrEmpty(parameterName)
-                    ? [] : new Dictionary<string, string> { [parameterName] = native.GetActionParameter() }));
-            _savedGestureBindings[native.DefinitionId] = binding;
-        }
-        _gestureBindings.Replace(_savedGestureBindings.Values);
     }
 
     private unsafe void LogGestureRecognitionSnapshot()
@@ -741,7 +546,7 @@ public partial class MainWindow : Window
         GestureValidationPanel.Visibility = Visibility.Visible;
         ValidationPromptText.Text = $"Perform “{name}” again";
         ValidationResultText.Text = "WATCHING";
-        ValidationResultText.Foreground = System.Windows.Media.Brushes.DeepSkyBlue;
+        ValidationResultText.Foreground = ThemeBrush("Info");
         ValidationConfidenceBar.Value = 0;
         ValidationConfidenceText.Text = "0%";
         ValidationWindowBar.Value = 0;
@@ -764,7 +569,7 @@ public partial class MainWindow : Window
         if (snapshot.CandidateCount == 0 || snapshot.BestTemplateId == 0)
         {
             ValidationResultText.Text = "WATCHING";
-            ValidationResultText.Foreground = System.Windows.Media.Brushes.DeepSkyBlue;
+            ValidationResultText.Foreground = ThemeBrush("Info");
             ValidationConfidenceBar.Value = 0;
             ValidationConfidenceText.Text = "0%";
             ValidationReasonText.Text = "Start the gesture and complete it in one continuous movement.";
@@ -782,15 +587,15 @@ public partial class MainWindow : Window
         {
             _lastValidationMatchAt = DateTimeOffset.UtcNow;
             ValidationResultText.Text = "MATCH";
-            ValidationResultText.Foreground = System.Windows.Media.Brushes.LightGreen;
-            ValidationReasonText.Text = $"Recognized as “{_gestureNames.GetValueOrDefault(_validationTemplateId, "registered gesture")}”.";
+            ValidationResultText.Foreground = ThemeBrush("Success");
+            ValidationReasonText.Text = $"Recognized as “{_gestureCatalog.NameOf(_validationTemplateId, "registered gesture")}”.";
             return;
         }
 
         if (snapshot.BestActiveSegmentValid == 0)
         {
             ValidationResultText.Text = "WATCHING";
-            ValidationResultText.Foreground = System.Windows.Media.Brushes.DeepSkyBlue;
+            ValidationResultText.Foreground = ThemeBrush("Info");
             ValidationReasonText.Text = "Make one clear movement, then return to a resting pose.";
             return;
         }
@@ -798,8 +603,8 @@ public partial class MainWindow : Window
         if (snapshot.BestEligible != 0)
         {
             ValidationResultText.Text = "DIFFERENT GESTURE";
-            ValidationResultText.Foreground = System.Windows.Media.Brushes.Gold;
-            ValidationReasonText.Text = _gestureNames.TryGetValue(snapshot.BestTemplateId, out var otherName)
+            ValidationResultText.Foreground = ThemeBrush("Warning");
+            ValidationReasonText.Text = _gestureCatalog.TryGetName(snapshot.BestTemplateId, out var otherName)
                 ? $"The closest recognized gesture was “{otherName}”."
                 : "Another registered gesture was closer.";
             return;
@@ -807,8 +612,8 @@ public partial class MainWindow : Window
 
         ValidationResultText.Text = percent >= 65 ? "CLOSE" : "NOT YET";
         ValidationResultText.Foreground = percent >= 65
-            ? System.Windows.Media.Brushes.Gold
-            : System.Windows.Media.Brushes.OrangeRed;
+            ? ThemeBrush("Warning")
+            : ThemeBrush("Danger");
         ValidationReasonText.Text = HumanizeRecognitionReason(rejection);
     }
 
@@ -878,6 +683,7 @@ public partial class MainWindow : Window
         _gestureDispatchCancellation.Cancel();
         NativeVisionHostControl.StopNativeRuntime();
         NativeVisionHostControl.Visibility = Visibility.Collapsed;
+        PreviewPlaceholder.Visibility = Visibility.Visible;
         if (RegistrationPanel.Visibility == Visibility.Visible)
         {
             ResetRecordingUi("Start the camera before recording a gesture.");
@@ -897,20 +703,70 @@ public partial class MainWindow : Window
         // must destroy the playback handle before the source runtime stops.
         _recordingPlaybackWindow?.Close();
         _recordingPlaybackWindow = null;
+        _gestureActionWindow?.Close();
+        _gestureActionWindow = null;
+        _handoffEffect?.Close();
+        _handoffEffect = null;
         StopNativeRuntime();
         _ = _handoffService.DisposeAsync();
         base.OnClosed(e);
     }
 
-    private async void OfferScreenButton_Click(object sender, RoutedEventArgs e)
+    // LAN handoff is advanced only by recognized gestures bound to handoff.grab
+    // and handoff.release, so the main window reports state without offering
+    // any control that could bypass the gesture path.
+    private void UpdateHandoffStatus()
     {
-        try { await _handoffService.GrabScreenshotAsync(CancellationToken.None); HandoffStatusText.Text = "LAN screenshot offer is active."; }
-        catch (Exception exception) { HandoffStatusText.Text = "LAN offer failed: " + exception.Message; }
+        var status = _handoffService.GetStatus();
+        var text = $"LAN handoff {status.State.ToString().ToLowerInvariant()} · {status.Message}";
+        if (!StringComparer.Ordinal.Equals(HandoffStatusText.Text, text))
+        {
+            HandoffStatusText.Text = text;
+        }
+        var accent = status.State switch
+        {
+            HandoffState.Failed => ThemeBrush("Danger"),
+            HandoffState.Completed => ThemeBrush("Success"),
+            HandoffState.Advertising or HandoffState.OfferAvailable or HandoffState.Claiming
+                => ThemeBrush("Info"),
+            _ => ThemeBrush("TextMuted")
+        };
+        HandoffStatusText.Foreground = accent;
+        HandoffStatusDot.Fill = accent;
+        PlayHandoffEffectOnChange(status);
     }
 
-    private async void ReceiveOfferButton_Click(object sender, RoutedEventArgs e)
+    /// <summary>
+    /// The transfer is invisible otherwise: the operator's hand is on the
+    /// gesture, not the screen, so each phase change gets one short flourish.
+    /// </summary>
+    private void PlayHandoffEffectOnChange(HandoffStatus status)
     {
-        try { var path = await _handoffService.ReleaseHereAsync(CancellationToken.None); HandoffStatusText.Text = "Received: " + path; }
-        catch (Exception exception) { HandoffStatusText.Text = "LAN receive failed: " + exception.Message; }
+        if (status.State == _lastHandoffState) return;
+        var previous = _lastHandoffState;
+        _lastHandoffState = status.State;
+        var kind = status.State switch
+        {
+            HandoffState.Advertising => HandoffEffectKind.Offering,
+            HandoffState.Claiming => HandoffEffectKind.Claiming,
+            HandoffState.Completed => HandoffEffectKind.Completed,
+            HandoffState.Failed => HandoffEffectKind.Failed,
+            // An offer appearing is worth one cue, but only on the way up from
+            // idle; repeated re-advertising by a peer must not strobe.
+            HandoffState.OfferAvailable when previous is HandoffState.Idle
+                => HandoffEffectKind.Claiming,
+            _ => (HandoffEffectKind?)null
+        };
+        if (kind is not { } effect) return;
+        var title = status.State switch
+        {
+            HandoffState.Advertising => "Offering over LAN",
+            HandoffState.Claiming => "Receiving…",
+            HandoffState.Completed => "Handoff complete",
+            HandoffState.Failed => "Handoff failed",
+            _ => "Offer available"
+        };
+        _handoffEffect ??= new HandoffEffectWindow { Owner = this };
+        _handoffEffect.Play(this, effect, title, status.Message);
     }
 }

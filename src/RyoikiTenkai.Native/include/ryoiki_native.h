@@ -19,10 +19,7 @@ inline constexpr std::int32_t kRyoikiStatusSuccess = 1;
 inline constexpr std::uint32_t kRyoikiMaxHands = 2;
 inline constexpr std::uint32_t kRyoikiMaxHandStates = 16;
 inline constexpr std::uint32_t kRyoikiDomainExpansionStateId = 1;
-inline constexpr std::uint32_t kRyoikiOpenPalmStateId = 2;
 inline constexpr std::uint32_t kRyoikiMaxHandEventsPerBatch = 16;
-inline constexpr std::uint32_t kRyoikiSwipeLeftEventId = 1;
-inline constexpr std::uint32_t kRyoikiSwipeRightEventId = 2;
 
 enum RyoikiHandPresentationMode : std::int32_t
 {

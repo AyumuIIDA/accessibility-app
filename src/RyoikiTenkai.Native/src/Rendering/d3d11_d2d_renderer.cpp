@@ -138,11 +138,47 @@ public:
         hand3dView_ = view;
     }
 
+    ~Impl()
+    {
+        releaseSwapChain();
+    }
+
+    // DXGI keeps an HWND associated with its swap chain until the swap chain is
+    // actually destroyed, and destruction is deferred while the immediate
+    // context still references the back buffers. Releasing the ComPtr alone is
+    // not enough: a Stop followed by a quick Start then failed with
+    // CreateSwapChainForHwnd -> E_ACCESSDENIED (0x80070005), while a restart
+    // after a long enough pause succeeded once the deferred release had run.
+    // ClearState + Flush forces that release now, so restarting is immediate.
+    void releaseSwapChain() noexcept
+    {
+        if (d2dContext_ != nullptr)
+        {
+            d2dContext_->SetTarget(nullptr);
+        }
+        targetBitmap_.Reset();
+        cameraBitmap_.Reset();
+        gpuCopyTexture_.Reset();
+        if (d3dContext_ != nullptr)
+        {
+            if (sharedDevice_ != nullptr)
+            {
+                std::lock_guard lock{sharedDevice_->immediateContextMutex()};
+                d3dContext_->ClearState();
+                d3dContext_->Flush();
+            }
+            else
+            {
+                d3dContext_->ClearState();
+                d3dContext_->Flush();
+            }
+        }
+        swapChain_.Reset();
+    }
+
 private:
     bool createDeviceResources(std::string& error)
     {
-        cameraBitmap_.Reset();
-        gpuCopyTexture_.Reset();
         palmBrush_.Reset();
         handBrush_.Reset();
         candidateBrush_.Reset();
@@ -156,11 +192,12 @@ private:
         plotYAxisBrush_.Reset();
         plotZAxisBrush_.Reset();
         palmDirectionBrush_.Reset();
-        targetBitmap_.Reset();
+        // Releases target/camera bitmaps and the swap chain in the order DXGI
+        // requires before this HWND can be given a new swap chain.
+        releaseSwapChain();
         d2dContext_.Reset();
         d2dDevice_.Reset();
         d2dFactory_.Reset();
-        swapChain_.Reset();
         cameraWidth_ = 0;
         cameraHeight_ = 0;
         cameraBitmapIsGpuSurface_ = false;
@@ -691,43 +728,20 @@ private:
             return;
         }
         using hand_input::recognition::HandStatePhase;
-        hand_input::recognition::HandStateResult eventDisplay{};
-        const bool eventVisible = packet.latestEvent.id != 0
-            && packet.frame != nullptr
-            && packet.frame->captureTimestampUs()
-                >= packet.latestEvent.endedTimestampUs
-            && packet.frame->captureTimestampUs()
-                    - packet.latestEvent.endedTimestampUs
-                <= 600'000;
-        if (eventVisible)
-        {
-            eventDisplay.phase = HandStatePhase::Active;
-            eventDisplay.confidence = packet.latestEvent.confidence;
-        }
+        // Only Domain Sign remains a published State. With Open Palm removed the
+        // skeleton stays in its neutral colour unless that State is running, so
+        // the overlay no longer recolours itself for an unregistered pose.
         const bool domainVisible =
             packet.domainSignState.phase == HandStatePhase::Candidate
             || packet.domainSignState.phase == HandStatePhase::Active;
-        const auto& displayState = eventVisible
-            ? eventDisplay
-            : domainVisible
-                ? packet.domainSignState
-                : packet.openPalmState;
-        const wchar_t* stateName = eventVisible
-            ? packet.latestEvent.id
-                    == hand_input::recognition::kSwipeLeftEventId
-                ? L"SWIPE LEFT"
-                : L"SWIPE RIGHT"
-            : domainVisible
-                ? L"DOMAIN SIGN"
-                : L"OPEN PALM";
+        const auto& displayState = packet.domainSignState;
+        const wchar_t* stateName = L"DOMAIN SIGN";
         ID2D1SolidColorBrush* overlayBrush = handBrush_.Get();
-        if (displayState.phase == HandStatePhase::Candidate)
+        if (domainVisible)
         {
-            overlayBrush = candidateBrush_.Get();
-        }
-        else if (displayState.phase == HandStatePhase::Active)
-        {
-            overlayBrush = activeBrush_.Get();
+            overlayBrush = displayState.phase == HandStatePhase::Candidate
+                ? candidateBrush_.Get()
+                : activeBrush_.Get();
         }
 
         for (std::size_t handIndex = 0;
@@ -769,7 +783,7 @@ private:
                     (std::max)(topLeft.y, bottomRight.y)),
                 overlayBrush,
                 1.5F);
-            if (handIndex == 0)
+            if (handIndex == 0 && domainVisible)
             {
                 drawStateLabel(
                     displayState,

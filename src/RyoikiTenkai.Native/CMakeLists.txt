@@ -108,8 +108,6 @@ add_library(RyoikiTenkai.VisionCore STATIC
     src/HandInput/Recognition/gesture_match_stabilizer.cpp
     src/HandInput/Recognition/multi_hand_gesture_core.cpp
     src/HandInput/Recognition/gesture_template_registry.cpp
-    src/HandInput/Recognition/open_palm_state_recognizer.cpp
-    src/HandInput/Recognition/swipe_event_recognizer.cpp
     src/HandInput/Recognition/timed_state_stabilizer.cpp
     src/HandInput/Recognition/unified_sequence_gesture_comparator.cpp
     src/HandPerception/ModelRunners/ort_hand_landmark_runner.cpp

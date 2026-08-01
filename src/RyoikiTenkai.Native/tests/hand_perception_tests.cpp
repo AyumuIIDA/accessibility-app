@@ -20,8 +20,6 @@
 #include "HandInput/Publication/latest_hand_state_slot.h"
 #include "HandInput/Publication/ordered_hand_event_ring.h"
 #include "HandInput/Recognition/domain_expansion_state_recognizer.h"
-#include "HandInput/Recognition/open_palm_state_recognizer.h"
-#include "HandInput/Recognition/swipe_event_recognizer.h"
 #include "HandInput/Recognition/timed_state_stabilizer.h"
 #include "HandPerception/ModelRunners/ort_hand_landmark_runner.h"
 #include "HandPerception/ModelRunners/ort_palm_detection_runner.h"
@@ -1965,111 +1963,6 @@ void testDomainExpansionGestureGeometry()
         "Straight middle finger did not reduce the wrap score.");
 }
 
-void testOpenPalmStateRecognition()
-{
-    using namespace ryoiki::hand_input;
-    measurements::HandMeasurements open{};
-    open.present = true;
-    open.quality = measurements::HandMeasurementQuality::Valid;
-    open.trackingQuality = 0.92F;
-    open.extension = {0.70F, 0.91F, 0.94F, 0.92F, 0.89F};
-    open.thumbIndexDistance = 0.48F;
-
-    const auto accepted = recognition::recognizeOpenPalmState(open);
-    require(accepted.inputValid && accepted.detected,
-        "Open Palm recognizer rejected an extended hand.");
-    require(accepted.confidence > 0.70F,
-        "Open Palm confidence was unexpectedly weak.");
-
-    auto pointing = open;
-    pointing.extension = {0.75F, 0.94F, 0.20F, 0.18F, 0.15F};
-    require(!recognition::recognizeOpenPalmState(pointing).detected,
-        "Open Palm recognizer accepted a pointing hand.");
-
-    auto closed = open;
-    closed.extension = {0.15F, 0.20F, 0.18F, 0.22F, 0.17F};
-    closed.thumbIndexDistance = 0.10F;
-    require(!recognition::recognizeOpenPalmState(closed).detected,
-        "Open Palm recognizer accepted a closed hand.");
-
-    auto missing = open;
-    missing.quality = measurements::HandMeasurementQuality::Missing;
-    require(!recognition::recognizeOpenPalmState(missing).inputValid,
-        "Open Palm recognizer treated missing measurements as a negative sample.");
-
-    recognition::OpenPalmStateRecognizer recognizer;
-    auto state = recognizer.process(
-        accepted, open.trackingQuality, 1, 1'000'000);
-    require(state.phase == recognition::HandStatePhase::Candidate,
-        "Open Palm did not enter Candidate.");
-    state = recognizer.process(
-        accepted, open.trackingQuality, 2, 1'120'000);
-    require(state.phase == recognition::HandStatePhase::Active
-            && state.transition == recognition::HandStateTransition::Began,
-        "Open Palm did not become Active after its enter duration.");
-}
-
-ryoiki::hand_input::measurements::HandMeasurementFrame swipeFrame(
-    const std::uint64_t frameId,
-    const std::uint64_t timestampUs,
-    const float x,
-    const float y,
-    const float scale = 0.10F)
-{
-    using namespace ryoiki::hand_input::measurements;
-    HandMeasurementFrame frame{};
-    frame.hand.frameId = frameId;
-    frame.hand.timestampUs = timestampUs;
-    frame.hand.present = true;
-    frame.hand.quality = HandMeasurementQuality::Valid;
-    frame.hand.trackingQuality = 0.92F;
-    frame.screenPalm = {
-        .frameId = frameId,
-        .timestampUs = timestampUs,
-        .centerX = x,
-        .centerY = y,
-        .scale = scale,
-        .valid = true};
-    return frame;
-}
-
-void testSwipeEventRecognition()
-{
-    using namespace ryoiki::hand_input::recognition;
-    SwipeEventRecognizer recognizer;
-    require(!recognizer.process(
-        swipeFrame(1, 1'000'000, 0.70F, 0.50F), true, 0.9F).has_value(),
-        "Swipe recognizer emitted from its anchor.");
-    require(!recognizer.process(
-        swipeFrame(2, 1'080'000, 0.65F, 0.505F), true, 0.9F).has_value(),
-        "Swipe recognizer emitted before minimum duration/displacement.");
-    const auto left = recognizer.process(
-        swipeFrame(3, 1'180'000, 0.50F, 0.51F), true, 0.88F);
-    require(left.has_value() && left->id == kSwipeLeftEventId,
-        "A valid left swipe was not recognized.");
-    require(left->displacementX < -0.19F && left->durationUs == 180'000,
-        "Swipe Event did not preserve trajectory diagnostics.");
-    require(!recognizer.process(
-        swipeFrame(4, 1'220'000, 0.40F, 0.51F), true, 0.9F).has_value(),
-        "Swipe cooldown emitted a duplicate event.");
-
-    recognizer.reset();
-    static_cast<void>(recognizer.process(
-        swipeFrame(10, 2'000'000, 0.30F, 0.30F), true, 0.9F));
-    static_cast<void>(recognizer.process(
-        swipeFrame(11, 2'100'000, 0.38F, 0.40F), true, 0.9F));
-    require(!recognizer.process(
-        swipeFrame(12, 2'220'000, 0.50F, 0.48F), true, 0.9F).has_value(),
-        "A diagonal trajectory was incorrectly recognized as a swipe.");
-
-    recognizer.reset();
-    static_cast<void>(recognizer.process(
-        swipeFrame(20, 3'000'000, 0.30F, 0.50F), true, 0.9F));
-    require(!recognizer.process(
-        swipeFrame(21, 3'180'000, 0.50F, 0.50F, 0.20F), true, 0.9F).has_value(),
-        "Large depth/scale motion was incorrectly recognized as a swipe.");
-}
-
 void testOrderedHandEventRing()
 {
     using namespace ryoiki::hand_input;
@@ -2079,9 +1972,7 @@ void testOrderedHandEventRing()
          ++index)
     {
         recognition::HandEvent event{};
-        event.id = index % 2 == 0
-            ? recognition::kSwipeLeftEventId
-            : recognition::kSwipeRightEventId;
+        event.id = index % 2 == 0 ? 101U : 102U;
         ring.publish(event);
     }
     const auto first = ring.readAfter(0);
@@ -2463,8 +2354,6 @@ int main()
         testNativeCadHandBindingRezeroesAfterTrackingGap();
         testNativeCadHandBindingSensitivityAndPresentation();
         testDomainExpansionGestureGeometry();
-        testOpenPalmStateRecognition();
-        testSwipeEventRecognition();
         testOrderedHandEventRing();
         testTimedStateStabilizerLifecycle();
         testLatestHandStateSlot();

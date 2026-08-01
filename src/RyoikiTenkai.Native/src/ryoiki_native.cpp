@@ -20,8 +20,6 @@
 #include "HandInput/Recognition/multi_hand_gesture_core.h"
 #include "HandInput/Recognition/gesture_template_registry.h"
 #include "HandInput/Recognition/gesture_template_repository.h"
-#include "HandInput/Recognition/open_palm_state_recognizer.h"
-#include "HandInput/Recognition/swipe_event_recognizer.h"
 #include "Pipeline/perception_mailbox.h"
 #include "Rendering/hand_3d_plot.h"
 #include "Rendering/gesture_dtw_debug_source.h"
@@ -325,9 +323,7 @@ struct RyoikiHandle
     float palmRotationLastScreenY{0.0F};
     bool palmRotationLastScreenValid{false};
     ryoiki::hand_input::recognition::DomainExpansionStateRecognizer domainSignRecognizer;
-    ryoiki::hand_input::recognition::OpenPalmStateRecognizer openPalmRecognizer;
     ryoiki::hand_input::publication::LatestHandStateSlot handStateSlot;
-    ryoiki::hand_input::recognition::SwipeEventRecognizer swipeRecognizer;
     ryoiki::hand_input::publication::OrderedHandEventRing handEventRing;
     // On-demand gesture recognition (Stage 2): perception-worker-owned, like
     // handMeasurementStage above. gestureRecognitionSnapshot is the only
@@ -1939,30 +1935,14 @@ void runPerceptionLoop(RyoikiHandle& handle)
                 if (comparisonRows % 120 == 0) rotationComparisonCsv.flush();
             }
         }
-        const auto openPalm =
-            ryoiki::hand_input::recognition::recognizeOpenPalmState(
-                primaryHandMeasurements);
-        const auto openPalmState = handle.openPalmRecognizer.process(
-            openPalm,
-            primaryHandMeasurements.trackingQuality,
-            frame->frameId(),
-            frame->captureTimestampUs());
-        const auto swipeEvent = handle.swipeRecognizer.process(
-            primaryMeasurementFrame,
-            openPalm.detected,
-            openPalm.confidence);
-        if (swipeEvent.has_value())
-        {
-            handle.handEventRing.publish(*swipeEvent);
-        }
-        const auto latestSwipeEvent = swipeEvent.value_or(
-            ryoiki::hand_input::recognition::HandEvent{});
+        // Open Palm State and the swipe Event it gated were built-in poses from
+        // the pre-DTW design. Recognition is now entirely registered-template
+        // driven, so no hardcoded gesture is published here.
         ryoiki::hand_input::publication::HandStateSnapshot stateSnapshot{};
         stateSnapshot.frameId = frame->frameId();
         stateSnapshot.timestampUs = frame->captureTimestampUs();
-        stateSnapshot.count = 2;
+        stateSnapshot.count = 1;
         stateSnapshot.states[0] = domainState;
-        stateSnapshot.states[1] = openPalmState;
         handle.handStateSlot.publish(stateSnapshot);
         {
             std::lock_guard lock{handle.stateMutex};
@@ -2264,9 +2244,7 @@ void runPerceptionLoop(RyoikiHandle& handle)
             handle.renderStage.publishPerception(
                 perceptionResult,
                 frame->frameId(),
-                domainState,
-                openPalmState,
-                latestSwipeEvent);
+                domainState);
         }
         else
         {
@@ -2274,9 +2252,7 @@ void runPerceptionLoop(RyoikiHandle& handle)
                 frame,
                 perceptionResult,
                 frame->frameId(),
-                domainState,
-                openPalmState,
-                latestSwipeEvent});
+                domainState});
         }
     }
 }
@@ -2439,9 +2415,7 @@ RYOIKI_EXPORT std::int32_t ryoiki_start(RyoikiHandle* handle)
         handle->palmRotationLastScreenValid = false;
         handle->capturePalmRotationReference.store(false);
         handle->domainSignRecognizer.reset();
-        handle->openPalmRecognizer.reset();
         handle->handStateSlot.reset();
-        handle->swipeRecognizer.reset();
         handle->handEventRing.reset();
 
         RECT childRect{};

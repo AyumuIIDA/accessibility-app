@@ -13,3 +13,19 @@ internal interface IHandoffPayloadProvider
 
 internal sealed record HandoffOffer(string PayloadId, string SenderName,
     string FileName, string ContentType, long Length, DateTimeOffset ExpiresAt);
+
+/// <summary>
+/// Observable phase of the gesture-driven handoff. LAN transfer has no manual
+/// controls, so this is the only feedback the operator receives.
+/// </summary>
+internal enum HandoffState
+{
+    Idle,
+    Advertising,
+    OfferAvailable,
+    Claiming,
+    Completed,
+    Failed
+}
+
+internal sealed record HandoffStatus(HandoffState State, string Message, HandoffOffer? Offer);

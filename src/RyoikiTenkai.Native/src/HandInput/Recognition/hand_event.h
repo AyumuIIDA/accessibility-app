@@ -4,9 +4,6 @@
 
 namespace ryoiki::hand_input::recognition
 {
-inline constexpr std::uint32_t kSwipeLeftEventId = 1;
-inline constexpr std::uint32_t kSwipeRightEventId = 2;
-
 struct HandEvent
 {
     std::uint64_t sequence{0};

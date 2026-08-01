@@ -92,6 +92,17 @@ Run WPF UI:
 dotnet run --project src/RyoikiTenkai.Wpf/RyoikiTenkai.Wpf.csproj
 ```
 
+All WPF windows share `src/RyoikiTenkai.Wpf/Theme.xaml`, merged in `App.xaml`.
+It owns the colour scale and the control templates for buttons, text boxes,
+combo boxes, lists, checkboxes, sliders, progress bars, and scrollbars. Windows
+must reference its keys rather than literal hex; the default WPF templates are
+light-themed and do not belong on these surfaces.
+
+The main window's **Gesture Actions** button opens saved-gesture management and
+action binding in its own window. **Register a Gesture** keeps only the recording
+workflow beside the native preview, because WPF content cannot reliably overlay the
+`HwndHost` and the two panels together were too dense to read.
+
 The main window's **Open 3D Viewer** button opens a modeless native CAD-style viewer.
 The built-in demo assembly supports left-drag orbit, mouse-wheel zoom, and
 double-click reset without starting the camera. When the native camera runtime is

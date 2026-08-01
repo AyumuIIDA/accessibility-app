@@ -271,14 +271,21 @@ with a mutex and copies it into caller-owned structures.
   advances the native CAD binding directly from typed measurements. A shared
   endpoint synchronizes CAD lifetime, mouse/API view access, and CAD destruction;
   no borrowed CAD pointer is retained by the vision runtime.
-- The latest-State snapshot publishes built-in ID `1` (`state.domain_sign`) and
-  ID `2` (`state.open_palm`). Both recognizers and their time hysteresis run on
-  the native perception worker. The ROI overlay displays Candidate/Active state
-  text and color without routing recognition through CAD.
-- Version 18 adds `ryoiki_read_hand_events`. Swipe Left (`1`) and Swipe Right
-  (`2`) are delivered through a fixed-capacity native ring with monotonic sequence
-  numbers, bounded batches, and an explicit dropped-event count. WPF owns only
-  the read cursor. The native ROI displays a recognized Swipe for `600 ms`.
+- The latest-State snapshot publishes one built-in ID, `1` (`state.domain_sign`).
+  Its recognizer and time hysteresis run on the native perception worker. The ROI
+  overlay displays Candidate/Active state text and color only while that State is
+  running, without routing recognition through CAD.
+- The built-in Open Palm State (previously ID `2`) and the Swipe Left/Right Events
+  (previously IDs `1`/`2`) were removed. They were hardcoded poses from the
+  pre-DTW design: Open Palm could not be managed through gesture registration,
+  recoloured the skeleton for a pose no binding could reference, and was the only
+  gate for the swipe recognizer, whose events entered the ordered ring with IDs
+  that registered definitions never produce and so could never resolve a binding.
+  Recognition is now entirely registered-template driven.
+- `ryoiki_read_hand_events` still delivers ordered Events through a
+  fixed-capacity native ring with monotonic sequence numbers, bounded batches,
+  and an explicit dropped-event count. WPF owns only the read cursor. Every event
+  in the ring now originates from a registered gesture definition.
 
 `palm_rotation_fit_error` is the ordinary weighted RMS distance between the
 normalized current palm points and the rotated normalized reference points.

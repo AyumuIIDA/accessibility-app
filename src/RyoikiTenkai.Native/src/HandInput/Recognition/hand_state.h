@@ -5,7 +5,6 @@
 namespace ryoiki::hand_input::recognition
 {
 inline constexpr std::uint32_t kDomainExpansionStateId = 1;
-inline constexpr std::uint32_t kOpenPalmStateId = 2;
 
 enum class HandStatePhase : std::uint32_t
 {

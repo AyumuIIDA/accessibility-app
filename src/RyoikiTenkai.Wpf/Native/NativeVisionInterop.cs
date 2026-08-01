@@ -12,9 +12,6 @@ internal static partial class NativeVisionInterop
     public const int MaxGestureDefinitions = 8;
     public const int MaxHands = 2;
     public const uint DomainExpansionStateId = 1;
-    public const uint OpenPalmStateId = 2;
-    public const uint SwipeLeftEventId = 1;
-    public const uint SwipeRightEventId = 2;
 
     [LibraryImport(LibraryName, EntryPoint = "ryoiki_get_abi_version")]
     public static partial uint GetAbiVersion();

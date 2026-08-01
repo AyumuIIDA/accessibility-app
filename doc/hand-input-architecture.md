@@ -469,11 +469,13 @@ automatic DTW segmentation before explicit-gate replay succeeds
    `Presentation` layer and is also consumed by the native 3D hand plot.
 4. **Implemented:** move Domain Sign behind a timed State recognizer and publish it
    through the generic latest-State ABI while retaining compatibility fields.
-5. **Implemented:** add a native Open Palm State with measurement-quality gates
-   and timed hysteresis. It is published independently from CAD; replacing the
-   physical gate remains a separate binding-policy change.
-6. **Implemented:** add Swipe Left/Right as the first temporal Event and publish
-   it through a bounded ordered ring with a caller-owned sequence cursor.
+5. **Removed:** the native Open Palm State and the Swipe Left/Right Events that it
+   gated. Both were hardcoded poses predating the registered-template recognizer.
+   They could not be created, renamed, disabled, or bound through gesture
+   registration, so they sat outside the framework that now owns recognition.
+   A swipe is expressed by recording it as a gesture like any other.
+6. **Implemented:** publish ordered Events through a bounded ring with a
+   caller-owned sequence cursor. Its only producers are registered definitions.
 7. Generalize an interface only after two concrete implementations demonstrate the
    same contract.
 

@@ -2,50 +2,44 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:native="clr-namespace:RyoikiTenkai.Wpf.Native"
-        Title="RyoikiTenkai" Height="760" Width="1120"
-        MinHeight="680" MinWidth="900" Background="#0F1115">
-    <Window.Resources>
-        <Style TargetType="Button">
-            <Setter Property="MinHeight" Value="40" />
-            <Setter Property="Padding" Value="18,8" />
-            <Setter Property="Margin" Value="0,0,8,0" />
-        </Style>
-        <Style TargetType="TextBox">
-            <Setter Property="MinHeight" Value="38" />
-            <Setter Property="Padding" Value="10,6" />
-            <Setter Property="Background" Value="#101319" />
-            <Setter Property="Foreground" Value="#E7EAF0" />
-            <Setter Property="BorderBrush" Value="#303746" />
-            <Setter Property="CaretBrush" Value="#E7EAF0" />
-        </Style>
-        <Style TargetType="TextBlock">
-            <Setter Property="Foreground" Value="#E7EAF0" />
-        </Style>
-    </Window.Resources>
+        Title="RyoikiTenkai" Height="780" Width="1180"
+        MinHeight="680" MinWidth="960" Background="{StaticResource Backdrop}">
 
-    <Grid Margin="20">
+    <Grid Margin="22">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
-        <DockPanel Grid.Row="0" Margin="0,0,0,16">
+        <!-- Header: identity on the left, camera control on the right, and the
+             two passive status lines that must stay readable at a glance. -->
+        <DockPanel Grid.Row="0" Margin="0,0,0,18">
             <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
-                <Button Content="Offer Screen" Click="OfferScreenButton_Click" />
-                <Button Content="Receive Offer" Click="ReceiveOfferButton_Click" />
-                <Button x:Name="OpenCadViewerButton" Content="Open 3D Viewer"
+                <Button x:Name="OpenGestureActionsButton" Content="Gesture Actions"
+                        Style="{StaticResource QuietButton}"
+                        Click="OpenGestureActionsButton_Click" />
+                <Button x:Name="OpenCadViewerButton" Content="3D Viewer"
+                        Style="{StaticResource QuietButton}"
                         Click="OpenCadViewerButton_Click" />
                 <Button x:Name="OpenGestureRegistrationButton" Content="Register a Gesture"
-                        Click="EnterGestureRegistrationModeButton_Click" Background="#275EA8" Foreground="White" />
-                <Button x:Name="StartButton" Content="Start Camera" Click="StartButton_Click" />
-                <Button x:Name="StopButton" Content="Stop" Click="StopButton_Click" IsEnabled="False" />
+                        Click="EnterGestureRegistrationModeButton_Click" />
+                <Button x:Name="StartButton" Content="Start Camera"
+                        Style="{StaticResource AccentButton}" Click="StartButton_Click" />
+                <Button x:Name="StopButton" Content="Stop" Margin="0"
+                        Style="{StaticResource DangerQuietButton}"
+                        Click="StopButton_Click" IsEnabled="False" />
             </StackPanel>
-            <StackPanel>
-                <TextBlock Text="RyoikiTenkai" FontSize="28" FontWeight="SemiBold" />
-                <TextBlock Text="Real-time hand perception" Foreground="#9DA6B8" FontSize="14" />
-                <TextBlock x:Name="HandoffStatusText" Text="LAN handoff: waiting for offers"
-                           Foreground="#7F8A9E" FontSize="12" />
+            <StackPanel VerticalAlignment="Center">
+                <TextBlock Text="RyoikiTenkai" FontSize="27" FontWeight="SemiBold" />
+                <TextBlock Text="Real-time hand perception" Style="{StaticResource SubtitleText}" />
+                <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                    <Ellipse x:Name="HandoffStatusDot" Width="7" Height="7" VerticalAlignment="Center"
+                             Margin="0,0,7,0" Fill="{StaticResource TextMuted}" />
+                    <TextBlock x:Name="HandoffStatusText" Text="LAN handoff idle · waiting for offers"
+                               Foreground="{StaticResource TextMuted}" FontSize="12"
+                               VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                </StackPanel>
             </StackPanel>
         </DockPanel>
 
@@ -55,19 +49,28 @@
                 <ColumnDefinition x:Name="RegistrationColumn" Width="0" />
             </Grid.ColumnDefinitions>
 
-            <Border Grid.Column="0" Background="#050608" BorderBrush="#2B313D"
-                    BorderThickness="1" CornerRadius="10">
+            <Border Grid.Column="0" Style="{StaticResource ViewportFrame}">
                 <Grid x:Name="PreviewHost" ClipToBounds="True">
                     <native:NativeVisionHost x:Name="NativeVisionHostControl" Visibility="Collapsed" />
+                    <!-- Shown until the native runtime starts; WPF content cannot
+                         reliably overlay the HwndHost once it is visible. -->
+                    <StackPanel x:Name="PreviewPlaceholder" VerticalAlignment="Center"
+                                HorizontalAlignment="Center">
+                        <TextBlock Text="Camera is off" FontSize="17" FontWeight="SemiBold"
+                                   Foreground="{StaticResource TextSecondary}"
+                                   HorizontalAlignment="Center" />
+                        <TextBlock Text="Start the camera to see hand perception, register gestures, and run LAN handoff."
+                                   Style="{StaticResource CaptionText}" MaxWidth="360"
+                                   TextAlignment="Center" Margin="0,8,0,0" />
+                    </StackPanel>
                 </Grid>
             </Border>
 
             <!-- Keep registration controls beside HwndHost. WPF content cannot reliably overlay it. -->
             <Border x:Name="RegistrationPanel" Grid.Column="1" Visibility="Collapsed"
-                    Margin="18,0,0,0" Padding="22" Background="#171B22" CornerRadius="10">
+                    Margin="18,0,0,0" Style="{StaticResource Card}" Padding="20">
                 <Grid>
                     <Grid.RowDefinitions>
-                        <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="*" />
@@ -75,157 +78,137 @@
                     </Grid.RowDefinitions>
 
                     <DockPanel Grid.Row="0">
-                        <Button DockPanel.Dock="Right" Content="Close" Click="ExitGestureRegistrationModeButton_Click"
-                                Padding="12,6" MinHeight="32" />
+                        <Button DockPanel.Dock="Right" Content="✕" Margin="0"
+                                Style="{StaticResource CompactQuietButton}" Padding="9,4"
+                                ToolTip="Close gesture registration"
+                                Click="ExitGestureRegistrationModeButton_Click" />
                         <StackPanel>
-                            <TextBlock Text="Register a Gesture" FontSize="24" FontWeight="SemiBold" />
-                            <TextBlock Text="Record the same movement three times." Foreground="#9DA6B8" Margin="0,4,0,0" />
+                            <TextBlock Text="Register a Gesture" Style="{StaticResource TitleText}" FontSize="21" />
+                            <TextBlock Text="Record the same movement three times."
+                                       Style="{StaticResource SubtitleText}" FontSize="12" />
                         </StackPanel>
                     </DockPanel>
 
                     <StackPanel Grid.Row="1" Margin="0,20,0,0">
-                        <DockPanel>
-                            <Button DockPanel.Dock="Right" Content="Reload" MinHeight="28" Padding="10,3"
-                                    Click="ReloadGestureDefinitionsButton_Click" />
-                            <TextBlock Text="Saved gestures" Foreground="#AEB7C7" FontWeight="SemiBold"
-                                       VerticalAlignment="Center" />
+                        <TextBlock Text="NEW GESTURE NAME" Style="{StaticResource SectionHeaderText}" />
+                        <TextBox x:Name="GestureNameText" Text="My gesture" />
+                        <!-- Saved gestures and their action bindings live in their own window;
+                             this panel has to stay readable beside the native preview. -->
+                        <DockPanel Margin="0,12,0,0">
+                            <Button DockPanel.Dock="Right" Content="Manage…" Margin="0"
+                                    Style="{StaticResource CompactQuietButton}"
+                                    ToolTip="Open saved gestures and action bindings"
+                                    Click="OpenGestureActionsButton_Click" />
+                            <TextBlock x:Name="GestureCatalogSummaryText" Text="Loading saved gestures…"
+                                       Foreground="{StaticResource TextMuted}" FontSize="12"
+                                       VerticalAlignment="Center" Margin="0,0,10,0"
+                                       TextTrimming="CharacterEllipsis" />
                         </DockPanel>
-                        <ListBox x:Name="SavedGesturesList" Height="92" Margin="0,7,0,7"
-                                 Background="#101319" Foreground="#E7EAF0" BorderBrush="#303746"
-                                 SelectionChanged="SavedGesturesList_SelectionChanged" />
-                        <Grid>
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="Auto" />
-                                <ColumnDefinition Width="Auto" />
-                                <ColumnDefinition Width="Auto" />
-                            </Grid.ColumnDefinitions>
-                            <CheckBox x:Name="SelectedGestureEnabledCheckBox" Content="Enabled"
-                                      Foreground="#C5CDDA" VerticalAlignment="Center" />
-                            <Button Grid.Column="1" Content="Review" MinHeight="28" Padding="10,3"
-                                    Click="ReviewGestureRecordingsButton_Click" />
-                            <Button Grid.Column="2" Content="Update" MinHeight="28" Padding="10,3"
-                                    Click="UpdateGestureDefinitionButton_Click" />
-                            <Button Grid.Column="3" Content="Delete" MinHeight="28" Padding="10,3"
-                                    Click="DeleteGestureDefinitionButton_Click" />
-                        </Grid>
-                        <Border Margin="0,8,0,0" Padding="10" Background="#151A22"
-                                BorderBrush="#303746" BorderThickness="1" CornerRadius="5">
-                            <StackPanel>
-                                <TextBlock Text="Action binding" Foreground="#C5CDDA" FontWeight="SemiBold" />
-                                <ComboBox x:Name="GestureActionTypeComboBox" Margin="0,6,0,0" SelectedIndex="0">
-                                    <ComboBoxItem Content="Keyboard shortcut" Tag="keyboard.hotkey" />
-                                    <ComboBoxItem Content="Type text" Tag="keyboard.typeText" />
-                                    <ComboBoxItem Content="Launch app or document" Tag="app.launch" />
-                                    <ComboBoxItem Content="Offer screenshot over LAN" Tag="handoff.grab" />
-                                    <ComboBoxItem Content="Receive latest LAN offer" Tag="handoff.release" />
-                                </ComboBox>
-                                <TextBox x:Name="GestureActionParameterText" Margin="0,6,0,0"
-                                         ToolTip="Examples: CTRL+K, presentation text, or an application path" />
-                                <DockPanel Margin="0,6,0,0">
-                                    <CheckBox x:Name="GestureBindingEnabledCheckBox" Content="Action enabled"
-                                              IsChecked="True" Foreground="#C5CDDA" VerticalAlignment="Center" />
-                                    <Button DockPanel.Dock="Right" Content="Save action" Padding="10,3"
-                                            Click="SaveGestureBindingButton_Click" />
-                                    <Button DockPanel.Dock="Right" Content="Remove" Padding="10,3"
-                                            Click="RemoveGestureBindingButton_Click" />
-                                </DockPanel>
-                            </StackPanel>
-                        </Border>
-                        <TextBlock x:Name="GestureRepositoryStatusText" Text="Loading saved gestures…"
-                                   Foreground="#9DA6B8" FontSize="12" TextWrapping="Wrap" Margin="0,4,0,0" />
                     </StackPanel>
 
-                    <StackPanel Grid.Row="2" Margin="0,18,0,0">
-                        <TextBlock Text="New gesture name" Foreground="#AEB7C7" />
-                        <TextBox x:Name="GestureNameText" Text="My gesture" Margin="0,7,0,0" />
-                    </StackPanel>
-
-                    <Border Grid.Row="3" Margin="0,18,0,18" Padding="18"
-                            Background="#101319" BorderBrush="#303746" BorderThickness="1" CornerRadius="8">
+                    <Border Grid.Row="2" Margin="0,18,0,18" Style="{StaticResource InsetCard}" Padding="16">
                         <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                        <StackPanel VerticalAlignment="Center" Margin="0,4">
-                            <TextBlock x:Name="RecordingTrialText" Text="TRIAL 1 OF 3"
-                                       HorizontalAlignment="Center" Foreground="#C5CDDA"
-                                       FontSize="14" FontWeight="SemiBold" />
-                            <ProgressBar x:Name="AcceptedTrialsProgress" Minimum="0" Maximum="3"
-                                         Value="0" Height="6" Margin="22,8,22,14" />
-                            <TextBlock x:Name="RecordingPhaseText" Text="SHOW ONE HAND"
-                                       HorizontalAlignment="Center" FontSize="17" FontWeight="Bold"
-                                       Foreground="#8EC5FF" />
-                            <TextBlock x:Name="RecordingClockText" Text=""
-                                       HorizontalAlignment="Center" Margin="0,10,0,0"
-                                       FontSize="42" FontWeight="SemiBold" FontFamily="Consolas" />
-                            <ProgressBar x:Name="RecordingProgressBar" Minimum="0" Maximum="2.5"
-                                         Value="0" Height="10" Margin="0,16,0,14" />
-                            <TextBlock x:Name="RecordingInstructionText"
-                                       Text="Keep only the hand you want to record in view. Recording is available when one hand is stable."
-                                       Foreground="#C5CDDA" TextWrapping="Wrap" TextAlignment="Center" />
-                            <TextBlock x:Name="RecordingQualityText" Text=""
-                                       Foreground="#FFB36A" TextWrapping="Wrap" TextAlignment="Center"
-                                       Margin="0,10,0,0" />
-                            <Border x:Name="GestureValidationPanel" Visibility="Collapsed"
-                                    Margin="0,18,0,0" Padding="14" Background="#171B22"
-                                    BorderBrush="#303746" BorderThickness="1" CornerRadius="7">
-                                <StackPanel>
-                                    <TextBlock x:Name="ValidationPromptText" Text="Perform the gesture again"
-                                               Foreground="#C5CDDA" TextAlignment="Center" TextWrapping="Wrap" />
-                                    <TextBlock x:Name="ValidationResultText" Text="WATCHING"
-                                               Margin="0,10,0,0" HorizontalAlignment="Center"
-                                               FontSize="24" FontWeight="Bold" Foreground="#8EC5FF" />
-                                    <ProgressBar x:Name="ValidationConfidenceBar" Minimum="0" Maximum="100"
-                                                 Value="0" Height="14" Margin="0,12,0,0" />
-                                    <DockPanel Margin="0,5,0,0">
-                                        <TextBlock Text="Match" Foreground="#9DA6B8" />
-                                        <TextBlock x:Name="ValidationConfidenceText" Text="0%"
-                                                   DockPanel.Dock="Right" FontWeight="SemiBold" />
-                                    </DockPanel>
-                                    <ProgressBar x:Name="ValidationWindowBar" Minimum="0" Maximum="2500"
-                                                 Value="0" Height="6" Margin="0,12,0,0" />
-                                    <TextBlock x:Name="ValidationWindowText" Text="Motion window: waiting"
-                                               Foreground="#9DA6B8" FontSize="12" Margin="0,4,0,0" />
-                                    <TextBlock Text="Recognition threshold: 82%" Foreground="#788294"
-                                               FontSize="11" Margin="0,8,0,0" />
-                                    <TextBlock x:Name="ValidationReasonText" Text="Move the registered hand naturally."
-                                               Foreground="#C5CDDA" TextAlignment="Center" TextWrapping="Wrap"
-                                               Margin="0,8,0,0" />
-                                    <Button Content="Open DTW Debugger" Margin="0,12,0,0"
-                                            Click="OpenDtwDebuggerButton_Click" />
-                                </StackPanel>
-                            </Border>
-                        </StackPanel>
+                            <StackPanel VerticalAlignment="Center" Margin="0,4">
+                                <TextBlock x:Name="RecordingTrialText" Text="TRIAL 1 OF 3"
+                                           HorizontalAlignment="Center"
+                                           Foreground="{StaticResource TextSecondary}"
+                                           FontSize="11" FontWeight="SemiBold" />
+                                <ProgressBar x:Name="AcceptedTrialsProgress" Minimum="0" Maximum="3"
+                                             Value="0" Height="5" Margin="24,10,24,16" />
+                                <TextBlock x:Name="RecordingPhaseText" Text="SHOW ONE HAND"
+                                           HorizontalAlignment="Center" FontSize="16" FontWeight="Bold"
+                                           Foreground="{StaticResource Info}" />
+                                <TextBlock x:Name="RecordingClockText" Text=""
+                                           HorizontalAlignment="Center" Margin="0,10,0,0"
+                                           FontSize="44" FontWeight="SemiBold"
+                                           FontFamily="Cascadia Mono, Consolas, monospace" />
+                                <ProgressBar x:Name="RecordingProgressBar" Minimum="0" Maximum="2.5"
+                                             Value="0" Height="8" Margin="0,16,0,16" />
+                                <TextBlock x:Name="RecordingInstructionText"
+                                           Text="Keep only the hand you want to record in view. Recording is available when one hand is stable."
+                                           Foreground="{StaticResource TextSecondary}" FontSize="12"
+                                           TextWrapping="Wrap" TextAlignment="Center" />
+                                <TextBlock x:Name="RecordingQualityText" Text=""
+                                           Foreground="{StaticResource Warning}" FontSize="12"
+                                           TextWrapping="Wrap" TextAlignment="Center" Margin="0,10,0,0" />
+
+                                <Border x:Name="GestureValidationPanel" Visibility="Collapsed"
+                                        Margin="0,18,0,0" Style="{StaticResource Card}" Padding="14"
+                                        Background="{StaticResource SurfaceRaised}">
+                                    <StackPanel>
+                                        <TextBlock x:Name="ValidationPromptText" Text="Perform the gesture again"
+                                                   Foreground="{StaticResource TextSecondary}" FontSize="12"
+                                                   TextAlignment="Center" TextWrapping="Wrap" />
+                                        <TextBlock x:Name="ValidationResultText" Text="WATCHING"
+                                                   Margin="0,10,0,0" HorizontalAlignment="Center"
+                                                   FontSize="22" FontWeight="Bold"
+                                                   Foreground="{StaticResource Info}" />
+                                        <ProgressBar x:Name="ValidationConfidenceBar" Minimum="0" Maximum="100"
+                                                     Value="0" Height="10" Margin="0,12,0,0" />
+                                        <DockPanel Margin="0,6,0,0">
+                                            <TextBlock Text="Match" Foreground="{StaticResource TextMuted}"
+                                                       FontSize="12" />
+                                            <TextBlock x:Name="ValidationConfidenceText" Text="0%"
+                                                       DockPanel.Dock="Right" FontWeight="SemiBold" FontSize="12" />
+                                        </DockPanel>
+                                        <ProgressBar x:Name="ValidationWindowBar" Minimum="0" Maximum="2500"
+                                                     Value="0" Height="4" Margin="0,12,0,0" />
+                                        <DockPanel Margin="0,5,0,0">
+                                            <TextBlock x:Name="ValidationWindowText" Text="Motion window: waiting"
+                                                       Foreground="{StaticResource TextMuted}" FontSize="11" />
+                                            <TextBlock Text="threshold 82%" DockPanel.Dock="Right"
+                                                       Foreground="{StaticResource TextMuted}" FontSize="11" />
+                                        </DockPanel>
+                                        <TextBlock x:Name="ValidationReasonText"
+                                                   Text="Move the registered hand naturally."
+                                                   Foreground="{StaticResource TextSecondary}" FontSize="12"
+                                                   TextAlignment="Center" TextWrapping="Wrap" Margin="0,10,0,0" />
+                                        <Button Content="Open DTW Debugger" Margin="0,14,0,0"
+                                                Style="{StaticResource CompactQuietButton}"
+                                                Click="OpenDtwDebuggerButton_Click" />
+                                    </StackPanel>
+                                </Border>
+                            </StackPanel>
                         </ScrollViewer>
                     </Border>
 
-                    <Grid Grid.Row="4">
+                    <Grid Grid.Row="3">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
                         </Grid.ColumnDefinitions>
                         <Button x:Name="StartGestureRecordingButton" Grid.Column="0"
-                                Content="Start Trial 1" Click="BeginExplicitGestureRecordingButton_Click"
-                                Background="#16794A" Foreground="White" FontWeight="SemiBold" />
+                                Content="Start Trial 1" Style="{StaticResource SuccessButton}"
+                                Click="BeginExplicitGestureRecordingButton_Click" />
                         <Button x:Name="StopGestureRecordingButton" Grid.Column="0"
-                                Content="Stop &amp; Save" Click="FinishExplicitGestureRecordingButton_Click"
-                                Visibility="Collapsed" Background="#B71C1C" Foreground="White" FontWeight="SemiBold" />
-                        <Button x:Name="CancelGestureRecordingButton" Grid.Column="1"
-                                Content="Cancel" Click="CancelExplicitGestureRecordingButton_Click" />
+                                Content="Stop &amp; Save" Style="{StaticResource DangerButton}"
+                                Visibility="Collapsed"
+                                Click="FinishExplicitGestureRecordingButton_Click" />
+                        <Button x:Name="CancelGestureRecordingButton" Grid.Column="1" Margin="0"
+                                Content="Cancel" Style="{StaticResource QuietButton}"
+                                Click="CancelExplicitGestureRecordingButton_Click" />
                     </Grid>
                 </Grid>
             </Border>
         </Grid>
 
-        <Grid Grid.Row="2" Margin="0,14,0,0">
+        <Grid Grid.Row="2" Margin="0,16,0,0">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*" />
                 <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
-            <TextBlock x:Name="StateText" Text="Camera stopped" FontSize="15"
-                       Foreground="#B9C2D1" VerticalAlignment="Center" />
-            <Border Grid.Column="1" Background="#171B22" Padding="14,9" CornerRadius="7">
+            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                <Ellipse x:Name="CameraStatusDot" Width="8" Height="8" VerticalAlignment="Center"
+                         Margin="0,0,9,0" Fill="{StaticResource TextMuted}" />
+                <TextBlock x:Name="StateText" Text="Camera stopped" FontSize="14"
+                           Foreground="{StaticResource TextSecondary}" VerticalAlignment="Center" />
+            </StackPanel>
+            <Border Grid.Column="1" Style="{StaticResource StatusPill}">
                 <StackPanel Orientation="Horizontal">
-                    <TextBlock Text="Inference" Foreground="#9DA6B8" Margin="0,0,10,0" />
-                    <TextBlock x:Name="InferenceTimeText" Text="-" FontWeight="SemiBold" />
+                    <TextBlock Text="Inference" Foreground="{StaticResource TextMuted}"
+                               FontSize="12" Margin="0,0,10,0" VerticalAlignment="Center" />
+                    <TextBlock x:Name="InferenceTimeText" Text="—" FontWeight="SemiBold"
+                               FontSize="13" VerticalAlignment="Center" />
                 </StackPanel>
             </Border>
         </Grid>
