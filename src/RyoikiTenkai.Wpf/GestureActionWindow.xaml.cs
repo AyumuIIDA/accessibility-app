@@ -126,7 +126,7 @@ public partial class GestureActionWindow : Window
             "keyboard.hotkey" => "Example: CTRL+K",
             "keyboard.typeText" => "Typed into whichever window has focus.",
             "app.launch" => "Full path to an application or document.",
-            "handoff.grab" => "Captures this screen and advertises it on the LAN. No value needed.",
+            "handoff.grab" => "Captures the display this window is on, as it looks when the gesture fires, and advertises it on the LAN. No value needed.",
             "handoff.release" => "Claims the latest LAN offer on this device. No value needed.",
             _ => string.Empty
         };

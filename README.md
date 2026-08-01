@@ -103,6 +103,14 @@ action binding in its own window. **Register a Gesture** keeps only the recordin
 workflow beside the native preview, because WPF content cannot reliably overlay the
 `HwndHost` and the two panels together were too dense to read.
 
+The main window's **DTW Debugger** button opens the recognizer's native debug
+surface: the gesture it is comparing against, the decision, the score against the
+threshold, and the twelve distance contributions. It is enabled only while the
+camera runs, because the debug renderer is built against the running native
+runtime and cannot attach afterwards, and stopping the camera closes it — its
+child HWND must be destroyed before the runtime handle it points into. The same
+window is also reachable from the validation step of gesture registration.
+
 The main window's **Open 3D Viewer** button opens a modeless native CAD-style viewer.
 The built-in demo assembly supports left-drag orbit, mouse-wheel zoom, and
 double-click reset without starting the camera. When the native camera runtime is

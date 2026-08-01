@@ -80,6 +80,7 @@ public partial class MainWindow : Window
     {
         StartButton.IsEnabled = false;
         StopButton.IsEnabled = true;
+        OpenDtwDebuggerButton.IsEnabled = true;
         SetCameraStatus("Starting camera and hand models…", "Warning");
         NativeVisionHostControl.Visibility = Visibility.Visible;
         PreviewPlaceholder.Visibility = Visibility.Collapsed;
@@ -90,6 +91,7 @@ public partial class MainWindow : Window
             SetCameraStatus("Camera could not start", "Danger");
             StartButton.IsEnabled = true;
             StopButton.IsEnabled = false;
+            OpenDtwDebuggerButton.IsEnabled = false;
             Log("Native runtime is required; no managed inference fallback exists.");
             return;
         }
@@ -117,6 +119,7 @@ public partial class MainWindow : Window
         SetCameraStatus("Camera stopped", "TextMuted");
         StartButton.IsEnabled = true;
         StopButton.IsEnabled = false;
+        OpenDtwDebuggerButton.IsEnabled = false;
     }
 
     private void SetCameraStatus(string message, string brushKey)
@@ -687,6 +690,12 @@ public partial class MainWindow : Window
         _pendingTemplateId = 0;
         _nativePollTimer.Stop();
         _gestureDispatchCancellation.Cancel();
+        // The DTW debugger and playback both hold non-owning native runtime
+        // pointers, so their HwndHosts must destroy those handles first.
+        _dtwDebugWindow?.Close();
+        _dtwDebugWindow = null;
+        _recordingPlaybackWindow?.Close();
+        _recordingPlaybackWindow = null;
         NativeVisionHostControl.StopNativeRuntime();
         NativeVisionHostControl.Visibility = Visibility.Collapsed;
         PreviewPlaceholder.Visibility = Visibility.Visible;
@@ -705,14 +714,11 @@ public partial class MainWindow : Window
 
     protected override void OnClosed(EventArgs e)
     {
-        // Playback retains a non-owning native runtime pointer, so its HwndHost
-        // must destroy the playback handle before the source runtime stops.
-        _recordingPlaybackWindow?.Close();
-        _recordingPlaybackWindow = null;
         _gestureActionWindow?.Close();
         _gestureActionWindow = null;
         _handoffEffect?.Close();
         _handoffEffect = null;
+        // Closes the windows holding native runtime pointers before it stops.
         StopNativeRuntime();
         _ = _handoffService.DisposeAsync();
         base.OnClosed(e);

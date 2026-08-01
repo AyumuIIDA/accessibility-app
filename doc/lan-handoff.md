@@ -20,10 +20,18 @@ Security and lifecycle limits:
 - shutdown cancels listeners, awaits the receive/broadcast/server loops and all
   accepted clients, with a bounded five-second drain.
 
-The WPF provider captures the application window and is deliberately only a UI
-adapter. Gesture command bindings map explicit `handoff.grab` and
-`handoff.release` actions to the long-lived service instance; they must not create
-a new network service per confirmed gesture.
+The WPF provider is deliberately only a UI adapter. Gesture command bindings map
+explicit `handoff.grab` and `handoff.release` actions to the long-lived service
+instance; they must not create a new network service per confirmed gesture.
+
+The captured payload is the display as it stands the moment the gesture fires —
+whatever the operator has open — not this application's own window. The capture
+is a GDI `BitBlt` of the monitor holding the main window, so a multi-monitor
+desktop hands off the screen being gestured at rather than every screen at once;
+`CAPTUREBLT` is set because layered windows otherwise copy as black. The longest
+edge is capped at 2560 px, which keeps a 4K desktop comfortably inside the 16 MiB
+payload limit. Because the capture is of the real screen, a handoff effect still
+fading from a previous transfer would appear in it.
 
 ## Gesture-only operation
 

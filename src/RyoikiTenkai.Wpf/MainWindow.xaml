@@ -19,6 +19,12 @@
                 <Button x:Name="OpenGestureActionsButton" Content="Gesture Actions"
                         Style="{StaticResource QuietButton}"
                         Click="OpenGestureActionsButton_Click" />
+                <!-- Disabled while the camera is off: the debug renderer is built
+                     against the running native runtime and cannot attach later. -->
+                <Button x:Name="OpenDtwDebuggerButton" Content="DTW Debugger"
+                        Style="{StaticResource QuietButton}" IsEnabled="False"
+                        ToolTip="Inspect how the recognizer scores the gesture it is comparing (needs the camera running)"
+                        Click="OpenDtwDebuggerButton_Click" />
                 <Button x:Name="OpenCadViewerButton" Content="3D Viewer"
                         Style="{StaticResource QuietButton}"
                         Click="OpenCadViewerButton_Click" />
