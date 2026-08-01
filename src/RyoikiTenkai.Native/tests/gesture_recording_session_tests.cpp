@@ -180,6 +180,33 @@ void testThreeAcceptedTakesCommitAtomicallyAndFailuresRetrySameTake()
     require(definition != nullptr && definition->trialCount == 3,
         "The registry did not group all accepted trials under the definition ID.");
 }
+
+void testCancelBetweenTakesStartsSameIdFromTakeOne()
+{
+    recognition::GestureRecordingSession session;
+    recognition::GestureTemplateRegistry registry;
+    std::uint64_t frameId = 1;
+    std::uint64_t timestampUs = 1'000'000;
+
+    auto status = captureTake(session, registry, 700, frameId, timestampUs);
+    require(status.state == recognition::GestureRecordingState::AwaitingNextTake
+            && status.acceptedTakeCount == 1 && status.currentTake == 2,
+        "The setup take did not reach AwaitingNextTake.");
+
+    session.submitCommand(recognition::GestureRecordingCommandKind::Cancel, 0);
+    status = session.processFrame(makeHands(0), frameId++, timestampUs + 10'000, registry);
+    require(status.state == recognition::GestureRecordingState::Cancelled
+            && status.acceptedTakeCount == 0 && status.currentTake == 0
+            && status.lastResultTemplateId == 0,
+        "Cancel between takes retained state from the previous registration.");
+
+    session.submitCommand(recognition::GestureRecordingCommandKind::Begin, 700);
+    status = session.processFrame(makeHands(0), frameId++, timestampUs + 20'000, registry);
+    require(status.state == recognition::GestureRecordingState::AwaitingHand
+            && status.acceptedTakeCount == 0 && status.currentTake == 1
+            && status.attemptCount == 1,
+        "Reusing an ID after cancel resumed the previous accepted takes.");
+}
 }
 
 int main()
@@ -189,6 +216,7 @@ int main()
         testWaitsForExactlyOneHandAndLocksWithoutRebinding();
         testFinishUsesOnlyExplicitSessionAndCancelResetsLifecycle();
         testThreeAcceptedTakesCommitAtomicallyAndFailuresRetrySameTake();
+        testCancelBetweenTakesStartsSameIdFromTakeOne();
         std::cout << "Gesture recording session tests passed.\n";
         return 0;
     }

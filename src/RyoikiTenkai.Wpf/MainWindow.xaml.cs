@@ -28,6 +28,7 @@ public partial class MainWindow : Window
     private bool _nativeRecordingBegan;
     private bool _isRecordingCountdown;
     private uint _pendingTemplateId;
+    private bool _awaitingNativeRecordingStart;
     private uint _validationTemplateId;
     private uint _currentRecordingTrial = 1;
     private readonly Dictionary<uint, string> _gestureNames = [];
@@ -139,9 +140,11 @@ public partial class MainWindow : Window
 
     private void ExitGestureRegistrationModeButton_Click(object sender, RoutedEventArgs e)
     {
-        if (_isGestureRecording) NativeVisionHostControl.CancelGestureRecording();
+        if (_pendingTemplateId != 0) NativeVisionHostControl.CancelGestureRecording();
         _recordingDisplayTimer.Stop();
         _isGestureRecording = false;
+        _awaitingNativeRecordingStart = false;
+        _pendingTemplateId = 0;
         RegistrationPanel.Visibility = Visibility.Collapsed;
         RegistrationColumn.Width = new GridLength(0);
         OpenGestureRegistrationButton.IsEnabled = true;
@@ -200,6 +203,18 @@ public partial class MainWindow : Window
         RecordingPhaseText.Foreground = System.Windows.Media.Brushes.Gold;
         RecordingClockText.Text = string.Empty;
         RecordingInstructionText.Text = "Checking motion quality and building the gesture template.";
+        var startingNewSession = _pendingTemplateId == 0 || _validationTemplateId != 0;
+        if (startingNewSession)
+        {
+            // Completed and cancelled status snapshots intentionally remain
+            // pollable in native code. Explicitly terminate the previous
+            // workflow before reusing a stable ID for three fresh takes.
+            NativeVisionHostControl.CancelGestureRecording();
+            _validationTemplateId = 0;
+            _currentRecordingTrial = 1;
+            AcceptedTrialsProgress.Value = 0;
+            GestureValidationPanel.Visibility = Visibility.Collapsed;
+        }
         StopGestureRecordingButton.IsEnabled = false;
         if (!NativeVisionHostControl.FinishGestureRecording())
         {
@@ -212,7 +227,7 @@ public partial class MainWindow : Window
 
     private void CancelExplicitGestureRecordingButton_Click(object sender, RoutedEventArgs e)
     {
-        if (_isGestureRecording) NativeVisionHostControl.CancelGestureRecording();
+        if (_pendingTemplateId != 0) NativeVisionHostControl.CancelGestureRecording();
         ResetRecordingUi("Nothing was saved. You can record again when ready.");
     }
 
@@ -270,10 +285,18 @@ public partial class MainWindow : Window
         if (_handoffService.LatestOffer is { } offer)
             HandoffStatusText.Text = $"LAN offer: {offer.FileName} from {offer.SenderName} ({Math.Max(0, (offer.ExpiresAt - DateTimeOffset.UtcNow).TotalSeconds):0}s)";
         try
+                _awaitingNativeRecordingStart = false;
         {
             await _gestureEventPump.PollAsync(_gestureDispatchCancellation.Token);
         }
         catch (OperationCanceledException) when (_gestureDispatchCancellation.IsCancellationRequested) { }
+            else
+            {
+                // Begin is delivered through the native worker mailbox. Until
+                // AwaitingHand/Recording is observed, the polled snapshot may
+                // still be Completed from the previous registration.
+                _awaitingNativeRecordingStart = true;
+            }
         catch (Exception exception) { Log("Gesture dispatch failed: " + exception.Message); }
     }
 
@@ -290,7 +313,6 @@ public partial class MainWindow : Window
         _currentRecordingTrial = currentTake;
         AcceptedTrialsProgress.Maximum = requiredTakeCount;
         AcceptedTrialsProgress.Value = Math.Min(status.AcceptedTakeCount, requiredTakeCount);
-        if (_isRecordingCountdown) return;
         if (status.State == NativeGestureRecordingState.AwaitingHand && _isGestureRecording)
         {
             RecordingTrialText.Text = $"TRIAL {currentTake} OF {requiredTakeCount}";
@@ -318,6 +340,16 @@ public partial class MainWindow : Window
             _recordingDisplayTimer.Stop();
             RecordingTrialText.Text = $"TRIAL {currentTake} OF {requiredTakeCount}";
             RecordingPhaseText.Text = "ACCEPTED";
+        if (_isRecordingCountdown) return;
+        if (_awaitingNativeRecordingStart)
+        {
+            if (status.State is not (NativeGestureRecordingState.AwaitingHand
+                or NativeGestureRecordingState.Recording))
+            {
+                return;
+            }
+            _awaitingNativeRecordingStart = false;
+        }
             RecordingPhaseText.Foreground = System.Windows.Media.Brushes.LightGreen;
             RecordingClockText.Text = string.Empty;
             RecordingProgressBar.Value = 0;
@@ -333,7 +365,9 @@ public partial class MainWindow : Window
         else if (status.State == NativeGestureRecordingState.Completed)
         {
             var savedTemplateId = status.LastResultTemplateId;
-            if (savedTemplateId != 0 && _validationTemplateId != savedTemplateId)
+            if (savedTemplateId != 0
+                && savedTemplateId == _pendingTemplateId
+                && _validationTemplateId != savedTemplateId)
             {
                 var name = GestureNameText.Text.Trim();
                 _gestureNames[savedTemplateId] = name;
@@ -437,6 +471,8 @@ public partial class MainWindow : Window
         foreach (var value in Encoding.UTF8.GetBytes(name.Trim().ToUpperInvariant()))
             hash = unchecked((hash ^ value) * prime);
         return hash == 0 ? 1U : hash;
+        _awaitingNativeRecordingStart = false;
+        _pendingTemplateId = 0;
     }
 
     private void SavedGesturesList_SelectionChanged(
@@ -833,9 +869,11 @@ public partial class MainWindow : Window
 
     private void StopNativeRuntime()
     {
-        if (_isGestureRecording) NativeVisionHostControl.CancelGestureRecording();
+        if (_pendingTemplateId != 0) NativeVisionHostControl.CancelGestureRecording();
         _recordingDisplayTimer.Stop();
         _isGestureRecording = false;
+        _awaitingNativeRecordingStart = false;
+        _pendingTemplateId = 0;
         _nativePollTimer.Stop();
         _gestureDispatchCancellation.Cancel();
         NativeVisionHostControl.StopNativeRuntime();

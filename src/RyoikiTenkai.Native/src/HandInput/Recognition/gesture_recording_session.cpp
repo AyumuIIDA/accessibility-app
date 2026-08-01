@@ -278,13 +278,28 @@ GestureRecordingStatus GestureRecordingSession::processFrame(
         }
         break;
     case GestureRecordingCommandKind::Cancel:
-        if (state_ == GestureRecordingState::AwaitingHand
-            || state_ == GestureRecordingState::Recording)
+        if (state_ != GestureRecordingState::Idle)
         {
             cancelLocked("Cancelled by request.", GestureRecordingState::Cancelled);
             acceptedTrials_ = {};
+            acceptedProvenance_ = {};
             acceptedTakeCount_ = 0;
+            attemptCount_ = 0;
             currentTake_ = 0;
+            sessionTemplateId_ = 0;
+            sessionKind_ = GestureTrialKind::OneHandDynamic;
+            buffer_.reset();
+            twoHandFrames_.clear();
+            capturedFrameSetCount_ = 0;
+            lockedTrackId_ = 0;
+            missingFrames_ = 0;
+            beganFrameId_ = 0;
+            beganTimestampUs_ = 0;
+            lastFrameId_ = 0;
+            lastTimestampUs_ = 0;
+            sampleCount_ = 0;
+            usableSampleCount_ = 0;
+            lastResultTemplateId_ = 0;
         }
         break;
     case GestureRecordingCommandKind::Finish:
