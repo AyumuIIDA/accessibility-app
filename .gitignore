@@ -11,6 +11,7 @@ obj/
 **/obj/
 **/out/
 **/vcpkg_installed/
+tmp/
 tmp/qnn-*/
 tmp/*-inference-metrics.csv
 tmp/codex-worker-*
